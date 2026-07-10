@@ -5,8 +5,14 @@
 name: smoke
 
 on:
+  # A release published by release.yml's GITHUB_TOKEN emits NO `release`
+  # event to other workflows (GitHub's recursion guard), so smoke chains off
+  # the release WORKFLOW completing instead.
+  workflow_run:
+    workflows: [release]
+    types: [completed]
   release:
-    types: [published]
+    types: [published] # still fires for manually-published releases
   workflow_dispatch:
     inputs:
       version:
@@ -16,6 +22,9 @@ on:
 jobs:
   install:
     name: install (${{ matrix.os }})
+    # Chained runs only smoke SUCCESSFUL releases; a failed release has no
+    # assets to install.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
