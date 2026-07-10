@@ -1,0 +1,17 @@
+# Scheduled dependency audit — catches NEW advisories between releases
+# (push-time cargo-deny only sees the tree as of that commit).
+name: audit
+
+on:
+  schedule:
+    - cron: "17 6 * * *" # daily, off-peak
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans

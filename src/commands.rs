@@ -52,7 +52,9 @@ pub fn login(flag_hub: Option<String>, key: Option<String>) {
             }
         }
     }
-    let key = key.unwrap_or_else(|| {
+    // The message promises SEVRA_API_KEY works — honor it: --key wins, the
+    // env var is the fallback.
+    let key = key.or_else(|| config::env_nonempty("SEVRA_API_KEY")).unwrap_or_else(|| {
         fail("provide a key: `sevra login --key vc_account_…` (create one in the dashboard). SEVRA_API_KEY also works.", None)
     });
 
@@ -182,21 +184,24 @@ pub fn push(cfg: &Config, dir: &str, brain: &str) {
     if !Path::new(dir).exists() {
         fail(&format!("store directory not found: {dir}"), None);
     }
-    let store =
-        read_store(dir).unwrap_or_else(|e| fail(&format!("could not read {dir}: {e}"), None));
+    let over_cap = || -> ! {
+        fail(
+            "store is over the hub's push cap (~4 MB as JSON). Large brains sync a pack via presigned R2 upload (coming with the object store); push a smaller store for now.",
+            Some(json!({ "cap": MAX_PUSH_BYTES })),
+        )
+    };
+    let store = match read_store(dir, MAX_PUSH_BYTES as u64) {
+        Ok(s) => s,
+        Err(None) => over_cap(), // refused early, before reading past the cap
+        Err(Some(e)) => fail(&format!("could not read {dir}: {e}"), None),
+    };
     if store.files.is_empty() {
         fail(&format!("no .md files under {dir}"), None);
     }
     let payload = serde_json::to_value(&store).unwrap();
-    let bytes = payload.to_string().len();
-    if bytes > MAX_PUSH_BYTES {
-        fail(
-            &format!(
-                "store is {:.1} MB as JSON — over the hub's push cap (~4 MB). Large brains sync a pack via presigned R2 upload (coming with the object store); push a smaller store for now.",
-                bytes as f64 / 1024.0 / 1024.0
-            ),
-            Some(json!({ "bytes": bytes, "cap": MAX_PUSH_BYTES })),
-        );
+    // The exact check on the JSON encoding (escaping only grows raw bytes).
+    if payload.to_string().len() > MAX_PUSH_BYTES {
+        over_cap();
     }
     let file_count = store.files.len();
     let r = ensure_ok(
@@ -721,6 +726,22 @@ pub fn export(cfg: &Config, brain: &str, dir: Option<String>) {
             .unwrap_or_else(|| fail(&format!("refusing unsafe export path: {path}"), None));
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent).ok();
+            // The lexical containment above can be defeated by a symlinked
+            // subdir INSIDE an existing target dir — re-check the REAL parent
+            // after creation (exports into a fresh dir are unaffected).
+            let real_parent = std::fs::canonicalize(parent).unwrap_or_else(|e| {
+                fail(&format!("cannot resolve {}: {e}", parent.display()), None)
+            });
+            let real_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+            if !real_parent.starts_with(&real_root) {
+                fail(
+                    &format!(
+                        "refusing export through a symlink escaping {}: {path}",
+                        root.display()
+                    ),
+                    None,
+                );
+            }
         }
         std::fs::write(&full, content)
             .unwrap_or_else(|e| fail(&format!("write failed {}: {e}", full.display()), None));
@@ -756,11 +777,13 @@ pub fn validate(dir: Option<String>) {
     if !Path::new(&dir).exists() {
         fail(&format!("directory not found: {dir}"), None);
     }
-    match Command::new("dbmd")
-        .args(["validate", "--all"])
-        .current_dir(&dir)
-        .status()
-    {
+    // The --json contract holds THROUGH the shell-out: dbmd has its own
+    // global --json, so machine mode forwards it.
+    let mut args = vec!["validate", "--all"];
+    if json_mode() {
+        args.push("--json");
+    }
+    match Command::new("dbmd").args(&args).current_dir(&dir).status() {
         Ok(status) => {
             // A signal death (no code) is not a pass.
             std::process::exit(status.code().unwrap_or(1));

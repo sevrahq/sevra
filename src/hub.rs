@@ -34,6 +34,10 @@ pub struct HubResponse {
 fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .user_agent(concat!("sevra/", env!("CARGO_PKG_VERSION")))
+        // A hung hub must never hang an agent's loop: bounded connect, and a
+        // read window sized for a 4 MB push on a slow link.
+        .timeout_connect(std::time::Duration::from_secs(10))
+        .timeout_read(std::time::Duration::from_secs(120))
         .build()
 }
 

@@ -1,0 +1,42 @@
+# Post-release install smoke: run the REAL installer against the fresh
+# release on both OS families and prove the installed binary answers.
+# Catches broken assets, checksum drift, or installer regressions the moment
+# a release is cut — before any user or self-updating binary sees it.
+name: smoke
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to smoke (without leading v; default latest)"
+        required: false
+
+jobs:
+  install:
+    name: install (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run the installer against the release
+        shell: bash
+        env:
+          SEVRA_VERSION: ${{ inputs.version || github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          # Strip a leading v if the tag name came through.
+          export SEVRA_VERSION="${SEVRA_VERSION#v}"
+          export SEVRA_INSTALL_DIR="$RUNNER_TEMP/sevra-bin"
+          sh install.sh
+          "$SEVRA_INSTALL_DIR/sevra" version
+          "$SEVRA_INSTALL_DIR/sevra" version --json | grep '"version"'
+          # The not-logged-in path is the offline contract check.
+          if "$SEVRA_INSTALL_DIR/sevra" brains 2>err.txt; then
+            echo "expected failure without a key" >&2; exit 1
+          fi
+          grep -q "not logged in" err.txt

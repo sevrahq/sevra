@@ -25,7 +25,6 @@ use output::set_json_mode;
     version,
     about = "The command line for the Sevra hub — the managed home for db.md brains.",
     long_about = None,
-    disable_help_subcommand = true,
 )]
 struct Cli {
     /// Machine-readable JSON output on stdout for any command (agent-friendly).
@@ -125,7 +124,19 @@ enum Commands {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    // Even clap's own errors honor the --json contract: an agent parsing
+    // stdout must get a JSON object, not human usage text. Exit code stays
+    // clap's (2 = usage error).
+    let cli = Cli::try_parse().unwrap_or_else(|e| {
+        if std::env::args().any(|a| a == "--json") && e.use_stderr() {
+            println!(
+                "{}",
+                serde_json::json!({ "error": e.render().to_string().trim() })
+            );
+            std::process::exit(2);
+        }
+        e.exit();
+    });
     set_json_mode(cli.json);
 
     // Commands that don't need a loaded credential first.
@@ -182,4 +193,8 @@ fn main() {
         | Commands::Validate { .. }
         | Commands::Version => unreachable!(),
     }
+
+    // The daily auto-update, AFTER the command's output — its download can
+    // never add latency to the answer an agent is waiting on.
+    update::run_deferred_auto_update();
 }

@@ -65,8 +65,10 @@ pub fn load() -> Config {
     }
 }
 
-/// Persist hub + key, 0600. On Unix the mode is enforced; other platforms get
-/// default perms (the file still lives under the user profile).
+/// Persist hub + key, 0600 FROM CREATION — the credential must never be
+/// world-readable, not even for the write-then-chmod window. Written to a
+/// 0600 temp file in the same dir, then renamed over the target (atomic on
+/// POSIX). Non-Unix platforms get default perms under the user profile.
 pub fn save(hub: &str, key: &str) -> std::io::Result<()> {
     let dir = config_dir();
     fs::create_dir_all(&dir)?;
@@ -76,12 +78,24 @@ pub fn save(hub: &str, key: &str) -> std::io::Result<()> {
         key: Some(key.to_string()),
     })
     .unwrap();
-    fs::write(&path, format!("{body}\n"))?;
+    let tmp = dir.join(format!("config.json.new.{}", std::process::id()));
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(format!("{body}\n").as_bytes())?;
     }
+    #[cfg(not(unix))]
+    fs::write(&tmp, format!("{body}\n"))?;
+    fs::rename(&tmp, &path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })?;
     Ok(())
 }
 

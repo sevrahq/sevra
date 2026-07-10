@@ -1,0 +1,40 @@
+# sevra — the command line for the Sevra hub
+
+> The Sevra hub (https://www.sevrahq.com) is the managed home for db.md
+> brains: databases in plain files, operated by the customer's own AI. sevra
+> is the hub's product CLI — a signed, self-updating static binary. It is a
+> machine interface: agents are its primary users.
+
+Install (macOS/Linux, x86_64/arm64; no runtime, no package manager):
+
+    curl -fsSL https://www.sevrahq.com/install/sevra.sh | sh
+
+Authenticate (key from the dashboard at https://www.sevrahq.com/dashboard):
+
+    sevra login --key vc_account_...
+
+Agent contract:
+- Add `--json` to ANY command: machine-readable JSON on stdout, always,
+  including errors ({"error": ...}); exit code 1 on failure.
+- Notices go to stderr, never stdout.
+- Config: ~/.sevra/config.json (0600). Env SEVRA_HUB_URL / SEVRA_API_KEY
+  override it. Non-HTTPS hubs are refused (localhost exempt).
+
+Commands:
+    login --key <k> [--hub <url>] | logout | whoami
+    brains | create <slug> [--name --scope --public]
+    push <dir> --brain <id|slug>          # index-on-push; 4 MB JSON cap
+    query <brain> [text] [--type --layer --meta-type --tag --where k=v --limit N]
+    get <brain> <id|path> | graph <brain> <path> [--dir in|out|both]
+    grant <brain> <email> [--write] | grants <brain> | revoke <brain> <grantId>
+    shared | publish <brain> | unpublish <brain>
+    inbox list|drain <brain>              # drain prints full JSON (BYO-agent read half)
+    export <brain> [dir]                  # your brain back on disk
+    validate [dir]                        # shells `dbmd validate --all`
+    version | update                      # signed self-update; reports stale dbmd
+
+Updates: the binary checks /api/hub/versions at most once a day and
+signed-self-updates (Ed25519, pinned key). SEVRA_NO_AUTO_UPDATE=1 disables.
+
+Related: db.md, the open standard the hub hosts — https://github.com/carloslfu/db.md
+(its CLI `dbmd` is the neutral format tool; sevra wraps it, never reimplements it).

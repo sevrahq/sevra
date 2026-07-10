@@ -74,6 +74,10 @@ fn is_older(a: &str, b: &str) -> bool {
 fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .user_agent(concat!("sevra/", env!("CARGO_PKG_VERSION")))
+        // A hung endpoint must never hang the CLI: bounded connect, and a
+        // generous read window (release binaries are ~2 MB).
+        .timeout_connect(std::time::Duration::from_secs(10))
+        .timeout_read(std::time::Duration::from_secs(120))
         .build()
 }
 
@@ -116,9 +120,13 @@ fn download_verify_replace(version: &str) -> Result<(), String> {
     }
     let self_path = std::env::current_exe().map_err(|e| format!("cannot locate self: {e}"))?;
     let self_path = fs::canonicalize(&self_path).unwrap_or(self_path);
-    // Write-then-rename so a failed write can never leave a truncated CLI.
+    // Write-then-rename so a failed write can never leave a truncated CLI —
+    // and a failed WRITE cleans its own partial temp up too.
     let tmp = self_path.with_extension(format!("new.{}", std::process::id()));
-    fs::write(&tmp, &binary).map_err(|e| format!("write failed: {e}"))?;
+    fs::write(&tmp, &binary).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("write failed: {e}")
+    })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -132,14 +140,63 @@ fn download_verify_replace(version: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Once-per-process auto-update, triggered from the hub client. Best-effort and
-/// non-fatal: any failure downgrades to a one-line notice and never disturbs
-/// the in-flight command. A signature failure is the one loud case.
+/// Throttle: at most one background version check per day, stamped in
+/// ~/.sevra/update-check. The retired TS CLI's staleness signal rode a
+/// response header (zero extra requests); a versions fetch on every
+/// invocation would tax every agent loop with a round trip, so the check is
+/// daily. `stamp: false` peeks without consuming the daily slot; the deferred
+/// runner stamps only when it actually checks. Best-effort: an unreadable/
+/// unwritable stamp file just means "check now".
+fn update_check_due(stamp: bool) -> bool {
+    let path = crate::config::config_dir().join("update-check");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(prev) = fs::read_to_string(&path) {
+        if let Ok(prev) = prev.trim().parse::<u64>() {
+            if now.saturating_sub(prev) < 24 * 60 * 60 {
+                return false;
+            }
+        }
+    }
+    if stamp {
+        let _ = fs::create_dir_all(crate::config::config_dir());
+        let _ = fs::write(&path, now.to_string());
+    }
+    true
+}
+
+/// The hub the deferred check should use, recorded by the hub client. Empty =
+/// nothing scheduled.
+static PENDING_HUB: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Called by the hub client after a response: RECORDS that a daily check is
+/// due, never performs it — the in-flight command's latency stays untouched.
+/// SEVRA_NO_AUTO_UPDATE=1 skips entirely (zero extra requests); `sevra
+/// update` stays the explicit path.
 pub fn maybe_auto_update(cfg: &Config) {
     if CHECKED.swap(true, Ordering::Relaxed) {
         return;
     }
-    let versions = match fetch_versions(&cfg.hub) {
+    if std::env::var("SEVRA_NO_AUTO_UPDATE").is_ok() {
+        return;
+    }
+    if !update_check_due(false) {
+        return;
+    }
+    let _ = PENDING_HUB.set(cfg.hub.clone());
+}
+
+/// Runs at the END of main, after the command's output is flushed: the daily
+/// version check and, when behind, the signed download + atomic self-replace.
+/// Best-effort and non-fatal; a signature failure is the one loud case.
+pub fn run_deferred_auto_update() {
+    let Some(hub) = PENDING_HUB.get() else { return };
+    if !update_check_due(true) {
+        return; // another process consumed the slot since we peeked
+    }
+    let versions = match fetch_versions(hub) {
         Some(v) => v,
         None => return,
     };
@@ -152,12 +209,6 @@ pub fn maybe_auto_update(cfg: &Config) {
         None => return,
     };
     if !is_older(VERSION, &latest) {
-        return;
-    }
-    if std::env::var("SEVRA_NO_AUTO_UPDATE").is_ok() {
-        note(&format!(
-            "sevra {VERSION} is out of date ({latest} is available) — run `sevra update`"
-        ));
         return;
     }
     match download_verify_replace(&latest) {

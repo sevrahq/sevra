@@ -1,0 +1,57 @@
+Third-party notices for the sevra binary
+=========================================
+
+sevra is MIT-licensed (see LICENSE). The compiled binary statically links the
+Rust crates below. Every dependency is under a permissive license; the
+allowlist is enforced in CI by `cargo deny check licenses` (see deny.toml).
+Regenerate this inventory with `cargo deny list` after any dependency change.
+
+Licenses present in the tree and the crates that carry them (a crate listed
+under several licenses is multi-licensed; we receive it under a permissive
+option):
+
+MIT and/or Apache-2.0 (the bulk of the tree)
+  adler2, anstream, anstyle, anstyle-parse, anstyle-query, anstyle-wincon,
+  base64, block-buffer, cc, cfg-if, clap, clap_builder, clap_derive, clap_lex,
+  colorchoice, cpufeatures, crc32fast, crypto-common, curve25519-dalek-derive,
+  digest, displaydoc, ed25519, fiat-crypto, find-msvc-tools, flate2,
+  form_urlencoded, generic-array, getrandom, heck, home, idna, idna_adapter,
+  is_terminal_polyfill, itoa, libc, log, memchr, miniz_oxide, once_cell,
+  once_cell_polyfill, percent-encoding, proc-macro2, quote, rustc_version,
+  rustls-pki-types, semver, serde, serde_core, serde_derive, serde_json, sha2,
+  shlex, signature, simd-adler32, smallvec, stable_deref_trait, strsim, syn,
+  synstructure, typenum, unicode-ident, ureq, url, utf8_iter, utf8parse,
+  version_check, wasi, windows-link, windows-sys, windows-targets,
+  windows_* target crates, zeroize, zmij
+
+BSD-3-Clause
+  curve25519-dalek, ed25519-dalek, subtle
+
+ISC
+  ring, rustls, rustls-webpki, untrusted
+
+Unicode-3.0 (ICU4X data + machinery, via url/idna)
+  icu_collections, icu_locale_core, icu_normalizer, icu_normalizer_data,
+  icu_properties, icu_properties_data, icu_provider, litemap, potential_utf,
+  tinystr, writeable, yoke, yoke-derive, zerofrom, zerofrom-derive, zerotrie,
+  zerovec, zerovec-derive
+
+CDLA-Permissive-2.0 (a permissive data license)
+  webpki-roots (the Mozilla CA root bundle rustls verifies TLS against)
+
+Zlib
+  miniz_oxide (multi-licensed; also MIT/Apache-2.0)
+
+Unlicense
+  memchr (multi-licensed; also MIT)
+
+Apache-2.0 WITH LLVM-exception
+  wasi (multi-licensed; also MIT/Apache-2.0)
+
+0BSD
+  adler2 (multi-licensed; also MIT/Apache-2.0)
+
+BSD-1-Clause
+  fiat-crypto (multi-licensed; also MIT/Apache-2.0)
+
+No GPL, LGPL, AGPL, or source-available licenses. No AI/LLM dependencies.

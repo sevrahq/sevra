@@ -36,6 +36,7 @@ fn walk(
     dir: &Path,
     visited: &mut HashSet<std::path::PathBuf>,
     store: &mut Store,
+    budget: &mut u64,
 ) -> std::io::Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -55,12 +56,20 @@ fn walk(
             if !visited.insert(real) {
                 continue;
             }
-            walk(root, &full, visited, store)?;
+            walk(root, &full, visited, store, budget)?;
         } else if meta.is_file() {
             let rel = rel_posix(root, &full);
+            let counts = rel == "assets.jsonl" || rel.to_lowercase().ends_with(".md");
+            if counts {
+                // Size-gate BEFORE reading: past the budget, stop touching disk.
+                *budget = budget.saturating_sub(meta.len());
+                if *budget == 0 {
+                    return Err(std::io::Error::other("push cap exceeded"));
+                }
+            }
             if rel == "assets.jsonl" {
                 store.assets = Some(fs::read_to_string(&full)?);
-            } else if rel.to_lowercase().ends_with(".md") {
+            } else if counts {
                 store.files.push(StoreFile {
                     path: rel,
                     content: fs::read_to_string(&full)?,
@@ -71,7 +80,11 @@ fn walk(
     Ok(())
 }
 
-pub fn read_store(dir: &str) -> std::io::Result<Store> {
+/// Read the store, refusing early once raw bytes exceed `max_bytes` — a
+/// store whose raw file bytes exceed the cap cannot fit under it as JSON
+/// either (escaping only grows), so a symlinked multi-GB vault is never read
+/// into memory before a post-hoc check. Err(None) = cap exceeded.
+pub fn read_store(dir: &str, max_bytes: u64) -> Result<Store, Option<std::io::Error>> {
     let root = Path::new(dir);
     let mut store = Store {
         files: Vec::new(),
@@ -79,6 +92,11 @@ pub fn read_store(dir: &str) -> std::io::Result<Store> {
     };
     let mut visited = HashSet::new();
     visited.insert(fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()));
-    walk(root, root, &mut visited, &mut store)?;
-    Ok(store)
+    // budget hits zero exactly when the running total reaches max_bytes.
+    let mut budget = max_bytes.saturating_add(1);
+    match walk(root, root, &mut visited, &mut store, &mut budget) {
+        Ok(()) => Ok(store),
+        Err(e) if e.to_string() == "push cap exceeded" => Err(None),
+        Err(e) => Err(Some(e)),
+    }
 }
