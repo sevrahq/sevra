@@ -21,6 +21,10 @@ allow = [
   "MPL-2.0",
   "CC0-1.0",
   "Unlicense",
+  # The Mozilla CA root bundle (webpki-roots) ships under CDLA-Permissive-2.0 —
+  # a permissive *data* license (no copyleft, no patent traps). It's the trust
+  # anchor rustls verifies TLS against; permissive and appropriate to bundle.
+  "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 
