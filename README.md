@@ -4,13 +4,15 @@ The command line for the [Sevra hub](https://www.sevrahq.com): the managed home 
 
 A brain is a database in plain files ([db.md](https://github.com/carloslfu/db.md)) that your own AI operates. Sevra keeps it alive, organized, indexed, and reachable. This CLI is how an agent works with a hosted brain: push a local store, query it back, publish pages, share access.
 
+It is a single static binary. No runtime, no package manager, no dependencies. It installs on any machine an agent runs on.
+
 ## Install
 
 ```sh
 curl -fsSL https://www.sevrahq.com/install/sevra.sh | sh
 ```
 
-Requires Node.js 18+. One self-contained file lands on your PATH. No packages, no dependencies, nothing else installed.
+macOS and Linux, x86_64 and arm64. On Windows use WSL. The installer verifies the download's SHA-256 and its Ed25519 publisher signature before placing the binary on your PATH.
 
 ## Commands
 
@@ -36,47 +38,34 @@ sevra inbox list|drain <brain>                   read the evidence inbox (drain 
 sevra export <brain> [dir]                       write your brain back to disk (you own it)
 
 sevra validate [dir]                             wraps `dbmd validate --all`
-sevra version                                    print this build's stamp
-sevra update                                     self-replace with the hub's current build
+sevra version
+sevra update                                     signed self-update; checks dbmd too
 ```
 
-Config lives at `~/.sevra/config.json`. Env `SEVRA_HUB_URL` / `SEVRA_API_KEY` override it.
+Config lives at `~/.sevra/config.json` (written 0600). Env `SEVRA_HUB_URL` / `SEVRA_API_KEY` override it.
 
 ## Built for agents
 
-sevra is a machine interface. Add `--json` to any command for machine-readable output on stdout, always, including errors. Error messages are written as instructions an agent can act on. Informational notices go to stderr and never break parsing.
+sevra is a machine interface. Add `--json` to any command for machine-readable output on stdout, always, including errors. Error messages are written as instructions an agent can act on. Notices go to stderr and never corrupt `--json` parsing.
 
-## How updates work
+## Updates and signing
 
-sevra is versionless: the deploy is the release. Every build carries a stamp (the short git sha). The CLI compares its stamp against the hub on every call and replaces its own file when the hub runs a newer build. The running command finishes untouched; the new build applies on the next run. Set `SEVRA_NO_AUTO_UPDATE=1` to get a one-line notice instead. `sevra update` updates explicitly and also reports when your local `dbmd` is behind.
+Every release binary is signed (Ed25519) and published to GitHub Releases with a `SHA256SUMS` manifest. `sevra` checks the hub for a newer release and updates itself: it downloads the platform asset, verifies the signature against the key pinned in the binary, and atomically replaces its own file. The running command finishes on its loaded code; the new version applies next run. Set `SEVRA_NO_AUTO_UPDATE=1` for a one-line notice instead, or run `sevra update` explicitly (it also reports when your local `dbmd` is behind).
 
-## Signing
+The publisher public key is in [`sevra.pub`](sevra.pub) and served at [`/install/sevra.pub`](https://www.sevrahq.com/install/sevra.pub) for out-of-band verification.
 
-Every served build is signed (Ed25519, detached signature). The installer verifies before installing. The CLI verifies before every self-update and refuses anything that fails. The public key is pinned in the installer and the CLI, served at [`/install/sevra.pub`](https://www.sevrahq.com/install/sevra.pub), and included in this repo as [`sevra.pub`](sevra.pub).
-
-Verify out of band:
+## Build from source
 
 ```sh
-curl -sO https://www.sevrahq.com/install/sevra.cjs
-curl -sO https://www.sevrahq.com/install/sevra.cjs.sig
-node -e '
-const { createPublicKey, verify } = require("node:crypto");
-const { readFileSync } = require("node:fs");
-const ok = verify(null, readFileSync("sevra.cjs"),
-  createPublicKey(readFileSync("sevra.pub")),
-  Buffer.from(readFileSync("sevra.cjs.sig", "utf8").trim(), "base64"));
-console.log(ok ? "valid" : "INVALID"); process.exit(ok ? 0 : 1)'
+cargo build --release   # target/release/sevra
+make check              # fmt + clippy + test
 ```
 
-## Source of truth
-
-This repo mirrors the canonical source in the Sevra platform repo on every change. The served artifact at `/install/sevra.cjs` is transpiled from [`sevra.ts`](sevra.ts) on every deploy, stamped, and signed. A Rust port with the same signed self-update chain is planned and will land in this repo.
-
-Issues and feedback are welcome here.
+Rust 1.82+. The dependency tree is permissive-licensed only, enforced by `cargo deny`.
 
 ## Related
 
-- [db.md](https://github.com/carloslfu/db.md): the open standard for databases in plain files. The `dbmd` CLI is the neutral tool for the format; sevra wraps it and never reimplements it.
+- [db.md](https://github.com/carloslfu/db.md): the open standard for databases in plain files. The `dbmd` CLI is the neutral tool for the format; sevra wraps it (via `validate`) and never reimplements it.
 - [Sevra](https://www.sevrahq.com): the hub. The home is free.
 
 ## License

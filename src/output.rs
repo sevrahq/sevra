@@ -22,7 +22,10 @@ pub fn json_mode() -> bool {
 /// `--json` mode (an empty object when no data is supplied).
 pub fn out(human: &str, data: Option<Value>) {
     if json_mode() {
-        println!("{}", serde_json::to_string_pretty(&data.unwrap_or_else(|| json!({}))).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&data.unwrap_or_else(|| json!({}))).unwrap()
+        );
     } else {
         println!("{human}");
     }
@@ -46,7 +49,10 @@ pub fn fail(msg: &str, data: Option<Value>) -> ! {
                 obj.insert(k, v);
             }
         }
-        println!("{}", serde_json::to_string_pretty(&Value::Object(obj)).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&Value::Object(obj)).unwrap()
+        );
     } else {
         eprintln!("sevra: {msg}");
     }

@@ -141,14 +141,33 @@ fn main() {
     match cli.command {
         Commands::Whoami => commands::whoami(&cfg),
         Commands::Brains => commands::brains(&cfg),
-        Commands::Create { slug, name, scope, public } => commands::create(&cfg, &slug, name, scope, public),
+        Commands::Create {
+            slug,
+            name,
+            scope,
+            public,
+        } => commands::create(&cfg, &slug, name, scope, public),
         Commands::Push { dir, brain } => commands::push(&cfg, &dir, &brain),
-        Commands::Query { brain, text, type_, layer, meta_type, tag, order, limit, r#where } => {
-            commands::query(&cfg, &brain, text, type_, layer, meta_type, tag, order, limit, r#where)
-        }
+        Commands::Query {
+            brain,
+            text,
+            type_,
+            layer,
+            meta_type,
+            tag,
+            order,
+            limit,
+            r#where,
+        } => commands::query(
+            &cfg, &brain, text, type_, layer, meta_type, tag, order, limit, r#where,
+        ),
         Commands::Get { brain, reference } => commands::get(&cfg, &brain, &reference),
         Commands::Graph { brain, path, dir } => commands::graph(&cfg, &brain, &path, dir),
-        Commands::Grant { brain, email, write } => commands::grant(&cfg, &brain, &email, write),
+        Commands::Grant {
+            brain,
+            email,
+            write,
+        } => commands::grant(&cfg, &brain, &email, write),
         Commands::Grants { brain } => commands::grants(&cfg, &brain),
         Commands::Revoke { brain, grant_id } => commands::revoke(&cfg, &brain, &grant_id),
         Commands::Shared => commands::shared(&cfg),
@@ -158,6 +177,9 @@ fn main() {
         Commands::Export { brain, dir } => commands::export(&cfg, &brain, dir),
         Commands::Update => update::cmd_update(&cfg),
         // handled above
-        Commands::Login { .. } | Commands::Logout | Commands::Validate { .. } | Commands::Version => unreachable!(),
+        Commands::Login { .. }
+        | Commands::Logout
+        | Commands::Validate { .. }
+        | Commands::Version => unreachable!(),
     }
 }

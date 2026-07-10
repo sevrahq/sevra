@@ -24,7 +24,9 @@ pub struct Config {
 }
 
 pub fn config_dir() -> PathBuf {
-    home::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".sevra")
+    home::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".sevra")
 }
 
 pub fn config_path() -> PathBuf {

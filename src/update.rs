@@ -143,7 +143,11 @@ pub fn maybe_auto_update(cfg: &Config) {
         Some(v) => v,
         None => return,
     };
-    let latest = match versions.get("sevra").and_then(|s| s.get("latest")).and_then(|l| l.as_str()) {
+    let latest = match versions
+        .get("sevra")
+        .and_then(|s| s.get("latest"))
+        .and_then(|l| l.as_str())
+    {
         Some(l) => l.to_string(),
         None => return,
     };
@@ -178,8 +182,12 @@ pub fn cmd_version() {
 /// dbmd's staleness (dbmd never auto-updates — a versioned standards tool).
 pub fn cmd_update(cfg: &Config) {
     crate::hub::assert_safe_hub(&cfg.hub);
-    let versions = fetch_versions(&cfg.hub)
-        .unwrap_or_else(|| fail(&format!("could not reach {}/api/hub/versions", cfg.hub), None));
+    let versions = fetch_versions(&cfg.hub).unwrap_or_else(|| {
+        fail(
+            &format!("could not reach {}/api/hub/versions", cfg.hub),
+            None,
+        )
+    });
     let latest = versions
         .get("sevra")
         .and_then(|s| s.get("latest"))
@@ -192,13 +200,18 @@ pub fn cmd_update(cfg: &Config) {
     if is_older(VERSION, &latest) {
         match download_verify_replace(&latest) {
             Ok(()) => {
-                line = format!("updated {VERSION} → {latest} (signature verified; applies next run)");
+                line =
+                    format!("updated {VERSION} → {latest} (signature verified; applies next run)");
                 data.insert("from".into(), json!(VERSION));
                 data.insert("to".into(), json!(latest));
                 data.insert("updated".into(), json!(true));
             }
             Err(e) => {
-                let msg = if e.contains("FAILED") { format!("SECURITY: {e}") } else { e };
+                let msg = if e.contains("FAILED") {
+                    format!("SECURITY: {e}")
+                } else {
+                    e
+                };
                 fail(&msg, None)
             }
         }
@@ -218,18 +231,27 @@ pub fn cmd_update(cfg: &Config) {
                         "\ndbmd: not installed — get it: curl -fsSL {}/install/dbmd.sh | sh",
                         cfg.hub
                     ));
-                    data.insert("dbmd".into(), json!({ "installed": null, "latest": dbmd_latest }));
+                    data.insert(
+                        "dbmd".into(),
+                        json!({ "installed": null, "latest": dbmd_latest }),
+                    );
                 }
                 Some(v) if is_older(v, dbmd_latest) => {
                     line.push_str(&format!(
                         "\ndbmd {v} is behind {dbmd_latest} — update: curl -fsSL {}/install/dbmd.sh | sh",
                         cfg.hub
                     ));
-                    data.insert("dbmd".into(), json!({ "installed": v, "latest": dbmd_latest, "current": false }));
+                    data.insert(
+                        "dbmd".into(),
+                        json!({ "installed": v, "latest": dbmd_latest, "current": false }),
+                    );
                 }
                 Some(v) => {
                     line.push_str(&format!("\ndbmd {v} — current"));
-                    data.insert("dbmd".into(), json!({ "installed": v, "latest": dbmd_latest, "current": true }));
+                    data.insert(
+                        "dbmd".into(),
+                        json!({ "installed": v, "latest": dbmd_latest, "current": true }),
+                    );
                 }
             }
         }
@@ -243,7 +265,10 @@ pub fn cmd_update(cfg: &Config) {
 }
 
 fn dbmd_installed_version() -> Option<String> {
-    let output = std::process::Command::new("dbmd").arg("--version").output().ok()?;
+    let output = std::process::Command::new("dbmd")
+        .arg("--version")
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }

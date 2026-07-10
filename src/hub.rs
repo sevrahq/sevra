@@ -100,10 +100,7 @@ pub fn ensure_ok(r: HubResponse, what: &str) -> Value {
             .and_then(|e| e.as_str())
             .unwrap_or("unknown error")
             .to_string();
-        fail(
-            &format!("{what} failed (HTTP {}): {msg}", r.status),
-            r.body,
-        );
+        fail(&format!("{what} failed (HTTP {}): {msg}", r.status), r.body);
     }
     match r.body {
         Some(b) => b,

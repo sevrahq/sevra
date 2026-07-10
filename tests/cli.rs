@@ -9,7 +9,10 @@ use predicates::prelude::*;
 fn sevra() -> Command {
     let mut c = Command::cargo_bin("sevra").unwrap();
     // Isolate HOME so no real ~/.sevra credential leaks in.
-    c.env("HOME", std::env::temp_dir().join(format!("sevra-test-{}", std::process::id())));
+    c.env(
+        "HOME",
+        std::env::temp_dir().join(format!("sevra-test-{}", std::process::id())),
+    );
     c.env_remove("SEVRA_API_KEY");
     c.env_remove("SEVRA_HUB_URL");
     c
@@ -17,17 +20,29 @@ fn sevra() -> Command {
 
 #[test]
 fn version_prints_semver() {
-    sevra().arg("version").assert().success().stdout(predicate::str::contains(env!("CARGO_PKG_VERSION")));
+    sevra()
+        .arg("version")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(env!("CARGO_PKG_VERSION")));
 }
 
 #[test]
 fn version_json_is_machine_readable() {
-    sevra().args(["version", "--json"]).assert().success().stdout(predicate::str::contains("\"version\""));
+    sevra()
+        .args(["version", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"version\""));
 }
 
 #[test]
 fn help_lists_commands() {
-    sevra().arg("--help").assert().success().stdout(predicate::str::contains("login").and(predicate::str::contains("update")));
+    sevra()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("login").and(predicate::str::contains("update")));
 }
 
 #[test]
@@ -84,7 +99,11 @@ fn json_error_contract_on_stdout() {
 
 #[test]
 fn validate_reports_missing_dir() {
-    sevra().args(["validate", "./definitely-not-a-dir-xyz"]).assert().failure().stderr(predicate::str::contains("directory not found"));
+    sevra()
+        .args(["validate", "./definitely-not-a-dir-xyz"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("directory not found"));
 }
 
 #[test]

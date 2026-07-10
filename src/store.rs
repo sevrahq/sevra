@@ -31,7 +31,12 @@ fn rel_posix(root: &Path, full: &Path) -> String {
         .join("/")
 }
 
-fn walk(root: &Path, dir: &Path, visited: &mut HashSet<std::path::PathBuf>, store: &mut Store) -> std::io::Result<()> {
+fn walk(
+    root: &Path,
+    dir: &Path,
+    visited: &mut HashSet<std::path::PathBuf>,
+    store: &mut Store,
+) -> std::io::Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
