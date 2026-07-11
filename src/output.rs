@@ -43,12 +43,15 @@ pub fn note(msg: &str) {
 pub fn fail(msg: &str, data: Option<Value>) -> ! {
     if json_mode() {
         let mut obj = serde_json::Map::new();
-        obj.insert("error".into(), Value::String(msg.to_string()));
+        // Extras first: `error` must always be OUR formatted message — a hub
+        // body that itself carries an `error` key must not clobber it (the
+        // formatted message embeds the hub's text plus the HTTP status).
         if let Some(Value::Object(extra)) = data {
             for (k, v) in extra {
                 obj.insert(k, v);
             }
         }
+        obj.insert("error".into(), Value::String(msg.to_string()));
         println!(
             "{}",
             serde_json::to_string_pretty(&Value::Object(obj)).unwrap()

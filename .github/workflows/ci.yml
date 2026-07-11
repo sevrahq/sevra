@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   check:
     name: fmt + clippy + test + deny
@@ -20,4 +23,12 @@ jobs:
       - run: cargo test --locked
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          command: check advisories licenses bans
+          command: check advisories licenses bans sources
+
+  msrv:
+    name: build on MSRV (1.82)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.82
+      - run: cargo build --locked

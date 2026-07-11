@@ -15,7 +15,8 @@ Authenticate (key from the dashboard at https://www.sevrahq.com/dashboard):
 
 Agent contract:
 - Add `--json` to ANY command: machine-readable JSON on stdout, always,
-  including errors ({"error": ...}); exit code 1 on failure.
+  including errors ({"error": ...}); exit code 1 on failure, 2 on usage
+  errors (bad flags/arguments), 0 with {"help"/"version"} for --help/--version.
 - Notices go to stderr, never stdout.
 - Config: ~/.sevra/config.json (0600). Env SEVRA_HUB_URL / SEVRA_API_KEY
   override it. Non-HTTPS hubs are refused (localhost exempt).

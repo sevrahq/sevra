@@ -132,3 +132,98 @@ fn json_flag_before_positional_is_not_swallowed() {
         .failure()
         .stdout(predicate::str::contains("\"error\""));
 }
+
+#[test]
+fn malformed_key_never_leaks_into_output() {
+    // A key with an INTERIOR control byte cannot travel in a header; ureq's
+    // own validation error would echo the ENTIRE authorization header. The
+    // CLI must refuse it first — and the secret must appear nowhere in
+    // stdout or stderr, in either output mode. (Trailing whitespace is the
+    // separate, trimmed-and-proceed case below.)
+    for json in [false, true] {
+        let mut c = sevra();
+        c.arg("brains");
+        if json {
+            c.arg("--json");
+        }
+        let out = c
+            .env("SEVRA_HUB_URL", "http://localhost:9")
+            .env("SEVRA_API_KEY", "vc_account_TOPSECRET\nLEAKCHECK")
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!all.contains("TOPSECRET"), "key leaked into output: {all}");
+        assert!(all.contains("re-copy it from the dashboard"), "got: {all}");
+    }
+}
+
+#[test]
+fn key_with_surrounding_whitespace_is_trimmed_not_refused() {
+    // Trim the paste artifact and proceed — the request then fails on auth
+    // (or reachability), never on the header.
+    sevra()
+        .arg("brains")
+        .env("SEVRA_HUB_URL", "http://localhost:9")
+        .env("SEVRA_API_KEY", " vc_account_x \n")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("hub unreachable"));
+}
+
+#[test]
+fn version_flag_honors_json() {
+    // clap's built-in --version must not break the JSON contract.
+    sevra()
+        .args(["--json", "--version"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"version\""));
+    sevra()
+        .args(["--json", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"help\""));
+}
+
+#[test]
+fn logout_without_credential_is_honest() {
+    sevra()
+        .arg("logout")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no stored credential"));
+}
+
+#[test]
+fn inbox_action_and_graph_dir_are_usage_checked() {
+    // Bad enum values are clap usage errors (exit 2), honoring --json.
+    sevra()
+        .args(["inbox", "purge", "b", "--json"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("\"error\""));
+    sevra()
+        .args(["graph", "b", "p", "--dir", "sideways"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("possible values"));
+}
+
+#[test]
+fn validate_rejects_a_regular_file() {
+    // A FILE as the store dir must not misreport as "dbmd not installed".
+    let tmp = std::env::temp_dir().join(format!("sevra-vf-{}", std::process::id()));
+    std::fs::write(&tmp, "not a dir").unwrap();
+    sevra()
+        .arg("validate")
+        .arg(&tmp)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("directory not found"));
+    let _ = std::fs::remove_file(&tmp);
+}

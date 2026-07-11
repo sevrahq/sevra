@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.1.3 — 2026-07-11
+
+Adversarial-review round three (two independent fresh-eyes reviews + an
+empirical edge-case pass).
+
+Security:
+
+- A malformed API key can no longer leak into output. A key with a bad byte
+  (e.g. an interior control character) used to reach ureq's header
+  validation, whose error echoed the ENTIRE authorization header — key
+  included — onto stdout/stderr. Keys are now whitespace-trimmed (the classic
+  trailing-newline paste artifact just works) and charset-checked before any
+  header is built; refusal messages never echo the key. Locked by a test.
+- Release builds no longer restore a mutable build cache (a poisoning vector
+  for bytes that get signed).
+- cargo-deny now also enforces the `[sources]` policy in CI (unknown
+  registries/git sources were declared denied but the check never ran).
+- The `workflow_dispatch` version input is env-bound, not interpolated into
+  the script.
+- ci/audit/smoke workflows run with least-privilege `contents: read`.
+- install.sh honors `SEVRA_REQUIRE_SIGNATURE=1`: fail the install when the
+  Ed25519 check cannot run here, instead of relying on SHA-256 + HTTPS alone.
+
+Correctness and honesty:
+
+- `logout` is honest: reports removal, reports "no stored credential", and
+  FAILS LOUDLY when the credential file exists but cannot be removed
+  (previously it always claimed success while the key stayed on disk).
+- `--json` now holds for clap's built-in `--version` and `--help` (they
+  printed human text on stdout under --json).
+- In `--json` failures, the `error` field is always sevra's formatted message
+  (status + context); a hub body carrying its own `error` key no longer
+  clobbers it.
+- An oversized release asset fails as "asset exceeds 64 MB" instead of
+  surfacing as a false signature-verification alarm.
+- `validate` on a regular file says "directory not found" instead of
+  misreporting that dbmd is not installed.
+- `inbox` action and `graph --dir` are clap-validated (usage errors, exit 2,
+  self-documenting help); `query --limit` is a real integer argument.
+- RELEASING.md now states the signing-secret encoding exactly (base64 of the
+  PKCS#8 PEM) with the command — following the old text on key rotation
+  would have broken the sign step with ERR_OSSL_UNSUPPORTED.
+- README no longer claims `SEVRA_NO_AUTO_UPDATE=1` prints a notice (it
+  disables the check entirely, as the code and llms.txt already said);
+  SECURITY.md states precisely what SHA-256 vs Ed25519 each prove.
+- MSRV (1.82) is now enforced by a CI job instead of merely claimed;
+  `ring` is attributed as Apache-2.0 AND ISC in THIRD_PARTY_NOTICES.
+- store-walk unit tests (cap boundary, dotfile skip, symlink-cycle dedup,
+  named non-UTF8 errors); 27 tests total.
+
 ## 0.1.2 — 2026-07-11
 
 Adversarial-review round two.

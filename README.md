@@ -50,7 +50,7 @@ sevra is a machine interface. Add `--json` to any command for machine-readable o
 
 ## Updates and signing
 
-Every release binary is signed (Ed25519) and published to GitHub Releases with a `SHA256SUMS` manifest. `sevra` checks the hub for a newer release and updates itself: it downloads the platform asset, verifies the signature against the key pinned in the binary, and atomically replaces its own file. The running command finishes on its loaded code; the new version applies next run. Set `SEVRA_NO_AUTO_UPDATE=1` for a one-line notice instead, or run `sevra update` explicitly (it also reports when your local `dbmd` is behind).
+Every release binary is signed (Ed25519) and published to GitHub Releases with a `SHA256SUMS` manifest. `sevra` checks the hub for a newer release at most once a day and updates itself: it downloads the platform asset, verifies the signature against the key pinned in the binary, and atomically replaces its own file. The running command finishes on its loaded code; the new version applies next run. `SEVRA_NO_AUTO_UPDATE=1` disables the check entirely (no request, no notice); run `sevra update` explicitly instead (it also reports when your local `dbmd` is behind).
 
 The publisher public key is in [`sevra.pub`](sevra.pub) and served at [`/install/sevra.pub`](https://www.sevrahq.com/install/sevra.pub) for out-of-band verification.
 

@@ -28,7 +28,10 @@ BSD-3-Clause
   curve25519-dalek, ed25519-dalek, subtle
 
 ISC
-  ring, rustls, rustls-webpki, untrusted
+  rustls, rustls-webpki, untrusted
+
+Apache-2.0 AND ISC
+  ring
 
 Unicode-3.0 (ICU4X data + machinery, via url/idna)
   icu_collections, icu_locale_core, icu_normalizer, icu_normalizer_data,

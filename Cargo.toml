@@ -1,6 +1,6 @@
 [package]
 name = "sevra"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 # MSRV: pinned conservatively; the dep tree (ureq/rustls/ed25519-dalek) builds
 # clean on 1.82+. Bump only with a recorded reason.

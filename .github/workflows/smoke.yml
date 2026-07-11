@@ -19,6 +19,9 @@ on:
         description: "Version to smoke (without leading v; default latest)"
         required: false
 
+permissions:
+  contents: read
+
 jobs:
   install:
     name: install (${{ matrix.os }})

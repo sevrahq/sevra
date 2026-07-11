@@ -99,6 +99,13 @@ pub fn save(hub: &str, key: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-pub fn remove() -> bool {
-    fs::remove_file(config_path()).is_ok()
+/// Remove the credential file. Ok(true) = removed, Ok(false) = nothing to
+/// remove; a file that exists but cannot be deleted is an Err (the caller
+/// must NOT report a clean logout).
+pub fn remove() -> std::io::Result<bool> {
+    match fs::remove_file(config_path()) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
 }

@@ -80,8 +80,9 @@ enum Commands {
         tag: Option<String>,
         #[arg(long)]
         order: Option<String>,
+        /// Max results (the hub clamps to 1..200)
         #[arg(long)]
-        limit: Option<String>,
+        limit: Option<u32>,
         #[arg(long)]
         r#where: Option<String>,
     },
@@ -91,7 +92,8 @@ enum Commands {
     Graph {
         brain: String,
         path: String,
-        #[arg(long)]
+        /// Edge direction (default: both)
+        #[arg(long, value_parser = ["in", "out", "both"])]
         dir: Option<String>,
     },
     /// Grant a person read (or --write) access
@@ -112,7 +114,11 @@ enum Commands {
     /// Pull all public pages
     Unpublish { brain: String },
     /// Read the evidence inbox (drain = full JSON)
-    Inbox { sub: String, brain: String },
+    Inbox {
+        #[arg(value_parser = ["list", "drain"])]
+        action: String,
+        brain: String,
+    },
     /// Write your brain back to disk (you own it)
     Export { brain: String, dir: Option<String> },
     /// Validate a store (wraps `dbmd validate --all`)
@@ -124,16 +130,37 @@ enum Commands {
 }
 
 fn main() {
-    // Even clap's own errors honor the --json contract: an agent parsing
-    // stdout must get a JSON object, not human usage text. Exit code stays
-    // clap's (2 = usage error).
+    // Even clap's own output honors the --json contract: an agent parsing
+    // stdout must get a JSON object, never human text — including the
+    // built-in `--version`/`--help` flags. Exit codes stay clap's
+    // (0 = help/version, 2 = usage error).
     let cli = Cli::try_parse().unwrap_or_else(|e| {
-        if std::env::args().any(|a| a == "--json") && e.use_stderr() {
-            println!(
-                "{}",
-                serde_json::json!({ "error": e.render().to_string().trim() })
-            );
-            std::process::exit(2);
+        if std::env::args().any(|a| a == "--json") {
+            use clap::error::ErrorKind;
+            match e.kind() {
+                ErrorKind::DisplayVersion => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "version": update::VERSION,
+                            "target": update::asset_target(),
+                        })
+                    );
+                    std::process::exit(0);
+                }
+                ErrorKind::DisplayHelp => {
+                    println!("{}", serde_json::json!({ "help": e.render().to_string() }));
+                    std::process::exit(0);
+                }
+                _ if e.use_stderr() => {
+                    println!(
+                        "{}",
+                        serde_json::json!({ "error": e.render().to_string().trim() })
+                    );
+                    std::process::exit(2);
+                }
+                _ => {}
+            }
         }
         e.exit();
     });
@@ -184,7 +211,7 @@ fn main() {
         Commands::Shared => commands::shared(&cfg),
         Commands::Publish { brain } => commands::publish(&cfg, &brain),
         Commands::Unpublish { brain } => commands::unpublish(&cfg, &brain),
-        Commands::Inbox { sub, brain } => commands::inbox(&cfg, &sub, &brain),
+        Commands::Inbox { action, brain } => commands::inbox(&cfg, &action, &brain),
         Commands::Export { brain, dir } => commands::export(&cfg, &brain, dir),
         Commands::Update => update::cmd_update(&cfg),
         // handled above

@@ -6,7 +6,8 @@
 //! process finishes on loaded code; the new build applies next run. The
 //! flyctl model, with signing.
 //!
-//! `SEVRA_NO_AUTO_UPDATE=1` downgrades the auto path to a one-line notice.
+//! `SEVRA_NO_AUTO_UPDATE=1` disables the auto path entirely (no request, no
+//! notice); `sevra update` stays the explicit path.
 
 use std::fs;
 use std::io::Read;
@@ -100,6 +101,8 @@ fn fetch_versions(hub: &str) -> Option<Value> {
     serde_json::from_str(&text).ok()
 }
 
+const MAX_ASSET_BYTES: u64 = 64 * 1024 * 1024;
+
 fn download(url: &str) -> Result<Vec<u8>, String> {
     let resp = agent()
         .get(url)
@@ -107,9 +110,17 @@ fn download(url: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("download failed {url}: {e}"))?;
     let mut buf = Vec::new();
     resp.into_reader()
-        .take(64 * 1024 * 1024)
+        .take(MAX_ASSET_BYTES + 1)
         .read_to_end(&mut buf)
         .map_err(|e| format!("read failed {url}: {e}"))?;
+    // Refuse oversize EXPLICITLY: silently truncating would surface later as
+    // a signature-verification failure — a false security alarm.
+    if buf.len() as u64 > MAX_ASSET_BYTES {
+        return Err(format!(
+            "asset exceeds {} MB, refusing: {url}",
+            MAX_ASSET_BYTES / (1024 * 1024)
+        ));
+    }
     Ok(buf)
 }
 

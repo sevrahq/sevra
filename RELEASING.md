@@ -29,9 +29,18 @@ the hub's `/api/hub/versions`.
 ## Key custody
 
 The Ed25519 signing key lives in three places (Vercel production env,
-the platform repo's `.env.local`, this repo's Actions secret). Set the
-secret by piping to stdin: `gh secret set SEVRA_CLI_SIGNING_KEY -R
-sevrahq/sevra` — never `--body -`, which stores a literal dash. Rotation is
+the platform repo's `.env.local`, this repo's Actions secret). The secret's
+value is the **base64 of the PKCS#8 PEM** (release.yml decodes with
+`Buffer.from(..., "base64")` and hands the PEM to `createPrivateKey`; a raw
+PEM or base64-of-DER fails the sign step with ERR_OSSL_UNSUPPORTED). Set it
+by piping to stdin:
+
+```sh
+base64 < sevra-signing-key.pem | tr -d '\n' \
+  | gh secret set SEVRA_CLI_SIGNING_KEY -R sevrahq/sevra
+```
+
+Never `--body -`, which stores a literal dash. Rotation is
 additive and order-sensitive: pin the NEW public key in `src/signing.rs` +
 `install.sh` + `sevra.pub`, release while still signing with the old key, let
 installed binaries update onto the dual-pin build, then swap the private key

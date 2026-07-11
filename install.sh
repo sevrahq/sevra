@@ -10,7 +10,10 @@
 # dependencies. macOS + Linux (x86_64/arm64); on Windows use WSL.
 #
 # Honors: SEVRA_INSTALL_DIR (default ~/.sevra/bin), SEVRA_VERSION (default
-# latest), SEVRA_INSTALL_BASE (default GitHub releases). POSIX sh, no bashisms.
+# latest), SEVRA_INSTALL_BASE (default GitHub releases),
+# SEVRA_REQUIRE_SIGNATURE=1 (fail the install when the Ed25519 signature
+# cannot be checked here, instead of relying on SHA-256 + HTTPS alone).
+# POSIX sh, no bashisms.
 set -eu
 
 REPO="sevrahq/sevra"
@@ -122,8 +125,10 @@ if [ "$verified_sig" -eq 0 ] && have openssl; then
 fi
 if [ "$verified_sig" -eq 1 ]; then
   info "signature: verified (ed25519)"
+elif [ "${SEVRA_REQUIRE_SIGNATURE:-}" = "1" ]; then
+  err "signature could not be checked (no node or openssl 3) and SEVRA_REQUIRE_SIGNATURE=1 — refusing to install"
 else
-  info "signature: not checked here (no node or openssl 3); the SHA-256 above was verified over HTTPS, and the binary re-verifies its signature on every self-update"
+  info "signature: not checked here (no node or openssl 3); the SHA-256 above was verified over HTTPS, and the binary re-verifies its signature on every self-update. Set SEVRA_REQUIRE_SIGNATURE=1 to make this check mandatory."
 fi
 
 # ── Install ──────────────────────────────────────────────────────────────────

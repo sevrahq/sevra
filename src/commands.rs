@@ -57,6 +57,9 @@ pub fn login(flag_hub: Option<String>, key: Option<String>) {
     let key = key.or_else(|| config::env_nonempty("SEVRA_API_KEY")).unwrap_or_else(|| {
         fail("provide a key: `sevra login --key vc_account_…` (create one in the dashboard). SEVRA_API_KEY also works.", None)
     });
+    // Trim paste artifacts + refuse non-token bytes NOW, so the stored file is
+    // clean and the refusal happens at login, not on the next command.
+    let key = crate::hub::clean_key(&key);
 
     let probe_cfg = Config {
         hub: hub.clone(),
@@ -102,11 +105,26 @@ pub fn login(flag_hub: Option<String>, key: Option<String>) {
 }
 
 pub fn logout() {
-    config::remove();
-    out(
-        "logged out (removed ~/.sevra/config.json)",
-        Some(json!({ "ok": true })),
-    );
+    // Honest about what happened: a credential file that EXISTS but cannot be
+    // removed must be a loud failure (the key would silently survive on disk),
+    // and a no-op logout must not claim it removed anything.
+    match config::remove() {
+        Ok(true) => out(
+            "logged out (removed ~/.sevra/config.json)",
+            Some(json!({ "ok": true, "removed": true })),
+        ),
+        Ok(false) => out(
+            "logged out (no stored credential to remove)",
+            Some(json!({ "ok": true, "removed": false })),
+        ),
+        Err(e) => fail(
+            &format!(
+                "could not remove {} — the stored key is STILL on disk: {e}",
+                config::config_path().display()
+            ),
+            None,
+        ),
+    }
 }
 
 pub fn whoami(cfg: &Config) {
@@ -240,7 +258,7 @@ pub fn query(
     meta_type: Option<String>,
     tag: Option<String>,
     order: Option<String>,
-    limit: Option<String>,
+    limit: Option<u32>,
     where_: Option<String>,
 ) {
     let mut params: Vec<(String, String)> = Vec::new();
@@ -253,7 +271,7 @@ pub fn query(
         ("meta-type", meta_type),
         ("tag", tag),
         ("order", order),
-        ("limit", limit),
+        ("limit", limit.map(|n| n.to_string())),
     ] {
         if let Some(val) = v {
             params.push((k.into(), val));
@@ -354,10 +372,8 @@ pub fn get(cfg: &Config, brain: &str, reference: &str) {
 }
 
 pub fn graph(cfg: &Config, brain: &str, path: &str, dir: Option<String>) {
+    // clap's value_parser already constrained --dir to in|out|both.
     let dir = dir.unwrap_or_else(|| "both".into());
-    if !["in", "out", "both"].contains(&dir.as_str()) {
-        fail("--dir must be one of: in, out, both", None);
-    }
     let r = ensure_ok(
         request(
             cfg,
@@ -598,10 +614,8 @@ pub fn unpublish(cfg: &Config, brain: &str) {
     );
 }
 
-pub fn inbox(cfg: &Config, sub: &str, brain: &str) {
-    if sub != "list" && sub != "drain" {
-        fail("usage: sevra inbox list|drain <brain>", None);
-    }
+pub fn inbox(cfg: &Config, action: &str, brain: &str) {
+    // clap's value_parser already constrained the action to list|drain.
     let r = ensure_ok(
         request(
             cfg,
@@ -612,7 +626,7 @@ pub fn inbox(cfg: &Config, sub: &str, brain: &str) {
         ),
         "inbox",
     );
-    if json_mode() || sub == "drain" {
+    if json_mode() || action == "drain" {
         // drain prints the full payload as JSON regardless of mode (the BYO
         // agent's read half).
         println!("{}", serde_json::to_string_pretty(&r).unwrap());
@@ -785,7 +799,9 @@ fn normalize(p: &Path) -> PathBuf {
 
 pub fn validate(dir: Option<String>) {
     let dir = dir.unwrap_or_else(|| ".".into());
-    if !Path::new(&dir).exists() {
+    // is_dir, not exists: handing dbmd a FILE as its working dir would fail
+    // with a spawn error that misreads as "dbmd is not installed".
+    if !Path::new(&dir).is_dir() {
         fail(&format!("directory not found: {dir}"), None);
     }
     // The --json contract holds THROUGH the shell-out: dbmd has its own

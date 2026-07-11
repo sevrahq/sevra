@@ -55,6 +55,23 @@ fn agent() -> ureq::Agent {
         .build()
 }
 
+/// A key must be a clean header token before it is placed in the bearer
+/// header: ureq rejects bad header VALUES with an error that echoes the whole
+/// header line — key included — so a stray newline from a copy/paste would
+/// otherwise leak the secret into stdout/stderr. Trim the usual paste
+/// artifacts, then refuse anything still outside the printable-ASCII token
+/// range WITHOUT echoing the key.
+pub fn clean_key(raw: &str) -> String {
+    let k = raw.trim();
+    if k.bytes().any(|b| !(0x21..=0x7e).contains(&b)) {
+        fail(
+            "the API key contains whitespace or non-ASCII characters — re-copy it from the dashboard (the key is not shown here on purpose)",
+            None,
+        );
+    }
+    k.to_string()
+}
+
 /// Perform a hub request. `auth` toggles the bearer header (the caller passes
 /// false only for the login probe, which supplies its own key inline).
 pub fn request(
@@ -69,7 +86,7 @@ pub fn request(
     let mut req = agent().request(method, &url);
     if auth {
         match &cfg.key {
-            Some(k) => req = req.set("authorization", &format!("Bearer {k}")),
+            Some(k) => req = req.set("authorization", &format!("Bearer {}", clean_key(k))),
             None => fail(
                 "not logged in — run `sevra login --key vc_account_…` (get a key from the dashboard)",
                 None,
