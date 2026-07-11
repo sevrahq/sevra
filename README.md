@@ -61,7 +61,7 @@ cargo build --release   # target/release/sevra
 make check              # fmt + clippy + test
 ```
 
-Rust 1.82+. The dependency tree is permissive-licensed only, enforced by `cargo deny`.
+Rust 1.85+. The dependency tree is permissive-licensed only, enforced by `cargo deny`.
 
 ## Related
 
