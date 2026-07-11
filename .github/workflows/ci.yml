@@ -26,9 +26,9 @@ jobs:
           command: check advisories licenses bans sources
 
   msrv:
-    name: build on MSRV (1.85)
+    name: build on MSRV (1.88)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.85
+      - uses: dtolnay/rust-toolchain@1.88
       - run: cargo build --locked

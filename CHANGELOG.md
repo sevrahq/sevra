@@ -46,8 +46,9 @@ Correctness and honesty:
   disables the check entirely, as the code and llms.txt already said);
   SECURITY.md states precisely what SHA-256 vs Ed25519 each prove.
 - MSRV is now enforced by a CI job instead of merely claimed — which
-  immediately falsified the claim: the locked tree needs 1.85 (base64ct is
-  edition2024), so the declared MSRV is corrected 1.82 → 1.85.
+  immediately falsified the claim: the locked tree's true floor is 1.88
+  (home 0.5.12; base64ct is edition2024), so the declared MSRV is corrected
+  1.82 → 1.88.
   `ring` is attributed as Apache-2.0 AND ISC in THIRD_PARTY_NOTICES.
 - store-walk unit tests (cap boundary, dotfile skip, symlink-cycle dedup,
   named non-UTF8 errors); 27 tests total.
