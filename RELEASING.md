@@ -14,13 +14,17 @@ the hub's `/api/hub/versions`.
    git tag vX.Y.Z && git push origin main vX.Y.Z
    ```
 
-4. CI (`release.yml`) runs preflight, cross-builds the 4 targets, signs each
-   binary with the `SEVRA_CLI_SIGNING_KEY` repo secret, and publishes the
-   GitHub Release with `SHA256SUMS`. The tag MUST equal the Cargo.toml version
-   (preflight enforces it).
+4. CI (`release.yml`) runs preflight, cross-builds the 4 targets, then signs
+   every binary in the publish job (the `SEVRA_CLI_SIGNING_KEY` secret is
+   never exposed to the build jobs or their third-party actions) and publishes
+   the GitHub Release with `SHA256SUMS`. The released version MUST equal the
+   Cargo.toml version (the version job enforces it for tags AND dispatches).
 5. `smoke.yml` installs from the fresh release on macOS + Linux runners and
    runs `sevra version`. Green smoke = the release is live; installed CLIs
    pick it up on their next daily check (or `sevra update`).
+6. If `install.sh` changed: copy it to the platform repo's `install/sevra.sh`
+   (the hub serves that snapshot at https://www.sevrahq.com/install/sevra.sh)
+   and deploy. The two copies must stay byte-identical.
 
 ## Key custody
 

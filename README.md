@@ -12,7 +12,7 @@ It is a single static binary. No runtime, no package manager, no dependencies. I
 curl -fsSL https://www.sevrahq.com/install/sevra.sh | sh
 ```
 
-macOS and Linux, x86_64 and arm64. On Windows use WSL. The installer verifies the download's SHA-256 and its Ed25519 publisher signature before placing the binary on your PATH.
+macOS and Linux, x86_64 and arm64. On Windows use WSL. The installer verifies the download's SHA-256 always, and its Ed25519 publisher signature when node or openssl 3 is present, before placing the binary on your PATH. The binary itself re-verifies the signature on every self-update.
 
 ## Commands
 

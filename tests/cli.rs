@@ -72,6 +72,20 @@ fn refuses_non_https_hub() {
 }
 
 #[test]
+fn ipv6_loopback_is_https_exempt() {
+    // `http://[::1]:9` is loopback: it must pass the HTTPS guard and fail
+    // only on reachability (nothing listens on port 9).
+    sevra()
+        .arg("whoami")
+        .env("SEVRA_HUB_URL", "http://[::1]:9")
+        .env("SEVRA_API_KEY", "x")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("refusing non-HTTPS hub").not())
+        .stderr(predicate::str::contains("hub unreachable"));
+}
+
+#[test]
 fn empty_env_key_reads_as_unset() {
     // SEVRA_API_KEY="" must fall through to "not logged in", not send an empty
     // bearer (the TS `||` truthiness parity).

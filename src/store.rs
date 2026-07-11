@@ -31,6 +31,12 @@ fn rel_posix(root: &Path, full: &Path) -> String {
         .join("/")
 }
 
+/// Read a file, naming it in the error — "stream did not contain valid UTF-8"
+/// with no path is undebuggable in a 10k-file vault.
+fn read_named(full: &Path, rel: &str) -> std::io::Result<String> {
+    fs::read_to_string(full).map_err(|e| std::io::Error::other(format!("{rel}: {e}")))
+}
+
 fn walk(
     root: &Path,
     dir: &Path,
@@ -68,12 +74,10 @@ fn walk(
                 }
             }
             if rel == "assets.jsonl" {
-                store.assets = Some(fs::read_to_string(&full)?);
+                store.assets = Some(read_named(&full, &rel)?);
             } else if counts {
-                store.files.push(StoreFile {
-                    path: rel,
-                    content: fs::read_to_string(&full)?,
-                });
+                let content = read_named(&full, &rel)?;
+                store.files.push(StoreFile { path: rel, content });
             }
         }
     }

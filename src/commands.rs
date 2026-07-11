@@ -743,6 +743,17 @@ pub fn export(cfg: &Config, brain: &str, dir: Option<String>) {
                 );
             }
         }
+        // Never write THROUGH a pre-existing symlink at the leaf: a planted
+        // link inside the target dir would redirect the write outside it
+        // (the parent re-check above only covers directories).
+        if let Ok(m) = std::fs::symlink_metadata(&full) {
+            if m.file_type().is_symlink() {
+                fail(
+                    &format!("refusing to overwrite a symlink: {}", full.display()),
+                    None,
+                );
+            }
+        }
         std::fs::write(&full, content)
             .unwrap_or_else(|e| fail(&format!("write failed {}: {e}", full.display()), None));
     }
@@ -792,5 +803,31 @@ pub fn validate(dir: Option<String>) {
             &format!("could not run dbmd (is it installed? https://www.sevrahq.com/install): {e}"),
             None,
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contained_rejects_escapes() {
+        let root = Path::new("/safe/root");
+        assert!(contained(root, "notes/a.md").is_some());
+        assert!(contained(root, "a.md").is_some());
+        assert!(contained(root, "../a.md").is_none());
+        assert!(contained(root, "notes/../../a.md").is_none());
+        assert!(contained(root, "/etc/passwd").is_none());
+        assert!(contained(root, "").is_none());
+        assert!(contained(root, "a\0b").is_none());
+        assert!(contained(root, "./a.md").is_none()); // hub paths are normalized; `./` is refused
+    }
+
+    #[test]
+    fn normalize_pops_parents_lexically() {
+        assert_eq!(
+            normalize(Path::new("/a/b/../c/./d")),
+            PathBuf::from("/a/c/d")
+        );
     }
 }

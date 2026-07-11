@@ -71,6 +71,17 @@ fn is_older(a: &str, b: &str) -> bool {
     }
 }
 
+/// A version string safe to interpolate into the release-download URL: SemVer
+/// charset only. The hub supplies this string, and while a hostile value can
+/// never pass signature verification, it must not get to steer the URL path
+/// either (`0.1.2-x/../../other-repo/...`).
+fn safe_version_str(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+}
+
 fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .user_agent(concat!("sevra/", env!("CARGO_PKG_VERSION")))
@@ -108,6 +119,11 @@ fn download_verify_replace(version: &str) -> Result<(), String> {
     let target = asset_target();
     if target == "unsupported" {
         return Err("no release asset for this platform".into());
+    }
+    if !safe_version_str(version) {
+        return Err(format!(
+            "refusing malformed version string from the hub: {version:?}"
+        ));
     }
     let base = format!("{RELEASES}/v{version}/sevra-{target}");
     let binary = download(&base)?;
@@ -239,12 +255,20 @@ pub fn cmd_update(cfg: &Config) {
             None,
         )
     });
-    let latest = versions
+    // A hub that cannot resolve the latest release (e.g. GitHub rate-limited
+    // behind it) must not read as "already up to date" — that's an unknown,
+    // not a pass.
+    let latest = match versions
         .get("sevra")
         .and_then(|s| s.get("latest"))
         .and_then(|l| l.as_str())
-        .unwrap_or(VERSION)
-        .to_string();
+    {
+        Some(l) => l.to_string(),
+        None => fail(
+            "the hub could not report the latest sevra release right now — try again shortly",
+            None,
+        ),
+    };
 
     let mut data = serde_json::Map::new();
     let mut line;
@@ -339,5 +363,15 @@ mod tests {
         assert!(!is_older("1.0.0", "0.9.9"));
         assert!(!is_older("0.1.0", "0.1.0"));
         assert!(is_older("0.1.0", "0.1.1-rc1"));
+    }
+
+    #[test]
+    fn version_url_guard() {
+        assert!(safe_version_str("0.1.2"));
+        assert!(safe_version_str("0.1.2-rc1"));
+        assert!(!safe_version_str("0.1.2-x/../../evil"));
+        assert!(!safe_version_str("0.1.2%2f.."));
+        assert!(!safe_version_str(""));
+        assert!(!safe_version_str(&"9".repeat(65)));
     }
 }

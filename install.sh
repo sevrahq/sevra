@@ -39,6 +39,10 @@ fetch_stdout() {
   else err "need curl or wget"; fi
 }
 
+# Everything below runs through main(), called on the LAST line — a truncated
+# `curl | sh` stream can therefore never execute a partial script.
+main() {
+
 # ── Platform ─────────────────────────────────────────────────────────────────
 os="$(uname -s)"; arch="$(uname -m)"
 case "$os" in
@@ -65,7 +69,7 @@ asset="sevra-${target}"
 url="$BASE/v${version}/${asset}"
 
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT INT TERM
+trap 'rm -rf "$tmp"; rm -f "${staged:-}" 2>/dev/null || true' EXIT INT TERM
 
 info "Downloading sevra ${version} (${target})..."
 fetch "$url" "$tmp/sevra"
@@ -111,7 +115,13 @@ fi
 # ── Install ──────────────────────────────────────────────────────────────────
 mkdir -p "$DIR"
 chmod +x "$tmp/sevra"
-mv "$tmp/sevra" "$DIR/sevra"
+# Stage inside $DIR, then rename: atomic on the same filesystem, so a running
+# `sevra` (or a reinstall over one) never sees a half-written binary — a plain
+# cross-device mv from $tmp would write the destination in place.
+staged="$DIR/.sevra.new.$$"
+cp "$tmp/sevra" "$staged"
+chmod +x "$staged"
+mv -f "$staged" "$DIR/sevra"
 info "sevra ${version} installed to $DIR/sevra"
 case ":$PATH:" in
   *":$DIR:"*) info "Next: sevra login --key vc_account_...   (create a key in the dashboard)" ;;
@@ -120,3 +130,6 @@ case ":$PATH:" in
     info "  export PATH=\"$DIR:\$PATH\""
     info "  sevra login --key vc_account_..." ;;
 esac
+
+}
+main "$@"

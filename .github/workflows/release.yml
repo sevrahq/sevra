@@ -9,6 +9,11 @@
 # CI-gated: cross-platform builds/signing run only on GitHub runners; they are
 # authored + self-linted here, not executed on a dev host. Cut a release by
 # pushing a SemVer tag (`v0.1.0`); the tag must equal the Cargo.toml version.
+#
+# Key-custody layout: the signing key is used ONLY in the publish job, whose
+# only pre-signing action is first-party (actions/download-artifact) — no
+# third-party action ever runs in the job before the key is in env. Build jobs
+# never see the secret.
 name: release
 
 on:
@@ -23,7 +28,7 @@ on:
         required: false
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   version:
@@ -47,10 +52,12 @@ jobs:
           fi
           echo "$ver" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-.+)?$' || {
             echo "::error::resolved version '$ver' is not SemVer" >&2; exit 1; }
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            cargo_ver="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
-            [ "$ver" = "$cargo_ver" ] || { echo "::error::tag '$ver' != Cargo.toml '$cargo_ver'" >&2; exit 1; }
-          fi
+          # The released version must ALWAYS equal the embedded (Cargo.toml)
+          # version — a mismatch (e.g. a workflow_dispatch typo) would ship
+          # binaries that forever self-report older than "latest" and re-download
+          # on every daily check.
+          cargo_ver="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          [ "$ver" = "$cargo_ver" ] || { echo "::error::version '$ver' != Cargo.toml '$cargo_ver'" >&2; exit 1; }
           echo "version=$ver" >> "$GITHUB_OUTPUT"
 
   preflight:
@@ -120,25 +127,12 @@ jobs:
           else
             cargo build --release --locked --target ${{ matrix.rust_target }}
           fi
-      - name: Stage + sign asset
+      - name: Stage asset
         shell: bash
-        env:
-          SEVRA_CLI_SIGNING_KEY: ${{ secrets.SEVRA_CLI_SIGNING_KEY }}
         run: |
           set -euo pipefail
-          [ -n "$SEVRA_CLI_SIGNING_KEY" ] || { echo "::error::SEVRA_CLI_SIGNING_KEY secret is empty"; exit 1; }
           mkdir -p dist
-          asset="sevra-${{ matrix.target_name }}"
-          cp "target/${{ matrix.rust_target }}/release/sevra" "dist/$asset"
-          # Detached Ed25519 signature (base64 of 64 raw bytes), verified by the
-          # installer and `sevra update` against the pinned publisher key.
-          node -e '
-            const { createPrivateKey, sign } = require("node:crypto");
-            const { readFileSync, writeFileSync } = require("node:fs");
-            const key = createPrivateKey(Buffer.from(process.env.SEVRA_CLI_SIGNING_KEY, "base64"));
-            const sig = sign(null, readFileSync(process.argv[1]), key);
-            writeFileSync(process.argv[1] + ".sig", sig.toString("base64") + "\n");
-          ' "dist/$asset"
+          cp "target/${{ matrix.rust_target }}/release/sevra" "dist/sevra-${{ matrix.target_name }}"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target_name }}
@@ -146,20 +140,37 @@ jobs:
 
   publish:
     needs: [version, build]
-    name: publish release
+    name: sign + publish release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: staged
-      - name: Collect + checksum
+      - name: Collect, sign, checksum
         shell: bash
+        env:
+          SEVRA_CLI_SIGNING_KEY: ${{ secrets.SEVRA_CLI_SIGNING_KEY }}
         run: |
           set -euo pipefail
+          [ -n "$SEVRA_CLI_SIGNING_KEY" ] || { echo "::error::SEVRA_CLI_SIGNING_KEY secret is empty"; exit 1; }
           mkdir -p dist
           find staged -type f -exec cp {} dist/ \;
           cd dist
-          sha256sum sevra-* > SHA256SUMS
+          # Detached Ed25519 signature per binary (base64 of 64 raw bytes),
+          # verified by the installer and `sevra update` against the pinned
+          # publisher key.
+          for asset in sevra-*; do
+            node -e '
+              const { createPrivateKey, sign } = require("node:crypto");
+              const { readFileSync, writeFileSync } = require("node:fs");
+              const key = createPrivateKey(Buffer.from(process.env.SEVRA_CLI_SIGNING_KEY, "base64"));
+              const sig = sign(null, readFileSync(process.argv[1]), key);
+              writeFileSync(process.argv[1] + ".sig", sig.toString("base64") + "\n");
+            ' "$asset"
+          done
+          sha256sum sevra-* | grep -v '\.sig$' > SHA256SUMS
           ls -l
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

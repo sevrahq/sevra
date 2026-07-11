@@ -3,10 +3,18 @@
 //! matching the TS CLI — a 2xx without JSON is refused as "not a Sevra hub
 //! answer", and every >=400 fails with the hub's own error string.
 
+use std::io::Read;
+
 use serde_json::Value;
 
 use crate::config::{config_path, Config};
 use crate::output::fail;
+
+/// The most the CLI will buffer from one hub response. ureq's `into_string()`
+/// stops at 10 MB, which a large brain's `export` legitimately exceeds — so
+/// bodies are read through an explicit reader with a cap sized for the
+/// biggest honest payload (a full-store export), refused loudly past it.
+const MAX_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// The bearer key must never travel in cleartext; only loopback hosts may skip
 /// TLS (local dev against `npm run dev`).
@@ -16,8 +24,14 @@ pub fn assert_safe_hub(hub: &str) {
         Some(v) => v,
         None => fail(&format!("invalid hub URL: {hub}"), None),
     };
-    let host = rest.split(['/', ':']).next().unwrap_or("");
-    let loopback = host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]";
+    // Host = authority up to the first '/', minus any port — with the
+    // bracketed-IPv6 form handled so `http://[::1]:3000` counts as loopback.
+    let hostport = rest.split('/').next().unwrap_or("");
+    let host = match hostport.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => hostport.split(':').next().unwrap_or(""),
+    };
+    let loopback = host == "localhost" || host == "127.0.0.1" || host == "::1";
     if scheme != "https" && !loopback {
         fail(
             &format!("refusing non-HTTPS hub {hub} — your API key would travel in cleartext (localhost is exempt)"),
@@ -84,7 +98,30 @@ pub fn request(
     // deploy-coupled): the CLI learns the latest release from the hub and
     // signed-self-updates when behind.
     crate::update::maybe_auto_update(cfg);
-    let text = resp.into_string().unwrap_or_default();
+    let mut buf = Vec::new();
+    if let Err(e) = resp
+        .into_reader()
+        .take(MAX_RESPONSE_BYTES + 1)
+        .read_to_end(&mut buf)
+    {
+        fail(
+            &format!(
+                "reading the hub's response failed mid-body: {e} (hub: {})",
+                cfg.hub
+            ),
+            None,
+        );
+    }
+    if buf.len() as u64 > MAX_RESPONSE_BYTES {
+        fail(
+            &format!(
+                "hub response exceeded {} MB — refusing to buffer it",
+                MAX_RESPONSE_BYTES / (1024 * 1024)
+            ),
+            None,
+        );
+    }
+    let text = String::from_utf8_lossy(&buf);
     let parsed: Option<Value> = serde_json::from_str(&text).ok();
     HubResponse {
         status,
