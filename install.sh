@@ -33,9 +33,23 @@ fetch() {
   elif have wget; then wget -qO "$2" "$1" || err "download failed: $1"
   else err "need curl or wget"; fi
 }
-fetch_stdout() {
-  if have curl; then curl -fsSL "$1" || err "request failed: $1"
-  elif have wget; then wget -qO- "$1" || err "request failed: $1"
+# The latest-release lookup on api.github.com. An optional GITHUB_TOKEN
+# authenticates it (CI runners share rate-limited IPs; unauthenticated is
+# 60 req/h per IP). The token is sent ONLY to this hardcoded api.github.com
+# URL, never to the download host.
+fetch_api() {
+  if have curl; then
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+      curl -fsSL -H "authorization: Bearer $GITHUB_TOKEN" "$1" || err "request failed: $1"
+    else
+      curl -fsSL "$1" || err "request failed: $1"
+    fi
+  elif have wget; then
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+      wget -qO- --header="authorization: Bearer $GITHUB_TOKEN" "$1" || err "request failed: $1"
+    else
+      wget -qO- "$1" || err "request failed: $1"
+    fi
   else err "need curl or wget"; fi
 }
 
@@ -61,9 +75,9 @@ if [ "$p_os" = "linux" ]; then target="linux-${p_arch}-musl"; else target="darwi
 version="${SEVRA_VERSION:-}"
 if [ -z "$version" ]; then
   info "Resolving the latest sevra release..."
-  version="$(fetch_stdout "$API" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name"[^"]*"([^"]+)".*/\1/')"
+  version="$(fetch_api "$API" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name"[^"]*"([^"]+)".*/\1/')"
   version="${version#v}"
-  [ -n "$version" ] || err "could not resolve the latest release"
+  [ -n "$version" ] || err "could not resolve the latest release (rate-limited? set GITHUB_TOKEN, or pin SEVRA_VERSION)"
 fi
 asset="sevra-${target}"
 url="$BASE/v${version}/${asset}"

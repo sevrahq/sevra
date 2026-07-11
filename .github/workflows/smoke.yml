@@ -35,15 +35,30 @@ jobs:
       - name: Run the installer against the release
         shell: bash
         env:
-          SEVRA_VERSION: ${{ inputs.version || github.event.release.tag_name }}
+          # Chained runs take the version from the release workflow's TAG
+          # (head_branch is the tag for tag-triggered runs) — pinning it makes
+          # smoke deterministic AND skips the api.github.com latest lookup,
+          # which shared runner IPs get 403-rate-limited on.
+          SEVRA_VERSION: ${{ inputs.version || github.event.release.tag_name || github.event.workflow_run.head_branch }}
+          # For the unpinned path (bare dispatch), authenticate the lookup.
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # Strip a leading v if the tag name came through.
+          # Strip a leading v; discard non-version values (a dispatch-triggered
+          # release chains head_branch = "main" — fall back to latest).
           export SEVRA_VERSION="${SEVRA_VERSION#v}"
+          case "$SEVRA_VERSION" in
+            [0-9]*) ;;
+            *) export SEVRA_VERSION="" ;;
+          esac
           export SEVRA_INSTALL_DIR="$RUNNER_TEMP/sevra-bin"
           sh install.sh
           "$SEVRA_INSTALL_DIR/sevra" version
           "$SEVRA_INSTALL_DIR/sevra" version --json | grep '"version"'
+          # When pinned, the installed binary must self-report THAT version.
+          if [ -n "$SEVRA_VERSION" ]; then
+            "$SEVRA_INSTALL_DIR/sevra" version | grep -F "$SEVRA_VERSION"
+          fi
           # The not-logged-in path is the offline contract check.
           if "$SEVRA_INSTALL_DIR/sevra" brains 2>err.txt; then
             echo "expected failure without a key" >&2; exit 1
