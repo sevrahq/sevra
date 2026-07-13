@@ -48,6 +48,15 @@ pub fn login(flag_hub: Option<String>, key: Option<String>) {
         .or(config::load_file().hub)
         .unwrap_or_else(|| DEFAULT_HUB.to_string());
     let hub = hub.strip_suffix('/').unwrap_or(&hub).to_string();
+    // The apex 308s to www, and redirects strip the authorization header (the
+    // safe default), so a valid key probed against the apex reads back as a
+    // misleading 401. Normalize the one known apex to the canonical host.
+    let hub = if hub == "https://sevrahq.com" {
+        note("note: sevrahq.com redirects to www.sevrahq.com; storing the www host");
+        DEFAULT_HUB.to_string()
+    } else {
+        hub
+    };
     if flag_hub.is_none() {
         if let Some(env_hub) = config::env_nonempty("SEVRA_HUB_URL") {
             if env_hub.strip_suffix('/').unwrap_or(&env_hub) != hub {
@@ -58,7 +67,7 @@ pub fn login(flag_hub: Option<String>, key: Option<String>) {
     // The message promises SEVRA_API_KEY works — honor it: --key wins, the
     // env var is the fallback.
     let key = key.or_else(|| config::env_nonempty("SEVRA_API_KEY")).unwrap_or_else(|| {
-        fail("provide a key: `sevra login --key vc_account_…` (create one in the dashboard). SEVRA_API_KEY also works.", None)
+        fail("provide a key: `sevra login --key sevra_account_…` (create one in the dashboard). SEVRA_API_KEY also works.", None)
     });
     // Trim paste artifacts + refuse non-token bytes NOW, so the stored file is
     // clean and the refusal happens at login, not on the next command.

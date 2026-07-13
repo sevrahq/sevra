@@ -148,7 +148,7 @@ fn malformed_key_never_leaks_into_output() {
         }
         let out = c
             .env("SEVRA_HUB_URL", "http://localhost:9")
-            .env("SEVRA_API_KEY", "vc_account_TOPSECRET\nLEAKCHECK")
+            .env("SEVRA_API_KEY", "sevra_account_TOPSECRET\nLEAKCHECK")
             .output()
             .unwrap();
         assert!(!out.status.success());
@@ -169,7 +169,7 @@ fn key_with_surrounding_whitespace_is_trimmed_not_refused() {
     sevra()
         .arg("brains")
         .env("SEVRA_HUB_URL", "http://localhost:9")
-        .env("SEVRA_API_KEY", " vc_account_x \n")
+        .env("SEVRA_API_KEY", " sevra_account_x \n")
         .assert()
         .failure()
         .stderr(predicate::str::contains("hub unreachable"));

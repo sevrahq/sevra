@@ -11,7 +11,7 @@ Install (macOS/Linux, x86_64/arm64; no runtime, no package manager):
 
 Authenticate (key from the dashboard at https://www.sevrahq.com/dashboard):
 
-    sevra login --key vc_account_...
+    sevra login --key sevra_account_...
 
 Agent contract:
 - Add `--json` to ANY command: machine-readable JSON on stdout, always,

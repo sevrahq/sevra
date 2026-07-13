@@ -17,7 +17,7 @@ macOS and Linux, x86_64 and arm64. On Windows use WSL. The installer verifies th
 ## Commands
 
 ```
-sevra login --key <vc_account_…> [--hub <url>]   store your credential
+sevra login --key <sevra_account_…> [--hub <url>]   store your credential
 sevra logout
 sevra whoami
 

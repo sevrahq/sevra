@@ -99,7 +99,7 @@ expected="$(grep " ${asset}\$" "$tmp/SHA256SUMS" | awk '{print $1}')"
 if have sha256sum; then actual="$(sha256sum "$tmp/sevra" | awk '{print $1}')"
 elif have shasum; then actual="$(shasum -a 256 "$tmp/sevra" | awk '{print $1}')"
 else err "need sha256sum or shasum to verify the download"; fi
-[ "$actual" = "$expected" ] || err "checksum mismatch (expected $expected, got $actual) — refusing to install"
+[ "$actual" = "$expected" ] || err "checksum mismatch (expected $expected, got $actual). Refusing to install"
 info "checksum: verified (sha256)"
 
 # ── Verify signature (best-effort: node, else openssl 3) ─────────────────────
@@ -126,7 +126,7 @@ fi
 if [ "$verified_sig" -eq 1 ]; then
   info "signature: verified (ed25519)"
 elif [ "${SEVRA_REQUIRE_SIGNATURE:-}" = "1" ]; then
-  err "signature could not be checked (no node or openssl 3) and SEVRA_REQUIRE_SIGNATURE=1 — refusing to install"
+  err "signature could not be checked (no node or openssl 3) and SEVRA_REQUIRE_SIGNATURE=1. Refusing to install"
 else
   info "signature: not checked here (no node or openssl 3); the SHA-256 above was verified over HTTPS, and the binary re-verifies its signature on every self-update. Set SEVRA_REQUIRE_SIGNATURE=1 to make this check mandatory."
 fi
@@ -143,11 +143,11 @@ chmod +x "$staged"
 mv -f "$staged" "$DIR/sevra"
 info "sevra ${version} installed to $DIR/sevra"
 case ":$PATH:" in
-  *":$DIR:"*) info "Next: sevra login --key vc_account_...   (create a key in the dashboard)" ;;
+  *":$DIR:"*) info "Next: sevra login --key sevra_account_...   (create a key in the dashboard)" ;;
   *)
     info "Add it to your PATH, then log in:"
     info "  export PATH=\"$DIR:\$PATH\""
-    info "  sevra login --key vc_account_..." ;;
+    info "  sevra login --key sevra_account_..." ;;
 esac
 
 }
