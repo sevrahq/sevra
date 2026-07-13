@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.1.4 — 2026-07-13
+
+- New: `sevra secrets list|set|delete <brain> [NAME]` — the vault: write-only
+  secret values bound to a brain's published functions
+  (https://www.sevrahq.com/docs/publishing.md, "Functions + the vault").
+  `list` shows provisioned names plus each function's live state, declared
+  secrets, and egress allowlist; `set` provisions or rotates one value;
+  `delete` unbinds and forgets it.
+- The `set` security contract, locked by tests:
+  - the VALUE is read from stdin only — a no-echo prompt on the controlling
+    terminal (via /dev/tty, so `--json` stdout stays clean) when stdin is a
+    TTY, else the whole pipe with exactly ONE trailing newline trimmed
+    (`printf %s "$V" |` and `echo "$V" |` deliver the same value; multi-line
+    values like PEM keys pass through intact);
+  - the value is never accepted from argv: a trailing positional or a
+    `--value` flag is refused as a usage error (exit 2) WITHOUT being echoed
+    — clap's own unexpected-argument error would have printed it (hidden
+    trap arguments absorb both shapes first);
+  - the value appears nowhere in stdout/stderr on any path — success,
+    refusals, transport failures, `--json` included;
+  - names are clap-validated to the hub's exact gate (^[A-Z][A-Z0-9_]{0,63}$)
+    before any I/O; empty and >4096-char values are refused client-side with
+    messages that name sizes, never bytes;
+  - `set` fails "not logged in" BEFORE reading the value (never ask for a
+    secret the process cannot send).
+- New dependency: rpassword (Apache-2.0, with rtoolbox) for the no-echo
+  terminal read; recorded in THIRD_PARTY_NOTICES.
+- `usage_fail` joins the output contract: post-parse usage errors exit 2 like
+  clap's own, keeping the documented 1-vs-2 split for agents.
+
 ## 0.1.3 — 2026-07-11
 
 Adversarial-review round three (two independent fresh-eyes reviews + an

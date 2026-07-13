@@ -29,6 +29,12 @@ Commands:
     get <brain> <id|path> | graph <brain> <path> [--dir in|out|both]
     grant <brain> <email> [--write] | grants <brain> | revoke <brain> <grantId>
     shared | publish <brain> | unpublish <brain>
+    secrets list|set|delete <brain> [NAME]
+                                          # the vault (write-only values for published
+                                          # functions). set reads the VALUE from stdin —
+                                          # pipe it: printf %s "$V" | sevra secrets set b NAME
+                                          # (one trailing newline trimmed); NEVER argv,
+                                          # never echoed. NAME: ^[A-Z][A-Z0-9_]{0,63}$
     inbox list|drain <brain>              # drain prints full JSON (BYO-agent read half)
     export <brain> [dir]                  # your brain back on disk
     validate [dir]                        # shells `dbmd validate --all`

@@ -40,6 +40,11 @@ pub fn assert_safe_hub(hub: &str) {
     }
 }
 
+/// The one not-logged-in message (also used by `secrets set` to refuse BEFORE
+/// prompting for a value it could never send).
+pub const NOT_LOGGED_IN: &str =
+    "not logged in — run `sevra login --key vc_account_…` (get a key from the dashboard)";
+
 pub struct HubResponse {
     pub status: u16,
     pub body: Option<Value>,
@@ -87,10 +92,7 @@ pub fn request(
     if auth {
         match &cfg.key {
             Some(k) => req = req.set("authorization", &format!("Bearer {}", clean_key(k))),
-            None => fail(
-                "not logged in — run `sevra login --key vc_account_…` (get a key from the dashboard)",
-                None,
-            ),
+            None => fail(NOT_LOGGED_IN, None),
         }
     }
 

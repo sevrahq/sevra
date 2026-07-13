@@ -24,6 +24,9 @@ MIT and/or Apache-2.0 (the bulk of the tree)
   version_check, wasi, windows-link, windows-sys, windows-targets,
   windows_* target crates, zeroize, zmij
 
+Apache-2.0
+  rpassword, rtoolbox (the no-echo terminal read for `secrets set`)
+
 BSD-3-Clause
   curve25519-dalek, ed25519-dalek, subtle
 

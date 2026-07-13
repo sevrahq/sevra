@@ -227,3 +227,209 @@ fn validate_rejects_a_regular_file() {
         .stderr(predicate::str::contains("directory not found"));
     let _ = std::fs::remove_file(&tmp);
 }
+
+// --- secrets (the vault): the no-leak contract ---------------------------------
+
+/// stdout + stderr of one run, as one searchable string.
+fn all_output(out: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+#[test]
+fn secrets_help_lists_actions_and_hides_the_argv_trap() {
+    sevra()
+        .args(["secrets", "--help"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("list")
+                .and(predicate::str::contains("set"))
+                .and(predicate::str::contains("delete")),
+        );
+    // The hidden traps must not advertise a value positional in usage.
+    sevra()
+        .args(["secrets", "set", "--help"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("[REFUSED]")
+                .not()
+                .and(predicate::str::contains("--value").not()),
+        );
+}
+
+#[test]
+fn secrets_name_is_clap_validated() {
+    // Bad names are usage errors (exit 2) before any I/O — the hub's
+    // ^[A-Z][A-Z0-9_]{0,63}$ mirrored client-side. Names are public metadata,
+    // so clap echoing them is fine.
+    let over = "A".repeat(65);
+    for bad in ["lower", "1LEADING", "_LEAD", "HAS-DASH", over.as_str()] {
+        sevra()
+            .args(["secrets", "set", "b", bad])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("UPPER_SNAKE_CASE"));
+    }
+    // delete validates too, and the usage error honors --json on stdout.
+    sevra()
+        .args(["secrets", "delete", "b", "bad-name", "--json"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("\"error\""));
+}
+
+#[test]
+fn secrets_value_in_argv_is_refused_and_never_echoed() {
+    // The classic mistake: `sevra secrets set b NAME "$VALUE"` (or --value).
+    // It must be refused as a usage error (exit 2) and the would-be secret
+    // must appear NOWHERE in the output — clap's own unexpected-argument
+    // error would have echoed it; the hidden traps exist to prevent that.
+    let cases: &[&[&str]] = &[
+        &["secrets", "set", "b", "API_KEY", "hunter2-argv-secret"],
+        &[
+            "secrets",
+            "set",
+            "b",
+            "API_KEY",
+            "hunter2-argv-secret",
+            "part2",
+        ],
+        &[
+            "secrets",
+            "set",
+            "b",
+            "API_KEY",
+            "--value=hunter2-argv-secret",
+        ],
+        &[
+            "secrets",
+            "set",
+            "b",
+            "API_KEY",
+            "--value",
+            "hunter2-argv-secret",
+        ],
+    ];
+    for json in [false, true] {
+        for case in cases {
+            let mut c = sevra();
+            c.args(*case);
+            if json {
+                c.arg("--json");
+            }
+            let out = c.output().unwrap();
+            assert_eq!(out.status.code(), Some(2), "case {case:?}");
+            let all = all_output(&out);
+            assert!(
+                !all.contains("hunter2"),
+                "secret echoed for {case:?}: {all}"
+            );
+            assert!(all.contains("stdin"), "should point at stdin: {all}");
+            if json {
+                assert!(
+                    String::from_utf8_lossy(&out.stdout).contains("\"error\""),
+                    "--json contract broken: {all}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn secrets_set_value_never_leaks_on_failure_paths() {
+    // The value crosses the whole pipeline (stdin read → validation → request)
+    // and the request then fails. On EVERY path, in BOTH output modes, the
+    // value appears nowhere in stdout/stderr.
+    for json in [false, true] {
+        // Logged in (env key), unreachable hub → transport failure AFTER the
+        // value was read and placed in the request body.
+        let mut c = sevra();
+        c.args(["secrets", "set", "b", "API_KEY"]);
+        if json {
+            c.arg("--json");
+        }
+        let out = c
+            .env("SEVRA_HUB_URL", "http://localhost:9")
+            .env("SEVRA_API_KEY", "x")
+            .write_stdin("vault-TOPSECRET-value\n")
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        let all = all_output(&out);
+        assert!(!all.contains("TOPSECRET"), "value leaked: {all}");
+        assert!(all.contains("hub unreachable"), "got: {all}");
+
+        // Not logged in → refused BEFORE the value is even read (never prompt
+        // for a secret the process cannot send) — and still no leak.
+        let mut c = sevra();
+        c.args(["secrets", "set", "b", "API_KEY"]);
+        if json {
+            c.arg("--json");
+        }
+        let out = c
+            .env("SEVRA_HUB_URL", "https://www.sevrahq.com")
+            .write_stdin("vault-TOPSECRET-value\n")
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        let all = all_output(&out);
+        assert!(!all.contains("TOPSECRET"), "value leaked: {all}");
+        assert!(all.contains("not logged in"), "got: {all}");
+    }
+}
+
+#[test]
+fn secrets_set_refuses_empty_and_oversized_values_without_echo() {
+    // "\n" is one trimmed newline → empty → refused with an instruction (the
+    // ordering proof: a piped value present + no login fails "not logged in",
+    // so this failing "empty value" proves the read happens after auth).
+    sevra()
+        .args(["secrets", "set", "b", "API_KEY"])
+        .env("SEVRA_HUB_URL", "http://localhost:9")
+        .env("SEVRA_API_KEY", "x")
+        .write_stdin("\n")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("empty value"));
+    // >4096 chars is refused client-side, naming the size, never the bytes.
+    let big = "x".repeat(4097);
+    let out = sevra()
+        .args(["secrets", "set", "b", "API_KEY"])
+        .env("SEVRA_HUB_URL", "http://localhost:9")
+        .env("SEVRA_API_KEY", "x")
+        .write_stdin(big.clone())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let all = all_output(&out);
+    assert!(all.contains("4096"), "should name the cap: {all}");
+    assert!(all.contains("4097"), "should name the actual size: {all}");
+    assert!(
+        !all.contains("xxxxxxxx"),
+        "value bytes echoed into output: {all}"
+    );
+}
+
+#[test]
+fn secrets_list_and_delete_hold_the_json_error_contract() {
+    // Wiring smoke: both route through the hub client, honoring --json.
+    sevra()
+        .args(["secrets", "list", "b", "--json"])
+        .env("SEVRA_HUB_URL", "http://localhost:9")
+        .env("SEVRA_API_KEY", "x")
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("\"error\""));
+    sevra()
+        .args(["secrets", "delete", "b", "API_KEY"])
+        .env("SEVRA_HUB_URL", "http://localhost:9")
+        .env("SEVRA_API_KEY", "x")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("hub unreachable"));
+}

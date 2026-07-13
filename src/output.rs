@@ -37,6 +37,22 @@ pub fn note(msg: &str) {
     eprintln!("sevra: {msg}");
 }
 
+/// A usage error detected AFTER clap parsing (exit 2, matching clap's own
+/// usage errors, so agents keep the 1-vs-2 exit-code split). Exists because
+/// clap's error rendering echoes the offending VALUE — unusable when the
+/// offense is a secret that must never reach stdout or stderr.
+pub fn usage_fail(msg: &str) -> ! {
+    if json_mode() {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "error": msg })).unwrap()
+        );
+    } else {
+        eprintln!("sevra: {msg}");
+    }
+    exit(2);
+}
+
 /// Fail: in `--json` mode emit `{ "error": msg, ...data }` on stdout (so a
 /// parsing agent still gets structured output); in human mode print
 /// `sevra: msg` on stderr. Always exit 1.

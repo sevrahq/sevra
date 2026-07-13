@@ -11,11 +11,14 @@ use std::process::Command;
 use serde_json::{json, Value};
 
 use crate::config::{self, Config, DEFAULT_HUB};
-use crate::hub::{ensure_ok, request};
-use crate::output::{fail, json_mode, note, out};
+use crate::hub::{ensure_ok, request, NOT_LOGGED_IN};
+use crate::output::{fail, json_mode, note, out, usage_fail};
 use crate::store::read_store;
 
 const MAX_PUSH_BYTES: usize = 4 * 1024 * 1024;
+/// The hub's cap on one secret value (mirrored client-side so an oversized
+/// paste fails fast, before any request).
+const MAX_SECRET_VALUE_CHARS: usize = 4096;
 
 fn enc(s: &str) -> String {
     // Percent-encode a path segment for a URL (RFC 3986 unreserved kept).
@@ -795,6 +798,222 @@ fn normalize(p: &Path) -> PathBuf {
     out
 }
 
+// --- secrets (the vault) -------------------------------------------------------
+//
+// Write-only Cloudflare secret values bound to the brain's published functions
+// (docs: /docs/publishing.md, "Functions + the vault"). The security contract,
+// locked by tests: the VALUE is read from stdin only — never argv (argv is
+// visible to every process on the machine), never echoed back on any path
+// (prompts, errors, --json included). NAMES are public metadata (records
+// declare them; the dashboard lists them) and are clap-validated to the hub's
+// exact shape before any request.
+
+/// clap value_parser for a secret NAME — the hub's gate, mirrored exactly:
+/// `^[A-Z][A-Z0-9_]{0,63}$`. Refusal is a usage error (exit 2) before any I/O.
+pub fn parse_secret_name(s: &str) -> Result<String, String> {
+    let ok = matches!(s.as_bytes().first(), Some(b'A'..=b'Z'))
+        && s.len() <= 64
+        && s.bytes()
+            .all(|b| matches!(b, b'A'..=b'Z' | b'0'..=b'9' | b'_'));
+    if ok {
+        Ok(s.to_string())
+    } else {
+        Err(
+            "secret names are UPPER_SNAKE_CASE: start with A-Z, then A-Z/0-9/_, at most 64 chars (e.g. STRIPE_KEY)"
+                .into(),
+        )
+    }
+}
+
+/// Trim exactly ONE trailing newline (`\n` or `\r\n`) — so `printf %s "$V" |`
+/// and `echo "$V" |` both deliver the same value, while a value that really
+/// ends in a newline can still be sent by appending one more.
+fn trim_one_newline(mut s: String) -> String {
+    if s.ends_with('\n') {
+        s.pop();
+        if s.ends_with('\r') {
+            s.pop();
+        }
+    }
+    s
+}
+
+/// Read the secret VALUE: prompted on the controlling terminal with echo OFF
+/// when stdin is a TTY (rpassword talks to /dev/tty directly, so `--json`
+/// stdout stays clean), else read whole from piped stdin. Never from argv;
+/// never echoed — the refusal messages below name sizes and shapes, never
+/// bytes.
+fn secret_value_from_stdin(name: &str) -> String {
+    use std::io::{IsTerminal, Read};
+    let value = if std::io::stdin().is_terminal() {
+        match rpassword::prompt_password(format!("value for {name} (input hidden): ")) {
+            Ok(v) => v,
+            Err(e) => fail(
+                &format!(
+                    "could not read from the terminal: {e} — pipe the value instead: printf %s \"$VALUE\" | sevra secrets set <brain> {name}"
+                ),
+                None,
+            ),
+        }
+    } else {
+        let mut buf = String::new();
+        if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+            fail(
+                &format!("could not read the value from stdin (it must be UTF-8): {e}"),
+                None,
+            );
+        }
+        trim_one_newline(buf)
+    };
+    if value.is_empty() {
+        fail(
+            &format!(
+                "empty value — pipe the secret on stdin: printf %s \"$VALUE\" | sevra secrets set <brain> {name}"
+            ),
+            None,
+        );
+    }
+    if value.chars().count() > MAX_SECRET_VALUE_CHARS {
+        fail(
+            &format!(
+                "the value is {} characters — the hub caps one secret at {MAX_SECRET_VALUE_CHARS}",
+                value.chars().count()
+            ),
+            None,
+        );
+    }
+    value
+}
+
+pub fn secrets_list(cfg: &Config, brain: &str) {
+    let r = ensure_ok(
+        request(
+            cfg,
+            "GET",
+            &format!("/api/hub/brains/{}/secrets", enc(brain)),
+            None,
+            true,
+        ),
+        "secrets list",
+    );
+    if json_mode() {
+        out("", Some(r));
+        return;
+    }
+    let names: Vec<&str> = r
+        .get("secrets")
+        .and_then(|s| s.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    if names.is_empty() {
+        out(
+            "no secrets provisioned — printf %s \"$VALUE\" | sevra secrets set <brain> NAME",
+            None,
+        );
+    } else {
+        out(
+            &format!(
+                "secrets ({}, values write-only): {}",
+                names.len(),
+                names.join(", ")
+            ),
+            None,
+        );
+    }
+    let fns = r
+        .get("functions")
+        .and_then(|f| f.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if fns.is_empty() {
+        return;
+    }
+    out(&format!("functions ({}):", fns.len()), None);
+    let join = |f: &Value, key: &str| -> String {
+        let items: Vec<&str> = f
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+            .unwrap_or_default();
+        if items.is_empty() {
+            "-".into()
+        } else {
+            items.join(", ")
+        }
+    };
+    for f in &fns {
+        let live = if f.get("live").and_then(|l| l.as_bool()).unwrap_or(false) {
+            "live"
+        } else {
+            "not live"
+        };
+        out(
+            &format!(
+                "  {}\t{}\tneeds: {}\tegress: {}",
+                str_field(f, "name"),
+                live,
+                join(f, "secrets"),
+                join(f, "egress")
+            ),
+            None,
+        );
+    }
+}
+
+pub fn secrets_set(cfg: &Config, brain: &str, name: &str, value_in_argv: bool) {
+    if value_in_argv {
+        // The trap arguments exist so this refusal happens WITHOUT echoing
+        // what clap's own unexpected-argument error would have printed. The
+        // argv exposure itself already happened at the OS level — say so.
+        usage_fail(
+            "the secret value is never taken from the command line (argv is visible to every process on the machine; it was NOT echoed here, but treat it as exposed). Pipe it on stdin instead: printf %s \"$VALUE\" | sevra secrets set <brain> NAME",
+        );
+    }
+    // Before the prompt: never ask for a secret this process cannot send.
+    if cfg.key.is_none() {
+        fail(NOT_LOGGED_IN, None);
+    }
+    let value = secret_value_from_stdin(name);
+    let body = json!({ "name": name, "value": value });
+    let r = ensure_ok(
+        request(
+            cfg,
+            "PUT",
+            &format!("/api/hub/brains/{}/secrets", enc(brain)),
+            Some(&body),
+            true,
+        ),
+        "secrets set",
+    );
+    let hub_note = str_field(&r, "note");
+    let human = if hub_note.is_empty() {
+        format!("set secret {name} on {brain} (write-only)")
+    } else {
+        format!("set secret {name} on {brain} — {hub_note}")
+    };
+    out(&human, Some(r));
+}
+
+pub fn secrets_delete(cfg: &Config, brain: &str, name: &str) {
+    let body = json!({ "name": name });
+    let r = ensure_ok(
+        request(
+            cfg,
+            "DELETE",
+            &format!("/api/hub/brains/{}/secrets", enc(brain)),
+            Some(&body),
+            true,
+        ),
+        "secrets delete",
+    );
+    let mut data = r.as_object().cloned().unwrap_or_default();
+    data.insert("name".into(), json!(name));
+    out(
+        &format!("deleted secret {name} from {brain} (unbound from its functions)"),
+        Some(Value::Object(data)),
+    );
+}
+
 // --- validate (shells dbmd) --------------------------------------------------
 
 pub fn validate(dir: Option<String>) {
@@ -845,5 +1064,44 @@ mod tests {
             normalize(Path::new("/a/b/../c/./d")),
             PathBuf::from("/a/c/d")
         );
+    }
+
+    #[test]
+    fn secret_name_shape_matches_the_hub_gate() {
+        // ^[A-Z][A-Z0-9_]{0,63}$ — mirrored exactly, boundaries included.
+        let max = "A".repeat(64);
+        for good in ["A", "STRIPE_KEY", "A1_B2_C3", "OPENAI_API_KEY", &max] {
+            assert!(parse_secret_name(good).is_ok(), "should accept {good}");
+        }
+        let over = "A".repeat(65);
+        for bad in [
+            "",
+            "a",
+            "lower_case",
+            "1LEADING",
+            "_LEADING",
+            "HAS-DASH",
+            "HAS SPACE",
+            "Ä",
+            "A\n",
+            &over,
+        ] {
+            assert!(
+                parse_secret_name(bad).is_err(),
+                "should reject {}",
+                bad.escape_debug()
+            );
+        }
+    }
+
+    #[test]
+    fn trim_one_newline_trims_exactly_one() {
+        assert_eq!(trim_one_newline("v\n".into()), "v");
+        assert_eq!(trim_one_newline("v".into()), "v");
+        assert_eq!(trim_one_newline("v\n\n".into()), "v\n"); // exactly one
+        assert_eq!(trim_one_newline("v\r\n".into()), "v"); // CRLF is one newline
+        assert_eq!(trim_one_newline("v\r".into()), "v\r"); // a bare CR is data
+        assert_eq!(trim_one_newline("\n".into()), "");
+        assert_eq!(trim_one_newline("multi\nline\n".into()), "multi\nline");
     }
 }

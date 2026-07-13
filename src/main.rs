@@ -113,6 +113,11 @@ enum Commands {
     Publish { brain: String },
     /// Pull all public pages
     Unpublish { brain: String },
+    /// The vault: write-only secrets for a brain's published functions
+    Secrets {
+        #[command(subcommand)]
+        action: SecretsAction,
+    },
     /// Read the evidence inbox (drain = full JSON)
     Inbox {
         #[arg(value_parser = ["list", "drain"])]
@@ -127,6 +132,35 @@ enum Commands {
     Version,
     /// Update to the hub's current release (signed; checks dbmd too)
     Update,
+}
+
+#[derive(Subcommand)]
+enum SecretsAction {
+    /// List secret names + the functions they bind to
+    List { brain: String },
+    /// Provision or rotate one secret. The VALUE is read from stdin — hidden
+    /// prompt on a TTY, piped otherwise (one trailing newline trimmed) —
+    /// never from the command line, never echoed.
+    Set {
+        brain: String,
+        /// UPPER_SNAKE_CASE, e.g. STRIPE_KEY (A-Z start; A-Z/0-9/_; ≤64 chars)
+        #[arg(value_parser = commands::parse_secret_name)]
+        name: String,
+        // Traps, hidden from help: anything value-shaped in argv is refused
+        // WITHOUT being echoed (clap's own unexpected-argument error would
+        // print it — see commands::secrets_set).
+        #[arg(long, hide = true)]
+        value: Option<String>,
+        #[arg(hide = true, value_name = "REFUSED", num_args = 0..)]
+        value_argv: Vec<String>,
+    },
+    /// Unbind one secret and forget its name
+    Delete {
+        brain: String,
+        /// The secret's name
+        #[arg(value_parser = commands::parse_secret_name)]
+        name: String,
+    },
 }
 
 fn main() {
@@ -211,6 +245,19 @@ fn main() {
         Commands::Shared => commands::shared(&cfg),
         Commands::Publish { brain } => commands::publish(&cfg, &brain),
         Commands::Unpublish { brain } => commands::unpublish(&cfg, &brain),
+        Commands::Secrets { action } => match action {
+            SecretsAction::List { brain } => commands::secrets_list(&cfg, &brain),
+            SecretsAction::Set {
+                brain,
+                name,
+                value,
+                value_argv,
+            } => {
+                let value_in_argv = value.is_some() || !value_argv.is_empty();
+                commands::secrets_set(&cfg, &brain, &name, value_in_argv)
+            }
+            SecretsAction::Delete { brain, name } => commands::secrets_delete(&cfg, &brain, &name),
+        },
         Commands::Inbox { action, brain } => commands::inbox(&cfg, &action, &brain),
         Commands::Export { brain, dir } => commands::export(&cfg, &brain, dir),
         Commands::Update => update::cmd_update(&cfg),

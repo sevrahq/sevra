@@ -34,6 +34,9 @@ sevra revoke <brain> <grantId>
 sevra shared                                     brains shared with you
 sevra publish <brain>                            render public records to <handle>.sevra.page
 sevra unpublish <brain>                          pull all public pages
+sevra secrets list <brain>                       the vault: secret names + function bindings
+sevra secrets set <brain> NAME                   value from stdin (hidden prompt / pipe), write-only
+sevra secrets delete <brain> NAME                unbind + forget one secret
 sevra inbox list|drain <brain>                   read the evidence inbox (drain = full JSON)
 sevra export <brain> [dir]                       write your brain back to disk (you own it)
 
@@ -43,6 +46,8 @@ sevra update                                     signed self-update; checks dbmd
 ```
 
 Config lives at `~/.sevra/config.json` (written 0600). Env `SEVRA_HUB_URL` / `SEVRA_API_KEY` override it.
+
+`secrets set` binds a write-only value to the brain's published functions ([the vault](https://www.sevrahq.com/docs/publishing.md)). The value is read from stdin only — a hidden prompt on a terminal, or piped (`printf %s "$VALUE" | sevra secrets set <brain> NAME`, exactly one trailing newline trimmed). It is never accepted on the command line and never echoed back, on any path.
 
 ## Built for agents
 
