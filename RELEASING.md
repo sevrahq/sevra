@@ -20,7 +20,10 @@ the hub's `/api/hub/versions`.
    the publish job (the `SEVRA_CLI_SIGNING_KEY` secret is never exposed to
    the build jobs or their third-party actions) and publishes the GitHub
    Release with `SHA256SUMS`. The released version MUST equal the Cargo.toml
-   version (the version job enforces it for tags AND dispatches).
+   version (the version job enforces it for tags AND dispatches). After the
+   release is published, copy the asset digests into the platform repo's
+   static trusted manifest and deploy it. Ordinary installs do not trust the
+   checksum served beside the GitHub binary.
 5. `smoke.yml` installs from the fresh release on macOS + Linux (install.sh)
    and Windows (install.ps1) runners and runs `sevra version` + the
    not-logged-in contract. Green smoke = the release is live; installed CLIs
@@ -32,8 +35,10 @@ the hub's `/api/hub/versions`.
 
 ## Key custody
 
-The Ed25519 signing key lives in three places (Vercel production env,
-the platform repo's `.env.local`, this repo's Actions secret). The secret's
+The Ed25519 signing key is available to the release job only through this
+repo's Actions secret. A separately controlled recovery copy must exist
+offline; the platform runtime does not sign releases and must not hold this
+key. The secret's
 value is the **base64 of the PKCS#8 PEM** (release.yml decodes with
 `Buffer.from(..., "base64")` and hands the PEM to `createPrivateKey`; a raw
 PEM or base64-of-DER fails the sign step with ERR_OSSL_UNSUPPORTED). Set it
@@ -47,6 +52,6 @@ base64 < sevra-signing-key.pem | tr -d '\n' \
 Never `--body -`, which stores a literal dash. Rotation is
 additive and order-sensitive: pin the NEW public key in `src/signing.rs` +
 `install.sh` + `sevra.pub`, release while still signing with the old key, let
-installed binaries update onto the dual-pin build, then swap the private key
-and drop the old pin a release later. Full notes: the platform repo's
+installed binaries update onto the dual-pin build, then swap the Actions
+secret and drop the old pin a release later. Full notes: the platform repo's
 `infra/README.md`.

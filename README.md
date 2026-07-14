@@ -14,13 +14,13 @@ macOS and Linux (x86_64 and arm64):
 curl -fsSL https://www.sevrahq.com/install/sevra.sh | sh
 ```
 
-Windows (native x64; ARM64 runs the same binary under the built-in emulation — ships with the first release after v0.1.4):
+Windows (native x64; ARM64 runs the same binary under the built-in emulation):
 
 ```powershell
 irm https://www.sevrahq.com/install/sevra.ps1 | iex
 ```
 
-Both installers verify the download's SHA-256 always, and its Ed25519 publisher signature when node or openssl 3 is present, before placing the binary on your PATH. The binary itself re-verifies the signature on every self-update.
+Both installers verify the download's SHA-256 against Sevra's independently deployed release manifest. When Node or OpenSSL 3 is present, they also require a valid Ed25519 publisher signature before placing the binary on your PATH. The binary itself requires the signature on every self-update.
 
 ## Commands
 

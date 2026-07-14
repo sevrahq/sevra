@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::io::{Cursor, Write};
 use std::path::Path;
 
 use serde::Serialize;
@@ -20,6 +21,37 @@ pub struct Store {
     pub files: Vec<StoreFile>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assets: Option<String>,
+}
+
+/// Build the immutable whole-store ZIP used by the hub's large-brain path.
+/// Entries are path-sorted with fixed metadata so retrying an unchanged store
+/// produces the same bytes and therefore the same content address.
+pub fn build_pack(store: &Store) -> std::io::Result<Vec<u8>> {
+    let mut entries: Vec<(&str, &[u8])> = store
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file.content.as_bytes()))
+        .collect();
+    if let Some(assets) = store.assets.as_deref() {
+        entries.push(("assets.jsonl", assets.as_bytes()));
+    }
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .last_modified_time(zip::DateTime::default())
+        .unix_permissions(0o600);
+    for (path, bytes) in entries {
+        writer
+            .start_file(path, options)
+            .map_err(std::io::Error::other)?;
+        writer.write_all(bytes)?;
+    }
+    writer
+        .finish()
+        .map(Cursor::into_inner)
+        .map_err(std::io::Error::other)
 }
 
 /// Sentinel error text for the size-cap refusal — one definition, so the
@@ -169,5 +201,22 @@ mod tests {
             Err(Some(e)) => assert!(e.to_string().contains("bad.md"), "got: {e}"),
             other => panic!("expected named read error, got {:?}", other.map(|_| "ok")),
         }
+    }
+
+    #[test]
+    fn pack_is_deterministic_and_contains_the_complete_store() {
+        let t = tempfile::tempdir().unwrap();
+        write(t.path(), "z.md", b"last");
+        write(t.path(), "a.md", b"first");
+        write(t.path(), "assets.jsonl", b"{}\n");
+        let store = read_store(t.path().to_str().unwrap(), 4096).unwrap();
+        let one = build_pack(&store).unwrap();
+        let two = build_pack(&store).unwrap();
+        assert_eq!(one, two);
+        let mut archive = zip::ZipArchive::new(Cursor::new(one)).unwrap();
+        assert_eq!(archive.len(), 3);
+        assert_eq!(archive.by_index(0).unwrap().name(), "a.md");
+        assert_eq!(archive.by_index(1).unwrap().name(), "assets.jsonl");
+        assert_eq!(archive.by_index(2).unwrap().name(), "z.md");
     }
 }

@@ -19,25 +19,85 @@ const MAX_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
 /// The bearer key must never travel in cleartext; only loopback hosts may skip
 /// TLS (local dev against `npm run dev`).
 pub fn assert_safe_hub(hub: &str) {
-    // Minimal scheme/host parse — we control the shape (scheme://host[:port]).
-    let (scheme, rest) = match hub.split_once("://") {
-        Some(v) => v,
-        None => fail(&format!("invalid hub URL: {hub}"), None),
+    let parsed =
+        url::Url::parse(hub).unwrap_or_else(|_| fail(&format!("invalid hub URL: {hub}"), None));
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        fail("hub URLs must not contain userinfo", None);
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        fail("hub URLs must not contain a query or fragment", None);
+    }
+    let loopback = match parsed.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
     };
-    // Host = authority up to the first '/', minus any port — with the
-    // bracketed-IPv6 form handled so `http://[::1]:3000` counts as loopback.
-    let hostport = rest.split('/').next().unwrap_or("");
-    let host = match hostport.strip_prefix('[') {
-        Some(v6) => v6.split(']').next().unwrap_or(""),
-        None => hostport.split(':').next().unwrap_or(""),
-    };
-    let loopback = host == "localhost" || host == "127.0.0.1" || host == "::1";
-    if scheme != "https" && !loopback {
+    if parsed.scheme() != "https" && !loopback {
         fail(
             &format!("refusing non-HTTPS hub {hub} — your API key would travel in cleartext (localhost is exempt)"),
             None,
         );
     }
+}
+
+pub fn put_presigned(url: &str, headers: &Value, bytes: &[u8]) {
+    let parsed = url::Url::parse(url)
+        .unwrap_or_else(|_| fail("the hub returned an invalid upload URL", None));
+    if parsed.scheme() != "https"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
+        fail("the hub returned an unsafe upload URL", None);
+    }
+    let mut req = agent().put(url);
+    if let Some(map) = headers.as_object() {
+        for (name, value) in map {
+            if let Some(value) = value.as_str() {
+                req = req.set(name, value);
+            }
+        }
+    }
+    match req.send_bytes(bytes) {
+        Ok(resp) if resp.status() < 300 => {}
+        Ok(resp) => fail(
+            &format!("pack upload failed (HTTP {})", resp.status()),
+            None,
+        ),
+        Err(ureq::Error::Status(code, _)) => {
+            fail(&format!("pack upload failed (HTTP {code})"), None)
+        }
+        Err(ureq::Error::Transport(err)) => fail(&format!("pack upload failed: {err}"), None),
+    }
+}
+
+pub fn get_presigned(url: &str, max_bytes: u64) -> Vec<u8> {
+    let parsed = url::Url::parse(url)
+        .unwrap_or_else(|_| fail("the hub returned an invalid download URL", None));
+    if parsed.scheme() != "https"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
+        fail("the hub returned an unsafe download URL", None);
+    }
+    let resp = match agent().get(url).call() {
+        Ok(resp) => resp,
+        Err(ureq::Error::Status(code, _)) => {
+            fail(&format!("pack download failed (HTTP {code})"), None)
+        }
+        Err(ureq::Error::Transport(err)) => fail(&format!("pack download failed: {err}"), None),
+    };
+    let mut out = Vec::new();
+    resp.into_reader()
+        .take(max_bytes + 1)
+        .read_to_end(&mut out)
+        .unwrap_or_else(|err| fail(&format!("pack download failed: {err}"), None));
+    if out.len() as u64 > max_bytes {
+        fail("pack download exceeded the supported size", None);
+    }
+    out
 }
 
 /// The one not-logged-in message (also used by `secrets set` to refuse BEFORE
@@ -53,8 +113,12 @@ pub struct HubResponse {
 fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .user_agent(concat!("sevra/", env!("CARGO_PKG_VERSION")))
+        // Redirects are never implicit on authenticated or presigned traffic.
+        // A redirect can cross origins and strip or replay sensitive material;
+        // callers receive the 3xx and fail it as a non-success instead.
+        .redirects(0)
         // A hung hub must never hang an agent's loop: bounded connect, and a
-        // read window sized for a 4 MB push on a slow link.
+        // read window sized for a large pack transfer on a slow link.
         .timeout_connect(std::time::Duration::from_secs(10))
         .timeout_read(std::time::Duration::from_secs(120))
         .build()

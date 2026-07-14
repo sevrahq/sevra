@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.5 — 2026-07-14
+
 - New: **native Windows (x64)** — the release chain builds, signs, and ships
   `sevra-windows-x86_64.exe` (MSVC target); Windows-on-ARM runs it under the
   built-in x64 emulation. Self-update swaps the running exe Windows-style:
@@ -10,10 +12,11 @@
   failure, and stale parked copies are swept on the next launch.
 - New: `install.ps1` — the PowerShell installer
   (`irm https://www.sevrahq.com/install/sevra.ps1 | iex`), same contract as
-  `install.sh`: required SHA-256 (Get-FileHash), best-effort Ed25519 (node or
-  openssl 3) with `SEVRA_REQUIRE_SIGNATURE=1` to fail closed, honors
+  `install.sh`: required SHA-256 from Sevra's independently deployed release
+  manifest, plus fail-closed Ed25519 verification when Node or OpenSSL 3 is
+  available. It honors
   `SEVRA_INSTALL_DIR` / `SEVRA_VERSION` / `SEVRA_INSTALL_BASE` /
-  `GITHUB_TOKEN`, installs to `~\.sevra\bin`, no admin rights.
+  `SEVRA_TRUSTED_MANIFEST_BASE`, installs to `~\.sevra\bin`, no admin rights.
 - CI: the full test suite now also runs on `windows-latest` on every push
   (the release target's continuous guard), and the post-release smoke
   installs on Windows via `install.ps1` alongside the unix jobs.
@@ -22,6 +25,19 @@
   normalizes the bare apex hub host to www (a 308 strips the bearer, which
   read back as a misleading 401), and the installer error strings dropped
   their em dashes.
+- Large brains now push and export through deterministic, content-addressed
+  ZIP packs instead of failing at the JSON request-body ceiling. Snapshots
+  cap at 100,000 files, 512 MB uncompressed, and 256 MB compressed. Pack
+  downloads are SHA-256 verified and fully path/type/duplicate/size checked
+  before the first filesystem write; existing symlink escapes are refused.
+- Hub URLs use a real authority parser and reject userinfo, query, fragment,
+  and non-HTTPS remote origins. Authenticated and presigned traffic refuses
+  redirects, so credentials and pack bytes cannot be steered to a second
+  origin. Presigned requests never carry the hub bearer.
+- The Unix and Windows installers require the release digest from Sevra's
+  independently deployed manifest for ordinary GitHub downloads. A present
+  Ed25519 verifier now fails closed on a bad signature; only hosts with no
+  verifier at all use the independently trusted digest as their sole check.
 
 ## 0.1.4 — 2026-07-13
 

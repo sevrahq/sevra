@@ -13,13 +13,10 @@ allow = [
   "MIT",
   "Apache-2.0",
   "Apache-2.0 WITH LLVM-exception",
-  "BSD-2-Clause",
   "BSD-3-Clause",
   "ISC",
   "Unicode-3.0",
   "Zlib",
-  "MPL-2.0",
-  "CC0-1.0",
   "Unlicense",
   # The Mozilla CA root bundle (webpki-roots) ships under CDLA-Permissive-2.0 —
   # a permissive *data* license (no copyleft, no patent traps). It's the trust
@@ -31,6 +28,13 @@ confidence-threshold = 0.9
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# These three Windows compatibility crates are pinned by unrelated direct
+# dependency families (rustls/ring, rpassword, and clap/home). None exposes a
+# shared runtime API in sevra, and their major-version ranges cannot unify.
+skip = [
+  { name = "windows-sys", version = "=0.52.0", reason = "ring/rustls compatibility pin" },
+  { name = "windows-sys", version = "=0.59.0", reason = "rtoolbox compatibility pin" },
+]
 
 [sources]
 unknown-registry = "deny"

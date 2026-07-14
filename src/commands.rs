@@ -1,21 +1,26 @@
 //! The command handlers — full parity with the retired TS CLI, including the
 //! quality-pass behaviors (env-blind login, https-only hubs, non-JSON refusal,
-//! symlink-following push under the 4 MB cap, export path containment + slug
+//! symlink-following bounded push, export path containment + slug
 //! validation, gated-page reporting). `validate` shells `dbmd` and never links
 //! its library — Sevra's product tool consumes the standard through the same
 //! public binary any third party gets.
 
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::config::{self, Config, DEFAULT_HUB};
-use crate::hub::{ensure_ok, request, NOT_LOGGED_IN};
+use crate::hub::{ensure_ok, get_presigned, put_presigned, request, NOT_LOGGED_IN};
 use crate::output::{fail, json_mode, note, out, usage_fail};
-use crate::store::read_store;
+use crate::store::{build_pack, read_store};
 
-const MAX_PUSH_BYTES: usize = 4 * 1024 * 1024;
+const MAX_JSON_PUSH_BYTES: usize = 4 * 1024 * 1024;
+const MAX_STORE_FILES: usize = 100_000;
+const MAX_STORE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_PACK_BYTES: u64 = 256 * 1024 * 1024;
 /// The hub's cap on one secret value (mirrored client-side so an oversized
 /// paste fails fast, before any request).
 const MAX_SECRET_VALUE_CHARS: usize = 4096;
@@ -214,36 +219,74 @@ pub fn push(cfg: &Config, dir: &str, brain: &str) {
     if !Path::new(dir).exists() {
         fail(&format!("store directory not found: {dir}"), None);
     }
-    let over_cap = || -> ! {
-        fail(
-            "store is over the hub's push cap (~4 MB as JSON). Large brains sync a pack via presigned R2 upload (coming with the object store); push a smaller store for now.",
-            Some(json!({ "cap": MAX_PUSH_BYTES })),
-        )
-    };
-    let store = match read_store(dir, MAX_PUSH_BYTES as u64) {
+    let store = match read_store(dir, MAX_STORE_BYTES) {
         Ok(s) => s,
-        Err(None) => over_cap(), // refused early, before reading past the cap
+        Err(None) => fail(
+            "store exceeds the hub's 512 MB uncompressed snapshot limit",
+            Some(json!({ "cap": MAX_STORE_BYTES })),
+        ),
         Err(Some(e)) => fail(&format!("could not read {dir}: {e}"), None),
     };
     if store.files.is_empty() {
         fail(&format!("no .md files under {dir}"), None);
     }
-    let payload = serde_json::to_value(&store).unwrap();
-    // The exact check on the JSON encoding (escaping only grows raw bytes).
-    if payload.to_string().len() > MAX_PUSH_BYTES {
-        over_cap();
+    if store.files.len() > MAX_STORE_FILES {
+        fail(
+            "store exceeds the hub's 100,000-file snapshot limit",
+            Some(json!({ "cap": MAX_STORE_FILES, "files": store.files.len() })),
+        );
     }
+    let payload = serde_json::to_value(&store).unwrap();
     let file_count = store.files.len();
-    let r = ensure_ok(
-        request(
-            cfg,
-            "POST",
-            &format!("/api/hub/brains/{}/push", enc(brain)),
-            Some(&payload),
-            true,
-        ),
-        "push",
-    );
+    let payload_bytes = payload.to_string().len();
+    let r = if payload_bytes <= MAX_JSON_PUSH_BYTES {
+        ensure_ok(
+            request(
+                cfg,
+                "POST",
+                &format!("/api/hub/brains/{}/push", enc(brain)),
+                Some(&payload),
+                true,
+            ),
+            "push",
+        )
+    } else {
+        let pack = build_pack(&store)
+            .unwrap_or_else(|e| fail(&format!("could not build store pack: {e}"), None));
+        if pack.len() as u64 > MAX_PACK_BYTES {
+            fail(
+                "compressed store snapshot exceeds the hub's 256 MB limit",
+                Some(json!({ "cap": MAX_PACK_BYTES, "bytes": pack.len() })),
+            );
+        }
+        let sha256 = format!("{:x}", Sha256::digest(&pack));
+        let meta = json!({ "sha256": sha256, "bytes": pack.len() });
+        let presigned = ensure_ok(
+            request(
+                cfg,
+                "POST",
+                &format!("/api/hub/brains/{}/packs/presign", enc(brain)),
+                Some(&meta),
+                true,
+            ),
+            "prepare pack upload",
+        );
+        let url = presigned
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| fail("hub returned no pack upload URL", None));
+        put_presigned(url, presigned.get("headers").unwrap_or(&Value::Null), &pack);
+        ensure_ok(
+            request(
+                cfg,
+                "POST",
+                &format!("/api/hub/brains/{}/packs/commit", enc(brain)),
+                Some(&meta),
+                true,
+            ),
+            "commit pack",
+        )
+    };
     let s = r.get("indexed").cloned().unwrap_or(json!({}));
     let n = |k: &str| s.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
     out(
@@ -687,12 +730,59 @@ fn contained(root: &Path, rel: &str) -> Option<PathBuf> {
     Some(full)
 }
 
+fn entries_from_pack(bytes: Vec<u8>) -> Vec<(String, Vec<u8>)> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .unwrap_or_else(|e| fail(&format!("hub returned an invalid store pack: {e}"), None));
+    if archive.is_empty() || archive.len() > 100_000 {
+        fail("hub returned a store pack with an invalid file count", None);
+    }
+    let mut entries = Vec::with_capacity(archive.len());
+    let mut seen = std::collections::HashSet::new();
+    let mut total = 0u64;
+    for index in 0..archive.len() {
+        let mut file = archive
+            .by_index(index)
+            .unwrap_or_else(|e| fail(&format!("could not read store pack entry: {e}"), None));
+        if file.is_dir() {
+            continue;
+        }
+        let path = file.name().to_string();
+        if file.enclosed_name().is_none() || contained(Path::new("/store"), &path).is_none() {
+            fail(&format!("refusing unsafe export path: {path}"), None);
+        }
+        if let Some(mode) = file.unix_mode() {
+            let kind = mode & 0o170000;
+            if kind != 0 && kind != 0o100000 {
+                fail(&format!("refusing non-file ZIP entry: {path}"), None);
+            }
+        }
+        if !seen.insert(path.clone()) {
+            fail(&format!("refusing duplicate export path: {path}"), None);
+        }
+        total = total.saturating_add(file.size());
+        if total > MAX_STORE_BYTES {
+            fail("store pack expands beyond the 512 MB limit", None);
+        }
+        let mut content = Vec::new();
+        file.read_to_end(&mut content)
+            .unwrap_or_else(|e| fail(&format!("could not decompress {path}: {e}"), None));
+        if content.len() as u64 != file.size() {
+            fail(&format!("store pack entry length mismatch: {path}"), None);
+        }
+        entries.push((path, content));
+    }
+    if entries.is_empty() {
+        fail("hub returned an empty store pack", None);
+    }
+    entries
+}
+
 pub fn export(cfg: &Config, brain: &str, dir: Option<String>) {
     let r = ensure_ok(
         request(
             cfg,
             "GET",
-            &format!("/api/hub/brains/{}/export", enc(brain)),
+            &format!("/api/hub/brains/{}/export?format=pack", enc(brain)),
             None,
             true,
         ),
@@ -702,9 +792,11 @@ pub fn export(cfg: &Config, brain: &str, dir: Option<String>) {
     // becomes a path (don't trust the hub response).
     let remote_slug = r.get("slug").and_then(|s| s.as_str()).filter(|s| {
         !s.is_empty()
+            && s.len() <= 63
             && s.chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
             && !s.starts_with('-')
+            && !s.ends_with('-')
     });
     let local_slug: String = brain
         .to_lowercase()
@@ -733,32 +825,66 @@ pub fn export(cfg: &Config, brain: &str, dir: Option<String>) {
         .join(&dir);
     let root = normalize(&root);
 
-    let files = r
-        .get("files")
-        .and_then(|f| f.as_array())
-        .cloned()
-        .unwrap_or_default();
-    for f in &files {
-        let path = f.get("path").and_then(|p| p.as_str());
-        let content = f.get("content").and_then(|c| c.as_str());
-        let (path, content) = match (path, content) {
-            (Some(p), Some(c)) => (p, c),
-            _ => fail(
-                "refusing malformed file entry from hub (path/content must be strings)",
-                None,
-            ),
-        };
+    let entries: Vec<(String, Vec<u8>)> = if let Some(url) = r.get("url").and_then(Value::as_str) {
+        let expected = r
+            .get("sha256")
+            .and_then(Value::as_str)
+            .filter(|sha| sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+            .unwrap_or_else(|| fail("hub returned an invalid pack hash", None));
+        let pack = get_presigned(url, MAX_PACK_BYTES);
+        let actual = format!("{:x}", Sha256::digest(&pack));
+        if actual != expected {
+            fail("downloaded store pack failed SHA-256 verification", None);
+        }
+        entries_from_pack(pack)
+    } else {
+        let files = r
+            .get("files")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| fail("hub returned neither a store pack nor files", None));
+        files
+            .iter()
+            .map(|file| {
+                let path = file
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| fail("refusing malformed file path from hub", None));
+                let content = file
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| fail("refusing malformed file content from hub", None));
+                (path.to_string(), content.as_bytes().to_vec())
+            })
+            .collect()
+    };
+
+    // Gate the entire remote manifest before the first filesystem mutation.
+    let mut seen = std::collections::HashSet::new();
+    for (path, _) in &entries {
+        if contained(&root, path).is_none() {
+            fail(&format!("refusing unsafe export path: {path}"), None);
+        }
+        if !seen.insert(path) {
+            fail(&format!("refusing duplicate export path: {path}"), None);
+        }
+    }
+    std::fs::create_dir_all(&root)
+        .unwrap_or_else(|e| fail(&format!("cannot create {}: {e}", root.display()), None));
+    let real_root = std::fs::canonicalize(&root)
+        .unwrap_or_else(|e| fail(&format!("cannot resolve {}: {e}", root.display()), None));
+    for (path, content) in &entries {
         let full = contained(&root, path)
             .unwrap_or_else(|| fail(&format!("refusing unsafe export path: {path}"), None));
         if let Some(parent) = full.parent() {
-            std::fs::create_dir_all(parent).ok();
+            std::fs::create_dir_all(parent).unwrap_or_else(|e| {
+                fail(&format!("cannot create {}: {e}", parent.display()), None)
+            });
             // The lexical containment above can be defeated by a symlinked
             // subdir INSIDE an existing target dir — re-check the REAL parent
             // after creation (exports into a fresh dir are unaffected).
             let real_parent = std::fs::canonicalize(parent).unwrap_or_else(|e| {
                 fail(&format!("cannot resolve {}: {e}", parent.display()), None)
             });
-            let real_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
             if !real_parent.starts_with(&real_root) {
                 fail(
                     &format!(
@@ -785,10 +911,11 @@ pub fn export(cfg: &Config, brain: &str, dir: Option<String>) {
     }
     let mut data = r.as_object().cloned().unwrap_or_default();
     data.remove("files");
+    data.remove("url");
     data.insert("dir".into(), json!(dir));
-    data.insert("fileCount".into(), json!(files.len()));
+    data.insert("fileCount".into(), json!(entries.len()));
     out(
-        &format!("exported {} file(s) → {dir}", files.len()),
+        &format!("exported {} file(s) → {dir}", entries.len()),
         Some(Value::Object(data)),
     );
 }

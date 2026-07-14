@@ -3,17 +3,15 @@
 #
 #   irm https://www.sevrahq.com/install/sevra.ps1 | iex
 #
-# Downloads the signed `sevra.exe` static binary, verifies its SHA-256
-# (required, via Get-FileHash) and its Ed25519 publisher signature (when node
-# or openssl 3 is present), and drops it in a user directory. No runtime, no
+# Downloads the signed `sevra.exe` static binary, verifies its SHA-256 against
+# Sevra's independently deployed manifest (required) and its Ed25519 publisher
+# signature when a verifier is present, then drops it in a user directory. No runtime, no
 # package manager, no admin rights. Native x64; Windows-on-ARM runs the same
 # binary under the built-in x64 emulation.
 #
 # Honors: SEVRA_INSTALL_DIR (default ~\.sevra\bin), SEVRA_VERSION (default
 # latest), SEVRA_INSTALL_BASE (default GitHub releases),
-# SEVRA_REQUIRE_SIGNATURE=1 (fail the install when the Ed25519 signature
-# cannot be checked here, instead of relying on SHA-256 + HTTPS alone),
-# GITHUB_TOKEN (authenticates only the api.github.com latest lookup).
+# SEVRA_TRUSTED_MANIFEST_BASE (defaults to the Sevra origin).
 #
 # Everything runs through Invoke-Main on the LAST line, so a truncated
 # `irm | iex` stream can never execute a partial script.
@@ -23,7 +21,8 @@ $ErrorActionPreference = 'Stop'
 $Repo = 'sevrahq/sevra'
 $Dir = if ($env:SEVRA_INSTALL_DIR) { $env:SEVRA_INSTALL_DIR } else { Join-Path $env:USERPROFILE '.sevra\bin' }
 $Base = if ($env:SEVRA_INSTALL_BASE) { $env:SEVRA_INSTALL_BASE } else { "https://github.com/$Repo/releases/download" }
-$Api = "https://api.github.com/repos/$Repo/releases/latest"
+$Api = 'https://www.sevrahq.com/api/hub/versions'
+$ManifestBase = if ($env:SEVRA_TRUSTED_MANIFEST_BASE) { $env:SEVRA_TRUSTED_MANIFEST_BASE } else { 'https://www.sevrahq.com/api/hub/releases/sevra' }
 
 # The pinned publisher key (Ed25519 SPKI) — the same key that signs releases
 # in CI and is pinned inside the binary for self-update.
@@ -65,15 +64,10 @@ function Invoke-Main {
   $version = $env:SEVRA_VERSION
   if (-not $version) {
     Info 'Resolving the latest sevra release...'
-    # GITHUB_TOKEN authenticates ONLY this hardcoded api.github.com lookup
-    # (CI runners share rate-limited IPs); it is never sent to the download
-    # host.
-    $headers = @{}
-    if ($env:GITHUB_TOKEN) { $headers['authorization'] = "Bearer $($env:GITHUB_TOKEN)" }
-    try { $release = Invoke-RestMethod -Uri $Api -Headers $headers -UseBasicParsing } catch {
-      Fail 'could not resolve the latest release (rate-limited? set GITHUB_TOKEN, or pin SEVRA_VERSION)'
+    try { $release = Invoke-RestMethod -Uri $Api -UseBasicParsing } catch {
+      Fail 'could not resolve the trusted latest release; pin SEVRA_VERSION to retry'
     }
-    $version = "$($release.tag_name)" -replace '^v', ''
+    $version = "$($release.sevra.latest)"
     if (-not $version) { Fail 'could not resolve the latest release (empty tag)' }
   }
   $url = "$Base/v$version/$assetName"
@@ -86,20 +80,29 @@ function Invoke-Main {
     $bin = Join-Path $tmp 'sevra.exe'
     Fetch $url $bin
     Fetch "$url.sig" (Join-Path $tmp 'sevra.exe.sig')
-    Fetch "$Base/v$version/SHA256SUMS" (Join-Path $tmp 'SHA256SUMS')
 
-    # ── Verify checksum (required) ──────────────────────────────────────────
-    $sums = Get-Content (Join-Path $tmp 'SHA256SUMS')
-    $line = $sums | Where-Object { $_.TrimEnd().EndsWith(" $assetName") } | Select-Object -First 1
-    if (-not $line) { Fail "no checksum for $assetName in SHA256SUMS" }
-    $expected = ($line -split '\s+')[0].ToLowerInvariant()
+    # ── Verify checksum against the independently deployed manifest ────────
+    if ($env:SEVRA_INSTALL_BASE -and -not $env:SEVRA_TRUSTED_MANIFEST_BASE) {
+      Fetch "$Base/v$version/SHA256SUMS" (Join-Path $tmp 'SHA256SUMS')
+      $sums = Get-Content (Join-Path $tmp 'SHA256SUMS')
+      $line = $sums | Where-Object { $_.TrimEnd().EndsWith(" $assetName") } | Select-Object -First 1
+      if (-not $line) { Fail "no checksum for $assetName in SHA256SUMS" }
+      $expected = ($line -split '\s+')[0].ToLowerInvariant()
+    } else {
+      try { $expected = "$(Invoke-RestMethod -Uri "$ManifestBase/$version/$assetName" -UseBasicParsing)".Trim().ToLowerInvariant() } catch {
+        Fail "no trusted checksum for sevra $version $assetName"
+      }
+    }
+    if ($expected -notmatch '^[0-9a-f]{64}$') { Fail "no trusted checksum for sevra $version $assetName" }
     $actual = (Get-FileHash -Algorithm SHA256 -Path $bin).Hash.ToLowerInvariant()
     if ($actual -ne $expected) { Fail "checksum mismatch (expected $expected, got $actual). Refusing to install" }
     Info 'checksum: verified (sha256)'
 
-    # ── Verify signature (best-effort: node, else openssl 3) ────────────────
+    # ── Verify signature (required when a verifier is available) ───────────
     $verifiedSig = $false
+    $verifierAvailable = $false
     if (Have 'node') {
+      $verifierAvailable = $true
       $env:SEVRA_PUBKEY = $PubkeyPem
       $nodeScript = @'
 const { createPublicKey, verify } = require("node:crypto");
@@ -114,6 +117,7 @@ process.exit(ok ? 0 : 1);
       Remove-Item Env:SEVRA_PUBKEY -ErrorAction SilentlyContinue
     }
     if (-not $verifiedSig -and (Have 'openssl')) {
+      $verifierAvailable = $true
       $pubPem = Join-Path $tmp 'pub.pem'
       Set-Content -Path $pubPem -Value $PubkeyPem -NoNewline
       $sigB64 = (Get-Content (Join-Path $tmp 'sevra.exe.sig') -Raw).Trim()
@@ -124,10 +128,10 @@ process.exit(ok ? 0 : 1);
     }
     if ($verifiedSig) {
       Info 'signature: verified (ed25519)'
-    } elseif ($env:SEVRA_REQUIRE_SIGNATURE -eq '1') {
-      Fail 'signature could not be checked (no node or openssl 3) and SEVRA_REQUIRE_SIGNATURE=1. Refusing to install'
+    } elseif ($verifierAvailable) {
+      Fail 'publisher signature verification failed. Refusing to install'
     } else {
-      Info 'signature: not checked here (no node or openssl 3); the SHA-256 above was verified over HTTPS, and the binary re-verifies its signature on every self-update. Set SEVRA_REQUIRE_SIGNATURE=1 to make this check mandatory.'
+      Info 'signature: verifier unavailable; the required SHA-256 came from the independently deployed Sevra manifest'
     }
 
     # ── Install ─────────────────────────────────────────────────────────────
