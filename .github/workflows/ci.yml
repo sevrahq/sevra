@@ -20,6 +20,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
+      # The PowerShell installer must at least PARSE on every push — its full
+      # run is exercised by smoke.yml at release time, but a syntax error
+      # should never wait for a release to surface.
+      - name: Parse-check install.ps1
+        shell: pwsh
+        run: |
+          [void][scriptblock]::Create((Get-Content -Raw install.ps1))
+          Write-Host 'install.ps1: parse OK'
 
   check:
     name: fmt + clippy + test + deny
