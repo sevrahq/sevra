@@ -71,6 +71,13 @@ jobs:
           $out = (& $bin version | Out-String)
           if ($out -notmatch [regex]::Escape($env:SEVRA_VERSION)) { throw "expected pinned $env:SEVRA_VERSION" }
           # The not-logged-in path is the offline contract check.
+          # PowerShell 7.3 can promote a non-zero native exit to a terminating
+          # error under ErrorActionPreference=Stop. This failure is expected,
+          # so capture it explicitly before restoring strict native handling.
+          $nativeErrorsWereFatal = $PSNativeCommandUseErrorActionPreference
+          $PSNativeCommandUseErrorActionPreference = $false
           & $bin brains 2>err.txt
-          if ($LASTEXITCODE -eq 0) { throw 'expected failure without a key' }
+          $brainsExit = $LASTEXITCODE
+          $PSNativeCommandUseErrorActionPreference = $nativeErrorsWereFatal
+          if ($brainsExit -eq 0) { throw 'expected failure without a key' }
           if ((Get-Content err.txt -Raw) -notmatch 'not logged in') { throw 'missing not-logged-in message' }
