@@ -164,6 +164,10 @@ enum SecretsAction {
 }
 
 fn main() {
+    // Sweep any `<exe>.old.<pid>` leftover a previous Windows self-swap
+    // parked (the old exe stays delete-locked until its process exits, so
+    // the swap defers cleanup to here). No-op on unix.
+    update::cleanup_stale_swaps();
     // Even clap's own output honors the --json contract: an agent parsing
     // stdout must get a JSON object, never human text — including the
     // built-in `--version`/`--help` flags. Exit codes stay clap's

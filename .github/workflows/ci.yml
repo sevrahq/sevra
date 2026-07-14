@@ -9,6 +9,18 @@ permissions:
   contents: read
 
 jobs:
+  # The Windows release target's continuous guard: the full test suite on the
+  # OS we cannot run locally, so a portability regression fails on push, not
+  # at release time. Lint/deny stay on the canonical linux job below.
+  windows:
+    name: test (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+
   check:
     name: fmt + clippy + test + deny
     runs-on: ubuntu-latest

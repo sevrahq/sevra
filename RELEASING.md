@@ -14,17 +14,21 @@ the hub's `/api/hub/versions`.
    git tag vX.Y.Z && git push origin main vX.Y.Z
    ```
 
-4. CI (`release.yml`) runs preflight, cross-builds the 4 targets, then signs
-   every binary in the publish job (the `SEVRA_CLI_SIGNING_KEY` secret is
-   never exposed to the build jobs or their third-party actions) and publishes
-   the GitHub Release with `SHA256SUMS`. The released version MUST equal the
-   Cargo.toml version (the version job enforces it for tags AND dispatches).
-5. `smoke.yml` installs from the fresh release on macOS + Linux runners and
-   runs `sevra version`. Green smoke = the release is live; installed CLIs
+4. CI (`release.yml`) runs preflight, cross-builds the 5 targets (darwin
+   x86_64/aarch64, linux x86_64/aarch64 musl, windows x86_64 msvc — the
+   Windows asset is `sevra-windows-x86_64.exe`), then signs every binary in
+   the publish job (the `SEVRA_CLI_SIGNING_KEY` secret is never exposed to
+   the build jobs or their third-party actions) and publishes the GitHub
+   Release with `SHA256SUMS`. The released version MUST equal the Cargo.toml
+   version (the version job enforces it for tags AND dispatches).
+5. `smoke.yml` installs from the fresh release on macOS + Linux (install.sh)
+   and Windows (install.ps1) runners and runs `sevra version` + the
+   not-logged-in contract. Green smoke = the release is live; installed CLIs
    pick it up on their next daily check (or `sevra update`).
-6. If `install.sh` changed: copy it to the platform repo's `install/sevra.sh`
-   (the hub serves that snapshot at https://www.sevrahq.com/install/sevra.sh)
-   and deploy. The two copies must stay byte-identical.
+6. If `install.sh` or `install.ps1` changed: copy them to the platform repo's
+   `install/sevra.sh` / `install/sevra.ps1` (the hub serves those snapshots
+   at https://www.sevrahq.com/install/sevra.sh and .../install/sevra.ps1)
+   and deploy. Each pair must stay byte-identical.
 
 ## Key custody
 

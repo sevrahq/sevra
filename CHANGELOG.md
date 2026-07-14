@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+- New: **native Windows (x64)** — the release chain builds, signs, and ships
+  `sevra-windows-x86_64.exe` (MSVC target); Windows-on-ARM runs it under the
+  built-in x64 emulation. Self-update swaps the running exe Windows-style:
+  the old binary is parked aside as `sevra.exe.old.<pid>` (a rename ONTO a
+  running exe is refused by the OS), the new one renamed in with rollback on
+  failure, and stale parked copies are swept on the next launch.
+- New: `install.ps1` — the PowerShell installer
+  (`irm https://www.sevrahq.com/install/sevra.ps1 | iex`), same contract as
+  `install.sh`: required SHA-256 (Get-FileHash), best-effort Ed25519 (node or
+  openssl 3) with `SEVRA_REQUIRE_SIGNATURE=1` to fail closed, honors
+  `SEVRA_INSTALL_DIR` / `SEVRA_VERSION` / `SEVRA_INSTALL_BASE` /
+  `GITHUB_TOKEN`, installs to `~\.sevra\bin`, no admin rights.
+- CI: the full test suite now also runs on `windows-latest` on every push
+  (the release target's continuous guard), and the post-release smoke
+  installs on Windows via `install.ps1` alongside the unix jobs.
+- Account keys read `sevra_account_*` in every hint and doc (the hub mints
+  that prefix now; legacy `vc_account_*` keys keep validating), `login`
+  normalizes the bare apex hub host to www (a 308 strips the bearer, which
+  read back as a misleading 401), and the installer error strings dropped
+  their em dashes.
+
 ## 0.1.4 — 2026-07-13
 
 - New: `sevra secrets list|set|delete <brain> [NAME]` — the vault: write-only

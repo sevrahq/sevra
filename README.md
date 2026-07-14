@@ -8,11 +8,19 @@ It is a single static binary. No runtime, no package manager, no dependencies. I
 
 ## Install
 
+macOS and Linux (x86_64 and arm64):
+
 ```sh
 curl -fsSL https://www.sevrahq.com/install/sevra.sh | sh
 ```
 
-macOS and Linux, x86_64 and arm64. On Windows use WSL. The installer verifies the download's SHA-256 always, and its Ed25519 publisher signature when node or openssl 3 is present, before placing the binary on your PATH. The binary itself re-verifies the signature on every self-update.
+Windows (native x64; ARM64 runs the same binary under the built-in emulation — ships with the first release after v0.1.4):
+
+```powershell
+irm https://www.sevrahq.com/install/sevra.ps1 | iex
+```
+
+Both installers verify the download's SHA-256 always, and its Ed25519 publisher signature when node or openssl 3 is present, before placing the binary on your PATH. The binary itself re-verifies the signature on every self-update.
 
 ## Commands
 

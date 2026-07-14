@@ -8,11 +8,12 @@ use predicates::prelude::*;
 
 fn sevra() -> Command {
     let mut c = Command::cargo_bin("sevra").unwrap();
-    // Isolate HOME so no real ~/.sevra credential leaks in.
-    c.env(
-        "HOME",
-        std::env::temp_dir().join(format!("sevra-test-{}", std::process::id())),
-    );
+    // Isolate the home dir so no real ~/.sevra credential leaks in.
+    // `home::home_dir()` reads HOME on unix and USERPROFILE on Windows —
+    // set both so the isolation holds on every CI OS.
+    let home = std::env::temp_dir().join(format!("sevra-test-{}", std::process::id()));
+    c.env("HOME", &home);
+    c.env("USERPROFILE", &home);
     c.env_remove("SEVRA_API_KEY");
     c.env_remove("SEVRA_HUB_URL");
     c

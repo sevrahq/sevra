@@ -5,9 +5,13 @@
 > is the hub's product CLI — a signed, self-updating static binary. It is a
 > machine interface: agents are its primary users.
 
-Install (macOS/Linux, x86_64/arm64; no runtime, no package manager):
+Install (no runtime, no package manager). macOS/Linux, x86_64/arm64:
 
     curl -fsSL https://www.sevrahq.com/install/sevra.sh | sh
+
+Windows (native x64, first release after v0.1.4; ARM64 via built-in emulation):
+
+    irm https://www.sevrahq.com/install/sevra.ps1 | iex
 
 Authenticate (key from the dashboard at https://www.sevrahq.com/dashboard):
 

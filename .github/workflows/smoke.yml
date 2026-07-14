@@ -67,3 +67,37 @@ jobs:
             echo "expected failure without a key" >&2; exit 1
           fi
           grep -q "not logged in" err.txt
+
+  install-windows:
+    name: install (windows-latest)
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run the PowerShell installer against the release
+        shell: pwsh
+        env:
+          # Same version resolution as the unix jobs (see the comment there).
+          SEVRA_VERSION: ${{ inputs.version || github.event.release.tag_name || github.event.workflow_run.head_branch }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $v = "$env:SEVRA_VERSION" -replace '^v', ''
+          if ($v -notmatch '^[0-9]') { $v = '' }
+          $env:SEVRA_VERSION = $v
+          $env:SEVRA_INSTALL_DIR = Join-Path $env:RUNNER_TEMP 'sevra-bin'
+          ./install.ps1
+          $bin = Join-Path $env:SEVRA_INSTALL_DIR 'sevra.exe'
+          & $bin version
+          if ($LASTEXITCODE -ne 0) { throw 'version failed' }
+          $json = (& $bin version --json | Out-String)
+          if ($json -notmatch '"version"') { throw 'version --json missing "version"' }
+          # When pinned, the installed binary must self-report THAT version.
+          if ($env:SEVRA_VERSION) {
+            $out = (& $bin version | Out-String)
+            if ($out -notmatch [regex]::Escape($env:SEVRA_VERSION)) { throw "expected pinned $env:SEVRA_VERSION" }
+          }
+          # The not-logged-in path is the offline contract check.
+          & $bin brains 2>err.txt
+          if ($LASTEXITCODE -eq 0) { throw 'expected failure without a key' }
+          if ((Get-Content err.txt -Raw) -notmatch 'not logged in') { throw 'missing not-logged-in message' }

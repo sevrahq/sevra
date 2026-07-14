@@ -7,7 +7,8 @@
 # Downloads the signed `sevra` static binary for your platform, verifies its
 # SHA-256 (required) and its Ed25519 publisher signature (when node or openssl 3
 # is present), and drops it on your PATH. No runtime, no package manager, no
-# dependencies. macOS + Linux (x86_64/arm64); on Windows use WSL.
+# dependencies. macOS + Linux (x86_64/arm64); on Windows use the PowerShell
+# installer: irm https://www.sevrahq.com/install/sevra.ps1 | iex
 #
 # Honors: SEVRA_INSTALL_DIR (default ~/.sevra/bin), SEVRA_VERSION (default
 # latest), SEVRA_INSTALL_BASE (default GitHub releases),
@@ -65,7 +66,7 @@ os="$(uname -s)"; arch="$(uname -m)"
 case "$os" in
   Darwin) p_os="darwin" ;;
   Linux)  p_os="linux" ;;
-  *) err "unsupported OS: $os (macOS/Linux only; on Windows use WSL)" ;;
+  *) err "unsupported OS: $os (macOS/Linux; on Windows: irm https://www.sevrahq.com/install/sevra.ps1 | iex)" ;;
 esac
 case "$arch" in
   x86_64|amd64) p_arch="x86_64" ;;

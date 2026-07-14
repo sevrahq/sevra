@@ -43,14 +43,78 @@ pub fn asset_target() -> &'static str {
     {
         "linux-aarch64-musl"
     }
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        // Also serves Windows-on-ARM: the x64 binary runs under emulation,
+        // and because target_arch is baked at compile time, an emulated
+        // binary self-updates onto the same x64 asset — consistent forever.
+        "windows-x86_64"
+    }
     #[cfg(not(any(
         all(target_os = "macos", target_arch = "x86_64"),
         all(target_os = "macos", target_arch = "aarch64"),
         all(target_os = "linux", target_arch = "x86_64"),
         all(target_os = "linux", target_arch = "aarch64"),
+        all(target_os = "windows", target_arch = "x86_64"),
     )))]
     {
         "unsupported"
+    }
+}
+
+/// Release assets are bare binaries on unix and carry `.exe` on Windows
+/// (`sevra-windows-x86_64.exe`) so the downloaded file is directly runnable.
+fn asset_suffix() -> &'static str {
+    if cfg!(target_os = "windows") {
+        ".exe"
+    } else {
+        ""
+    }
+}
+
+/// The aside name a Windows self-swap parks the running exe under:
+/// `<full file name>.old.<pid>` — appended to the whole name, never via
+/// `with_extension` (which would eat `.exe`).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn swap_aside_path(p: &std::path::Path) -> std::path::PathBuf {
+    let name = p
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "sevra".to_string());
+    p.with_file_name(format!("{name}.old.{}", std::process::id()))
+}
+
+/// True for the parked leftovers of a previous self-swap of `exe_name`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_stale_swap_name(name: &str, exe_name: &str) -> bool {
+    name.strip_prefix(exe_name)
+        .and_then(|rest| rest.strip_prefix(".old."))
+        .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Best-effort removal of `<exe>.old.<pid>` siblings parked by previous
+/// Windows self-swaps: the OLD exe stays delete-locked until its process
+/// exits, so the swap defers cleanup to the NEXT launch — this call. No-op on
+/// unix and on any error (a locked or missing file is fine).
+pub fn cleanup_stale_swaps() {
+    #[cfg(windows)]
+    {
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let Some(name) = exe.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            return;
+        };
+        let Some(dir) = exe.parent() else { return };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let entry_name = entry.file_name().to_string_lossy().into_owned();
+            if is_stale_swap_name(&entry_name, &name) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
 }
 
@@ -136,7 +200,7 @@ fn download_verify_replace(version: &str) -> Result<(), String> {
             "refusing malformed version string from the hub: {version:?}"
         ));
     }
-    let base = format!("{RELEASES}/v{version}/sevra-{target}");
+    let base = format!("{RELEASES}/v{version}/sevra-{target}{}", asset_suffix());
     let binary = download(&base)?;
     let sig = String::from_utf8(download(&format!("{base}.sig"))?)
         .map_err(|_| "signature is not text".to_string())?;
@@ -160,6 +224,27 @@ fn download_verify_replace(version: &str) -> Result<(), String> {
         fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))
             .map_err(|e| format!("chmod failed: {e}"))?;
     }
+    #[cfg(windows)]
+    {
+        // Windows refuses a rename ONTO a running exe but allows renaming the
+        // running exe ASIDE. Swap: self → `sevra.exe.old.<pid>` (delete-locked
+        // until this process exits; removed by cleanup_stale_swaps on the next
+        // launch), then tmp → self. A failed second step rolls the original
+        // back, so an interrupted update never leaves a missing binary.
+        let old = swap_aside_path(&self_path);
+        fs::rename(&self_path, &old).map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            format!("replace failed (staging the running exe aside): {e}")
+        })?;
+        if let Err(e) = fs::rename(&tmp, &self_path) {
+            let _ = fs::rename(&old, &self_path);
+            let _ = fs::remove_file(&tmp);
+            return Err(format!("replace failed: {e}"));
+        }
+        // Usually still locked by this very process; the next launch sweeps it.
+        let _ = fs::remove_file(&old);
+    }
+    #[cfg(not(windows))]
     fs::rename(&tmp, &self_path).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         format!("replace failed: {e}")
@@ -374,6 +459,31 @@ mod tests {
         assert!(!is_older("1.0.0", "0.9.9"));
         assert!(!is_older("0.1.0", "0.1.0"));
         assert!(is_older("0.1.0", "0.1.1-rc1"));
+    }
+
+    #[test]
+    fn swap_aside_keeps_the_full_file_name() {
+        // `with_extension` would turn sevra.exe into sevra.old.<pid> and eat
+        // `.exe` — the aside path must append to the WHOLE name instead.
+        // (Forward-slash paths so file_name() parses on every host OS.)
+        let aside = swap_aside_path(std::path::Path::new("bin/sevra.exe"));
+        let name = aside.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("sevra.exe.old."));
+        let aside = swap_aside_path(std::path::Path::new("/usr/local/bin/sevra"));
+        let name = aside.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("sevra.old."));
+    }
+
+    #[test]
+    fn stale_swap_name_matching_is_strict() {
+        assert!(is_stale_swap_name("sevra.exe.old.1234", "sevra.exe"));
+        assert!(is_stale_swap_name("sevra.old.7", "sevra"));
+        // Not ours: wrong exe, missing pid, non-numeric pid, unrelated files.
+        assert!(!is_stale_swap_name("sevra.exe.old.", "sevra.exe"));
+        assert!(!is_stale_swap_name("sevra.exe.old.abc", "sevra.exe"));
+        assert!(!is_stale_swap_name("other.exe.old.12", "sevra.exe"));
+        assert!(!is_stale_swap_name("sevra.exe", "sevra.exe"));
+        assert!(!is_stale_swap_name("sevra.exe.new.12", "sevra.exe"));
     }
 
     #[test]

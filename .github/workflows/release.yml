@@ -1,10 +1,12 @@
 # Cross-compile, sign, and release the single `sevra` binary.
 #
-# Four targets, each a BARE binary asset `sevra-<target>` plus a detached
-# Ed25519 signature `sevra-<target>.sig` (base64 of 64 raw bytes), signed with
-# the SEVRA_CLI_SIGNING_KEY secret — the same publisher key pinned in the
-# binary and the installer. A single SHA256SUMS covers every asset. install.sh
-# and `sevra update` download these directly (no tarball to extract).
+# Five targets: four BARE unix binaries `sevra-<target>` plus the Windows
+# `sevra-windows-x86_64.exe`, each with a detached Ed25519 signature
+# `<asset>.sig` (base64 of 64 raw bytes), signed with the
+# SEVRA_CLI_SIGNING_KEY secret — the same publisher key pinned in the binary
+# and the installers. A single SHA256SUMS covers every asset. install.sh /
+# install.ps1 and `sevra update` download these directly (no tarball to
+# extract).
 #
 # CI-gated: cross-platform builds/signing run only on GitHub runners; they are
 # authored + self-linted here, not executed on a dev host. Cut a release by
@@ -106,6 +108,10 @@ jobs:
             rust_target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             use_cross: true
+          - target_name: windows-x86_64
+            rust_target: x86_64-pc-windows-msvc
+            os: windows-latest
+            use_cross: false
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -135,8 +141,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Windows assets keep the .exe (directly runnable once downloaded);
+          # unix assets stay bare.
+          ext=""
+          case "${{ matrix.target_name }}" in windows-*) ext=".exe" ;; esac
           mkdir -p dist
-          cp "target/${{ matrix.rust_target }}/release/sevra" "dist/sevra-${{ matrix.target_name }}"
+          cp "target/${{ matrix.rust_target }}/release/sevra${ext}" "dist/sevra-${{ matrix.target_name }}${ext}"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target_name }}
