@@ -24,10 +24,14 @@ the hub's `/api/hub/versions`.
    release is published, copy the asset digests into the platform repo's
    static trusted manifest and deploy it. Ordinary installs do not trust the
    checksum served beside the GitHub binary.
-5. `smoke.yml` installs from the fresh release on macOS + Linux (install.sh)
-   and Windows (install.ps1) runners and runs `sevra version` + the
-   not-logged-in contract. Green smoke = the release is live; installed CLIs
-   pick it up on their next daily check (or `sevra update`).
+5. After the trusted manifest deployment is live, manually dispatch
+   `smoke.yml` with the concrete version. It installs from the release on
+   macOS + Linux (install.sh) and Windows (install.ps1), then runs
+   `sevra version` + the not-logged-in contract. It intentionally does not
+   auto-run at release publication: the independently controlled manifest is
+   not approved yet, and the correct installer behavior at that point is to
+   fail closed. Green post-manifest smoke = the release is live; installed
+   CLIs pick it up on their next daily check (or `sevra update`).
 6. If `install.sh` or `install.ps1` changed: copy them to the platform repo's
    `install/sevra.sh` / `install/sevra.ps1` (the hub serves those snapshots
    at https://www.sevrahq.com/install/sevra.sh and .../install/sevra.ps1)

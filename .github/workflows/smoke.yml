@@ -1,23 +1,16 @@
-# Post-release install smoke: run the REAL installer against the fresh
-# release on both OS families and prove the installed binary answers.
-# Catches broken assets, checksum drift, or installer regressions the moment
-# a release is cut — before any user or self-updating binary sees it.
-name: smoke
+# Post-manifest install smoke: run the REAL installer against a release after
+# its independently reviewed digests are live on www.sevrahq.com. The origin
+# manifest deliberately cannot be updated by this repository's release job;
+# auto-running at release publication would only prove that fail-closed trust
+# rejects a not-yet-approved version.
+name: post-manifest smoke
 
 on:
-  # A release published by release.yml's GITHUB_TOKEN emits NO `release`
-  # event to other workflows (GitHub's recursion guard), so smoke chains off
-  # the release WORKFLOW completing instead.
-  workflow_run:
-    workflows: [release]
-    types: [completed]
-  release:
-    types: [published] # still fires for manually-published releases
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to smoke (without leading v; default latest)"
-        required: false
+        description: "Approved version to smoke (without leading v)"
+        required: true
 
 permissions:
   contents: read
@@ -25,9 +18,6 @@ permissions:
 jobs:
   install:
     name: install (${{ matrix.os }})
-    # Chained runs only smoke SUCCESSFUL releases; a failed release has no
-    # assets to install.
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -38,30 +28,18 @@ jobs:
       - name: Run the installer against the release
         shell: bash
         env:
-          # Chained runs take the version from the release workflow's TAG
-          # (head_branch is the tag for tag-triggered runs) — pinning it makes
-          # smoke deterministic AND skips the api.github.com latest lookup,
-          # which shared runner IPs get 403-rate-limited on.
-          SEVRA_VERSION: ${{ inputs.version || github.event.release.tag_name || github.event.workflow_run.head_branch }}
-          # For the unpinned path (bare dispatch), authenticate the lookup.
+          SEVRA_VERSION: ${{ inputs.version }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # Strip a leading v; discard non-version values (a dispatch-triggered
-          # release chains head_branch = "main" — fall back to latest).
+          # Strip a leading v and reject anything but a concrete SemVer.
           export SEVRA_VERSION="${SEVRA_VERSION#v}"
-          case "$SEVRA_VERSION" in
-            [0-9]*) ;;
-            *) export SEVRA_VERSION="" ;;
-          esac
+          echo "$SEVRA_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
           export SEVRA_INSTALL_DIR="$RUNNER_TEMP/sevra-bin"
           sh install.sh
           "$SEVRA_INSTALL_DIR/sevra" version
           "$SEVRA_INSTALL_DIR/sevra" version --json | grep '"version"'
-          # When pinned, the installed binary must self-report THAT version.
-          if [ -n "$SEVRA_VERSION" ]; then
-            "$SEVRA_INSTALL_DIR/sevra" version | grep -F "$SEVRA_VERSION"
-          fi
+          "$SEVRA_INSTALL_DIR/sevra" version | grep -F "$SEVRA_VERSION"
           # The not-logged-in path is the offline contract check.
           if "$SEVRA_INSTALL_DIR/sevra" brains 2>err.txt; then
             echo "expected failure without a key" >&2; exit 1
@@ -70,20 +48,18 @@ jobs:
 
   install-windows:
     name: install (windows-latest)
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
       - name: Run the PowerShell installer against the release
         shell: pwsh
         env:
-          # Same version resolution as the unix jobs (see the comment there).
-          SEVRA_VERSION: ${{ inputs.version || github.event.release.tag_name || github.event.workflow_run.head_branch }}
+          SEVRA_VERSION: ${{ inputs.version }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
           $v = "$env:SEVRA_VERSION" -replace '^v', ''
-          if ($v -notmatch '^[0-9]') { $v = '' }
+          if ($v -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$') { throw 'version must be concrete SemVer' }
           $env:SEVRA_VERSION = $v
           $env:SEVRA_INSTALL_DIR = Join-Path $env:RUNNER_TEMP 'sevra-bin'
           ./install.ps1
@@ -92,11 +68,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'version failed' }
           $json = (& $bin version --json | Out-String)
           if ($json -notmatch '"version"') { throw 'version --json missing "version"' }
-          # When pinned, the installed binary must self-report THAT version.
-          if ($env:SEVRA_VERSION) {
-            $out = (& $bin version | Out-String)
-            if ($out -notmatch [regex]::Escape($env:SEVRA_VERSION)) { throw "expected pinned $env:SEVRA_VERSION" }
-          }
+          $out = (& $bin version | Out-String)
+          if ($out -notmatch [regex]::Escape($env:SEVRA_VERSION)) { throw "expected pinned $env:SEVRA_VERSION" }
           # The not-logged-in path is the offline contract check.
           & $bin brains 2>err.txt
           if ($LASTEXITCODE -eq 0) { throw 'expected failure without a key' }
