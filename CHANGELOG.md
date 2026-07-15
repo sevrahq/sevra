@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.1.6 — 2026-07-14
+
+- Reliability: hub requests and presigned pack transfers retry bounded DNS,
+  connection, and proxy-connect failures that occur before any request can
+  reach the server. Mid-stream I/O is never replayed, so mutating commands do
+  not guess after bytes may have crossed the wire.
+- Tests: a delayed loopback server locks the connect-retry regression.
+
 ## 0.1.5 — 2026-07-14
 
 - New: **native Windows (x64)** — the release chain builds, signs, and ships

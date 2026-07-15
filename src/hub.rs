@@ -15,6 +15,8 @@ use crate::output::fail;
 /// bodies are read through an explicit reader with a cap sized for the
 /// biggest honest payload (a full-store export), refused loudly past it.
 const MAX_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
+const CONNECT_ATTEMPTS: usize = 3;
+const CONNECT_RETRY_BACKOFF_MS: [u64; CONNECT_ATTEMPTS - 1] = [100, 300];
 
 /// The bearer key must never travel in cleartext; only loopback hosts may skip
 /// TLS (local dev against `npm run dev`).
@@ -51,24 +53,30 @@ pub fn put_presigned(url: &str, headers: &Value, bytes: &[u8]) {
     {
         fail("the hub returned an unsafe upload URL", None);
     }
-    let mut req = agent().put(url);
-    if let Some(map) = headers.as_object() {
-        for (name, value) in map {
-            if let Some(value) = value.as_str() {
-                req = req.set(name, value);
+    let http = agent();
+    let result = with_connect_retries(|| {
+        let mut req = http.put(url);
+        if let Some(map) = headers.as_object() {
+            for (name, value) in map {
+                if let Some(value) = value.as_str() {
+                    req = req.set(name, value);
+                }
             }
         }
-    }
-    match req.send_bytes(bytes) {
+        req.send_bytes(bytes).map_err(Box::new)
+    });
+    match result {
         Ok(resp) if resp.status() < 300 => {}
         Ok(resp) => fail(
             &format!("pack upload failed (HTTP {})", resp.status()),
             None,
         ),
-        Err(ureq::Error::Status(code, _)) => {
-            fail(&format!("pack upload failed (HTTP {code})"), None)
-        }
-        Err(ureq::Error::Transport(err)) => fail(&format!("pack upload failed: {err}"), None),
+        Err(error) => match *error {
+            ureq::Error::Status(code, _) => {
+                fail(&format!("pack upload failed (HTTP {code})"), None)
+            }
+            ureq::Error::Transport(err) => fail(&format!("pack upload failed: {err}"), None),
+        },
     }
 }
 
@@ -82,12 +90,15 @@ pub fn get_presigned(url: &str, max_bytes: u64) -> Vec<u8> {
     {
         fail("the hub returned an unsafe download URL", None);
     }
-    let resp = match agent().get(url).call() {
+    let http = agent();
+    let resp = match with_connect_retries(|| http.get(url).call().map_err(Box::new)) {
         Ok(resp) => resp,
-        Err(ureq::Error::Status(code, _)) => {
-            fail(&format!("pack download failed (HTTP {code})"), None)
-        }
-        Err(ureq::Error::Transport(err)) => fail(&format!("pack download failed: {err}"), None),
+        Err(error) => match *error {
+            ureq::Error::Status(code, _) => {
+                fail(&format!("pack download failed (HTTP {code})"), None)
+            }
+            ureq::Error::Transport(err) => fail(&format!("pack download failed: {err}"), None),
+        },
     };
     let mut out = Vec::new();
     resp.into_reader()
@@ -124,6 +135,40 @@ fn agent() -> ureq::Agent {
         .build()
 }
 
+/// Retry only failures that happen before an HTTP request can reach the hub.
+/// Mid-stream I/O is deliberately excluded because request bytes may already
+/// have crossed the wire; replay safety then belongs to the verb's idempotency
+/// contract, not a generic transport loop.
+fn is_pre_request_transport(kind: ureq::ErrorKind) -> bool {
+    matches!(
+        kind,
+        ureq::ErrorKind::Dns | ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::ProxyConnect
+    )
+}
+
+fn with_connect_retries(
+    mut send: impl FnMut() -> Result<ureq::Response, Box<ureq::Error>>,
+) -> Result<ureq::Response, Box<ureq::Error>> {
+    let mut attempt = 0;
+    loop {
+        match send() {
+            Err(error)
+                if matches!(
+                    error.as_ref(),
+                    ureq::Error::Transport(transport)
+                        if is_pre_request_transport(transport.kind())
+                ) && attempt + 1 < CONNECT_ATTEMPTS =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    CONNECT_RETRY_BACKOFF_MS[attempt],
+                ));
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
 /// A key must be a clean header token before it is placed in the bearer
 /// header: ureq rejects bad header VALUES with an error that echoes the whole
 /// header line — key included — so a stray newline from a copy/paste would
@@ -152,28 +197,38 @@ pub fn request(
 ) -> HubResponse {
     assert_safe_hub(&cfg.hub);
     let url = format!("{}{}", cfg.hub, path);
-    let mut req = agent().request(method, &url);
-    if auth {
+    let credential = if auth {
         match &cfg.key {
-            Some(k) => req = req.set("authorization", &format!("Bearer {}", clean_key(k))),
+            Some(k) => Some(format!("Bearer {}", clean_key(k))),
             None => fail(NOT_LOGGED_IN, None),
         }
-    }
-
-    let result = match body {
-        Some(v) => {
-            req = req.set("content-type", "application/json");
-            req.send_string(&v.to_string())
-        }
-        None => req.call(),
+    } else {
+        None
     };
+    let encoded_body = body.map(Value::to_string);
+    let http = agent();
+    let result = with_connect_retries(|| {
+        let mut req = http.request(method, &url);
+        if let Some(value) = &credential {
+            req = req.set("authorization", value);
+        }
+        match &encoded_body {
+            Some(value) => req
+                .set("content-type", "application/json")
+                .send_string(value)
+                .map_err(Box::new),
+            None => req.call().map_err(Box::new),
+        }
+    });
 
     let (status, resp) = match result {
         Ok(resp) => (resp.status(), Some(resp)),
-        Err(ureq::Error::Status(code, resp)) => (code, Some(resp)),
-        Err(ureq::Error::Transport(t)) => {
-            fail(&format!("hub unreachable at {}: {}", cfg.hub, t), None)
-        }
+        Err(error) => match *error {
+            ureq::Error::Status(code, resp) => (code, Some(resp)),
+            ureq::Error::Transport(t) => {
+                fail(&format!("hub unreachable at {}: {}", cfg.hub, t), None)
+            }
+        },
     };
 
     let resp = resp.unwrap();
@@ -236,5 +291,43 @@ pub fn ensure_ok(r: HubResponse, what: &str) -> Value {
             ),
             None,
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn request_retries_a_connection_failure_before_sending() {
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = probe.local_addr().unwrap();
+        drop(probe);
+        let server = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            let listener = TcpListener::bind(address).unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request_bytes = [0_u8; 1024];
+            let _ = stream.read(&mut request_bytes).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+                )
+                .unwrap();
+        });
+        let cfg = Config {
+            hub: format!("http://{address}"),
+            key: None,
+        };
+
+        let response = request(&cfg, "GET", "/retry", None, false);
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, Some(serde_json::json!({ "ok": true })));
+        server.join().unwrap();
     }
 }
