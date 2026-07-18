@@ -13,9 +13,12 @@ Windows (native x64, first release after v0.1.4; ARM64 via built-in emulation):
 
     irm https://www.sevrahq.com/install/sevra.ps1 | iex
 
-Authenticate (key from the dashboard at https://www.sevrahq.com/dashboard):
+Authenticate — approve once in the browser, no key to paste:
 
-    sevra login --key sevra_account_...
+    sevra login
+    # opens your person's browser; they approve; you get a session.
+    # Headless/SSH: it prints a short code + URL to approve from any device.
+    # Scripts/CI: sevra login --key sevra_account_... (minted in the dashboard).
 
 Agent contract:
 - Add `--json` to ANY command: machine-readable JSON on stdout, always,
@@ -26,7 +29,7 @@ Agent contract:
   override it. Non-HTTPS hubs are refused (localhost exempt).
 
 Commands:
-    login --key <k> [--hub <url>] | logout | whoami
+    login [--hub <url>] [--no-browser] [--key <k>] | logout | whoami
     brains | create <slug> [--name --scope --public]
     push <dir> --brain <id|slug>          # index-on-push; 4 MB JSON cap
     query <brain> [text] [--type --layer --meta-type --tag --where k=v --limit N]

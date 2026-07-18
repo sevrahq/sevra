@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+## 0.2.0 — 2026-07-18
+
+- New: **`sevra login` signs in through your browser** — no key to paste. It
+  binds a loopback port, opens the browser, and collects a session when the
+  approved sign-in is handed back to that port. The credential never travels
+  in the URL (a PKCE verifier held only by the CLI is exchanged for the
+  session), so the flow is phishing-resistant by construction.
+- New: **sign-in code fallback** for headless/SSH or approving from another
+  computer — `sevra login` prints a short code and a URL, chosen automatically
+  when no browser can open, or forced with `--no-browser`.
+- New: **server-managed sessions.** A browser/code sign-in mints a session
+  that expires after 90 days of inactivity (slid forward on use), listed and
+  revocable in the dashboard. `sevra logout` revokes it server-side. A stored
+  `--key` is still supported for scripts and CI and is left untouched by
+  logout.
+- Reliability: the sign-in poll tolerates a transport blip mid-wait instead of
+  aborting, and clamps hub-supplied timing values.
+
 ## 0.1.6 — 2026-07-14
 
 - Reliability: hub requests and presigned pack transfers retry bounded DNS,
