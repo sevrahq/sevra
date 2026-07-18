@@ -34,6 +34,9 @@ serde_json = "1"
 ed25519-dalek = "2"
 base64 = "0.22"
 sha2 = "0.10"
+# OS randomness for the browser sign-in's PKCE verifier (a credential, so it
+# must not come from a userspace PRNG). Already in the tree via rustls.
+getrandom = "0.2"
 zip = { version = "7.2", default-features = false, features = ["deflate"] }
 # Home directory resolution for ~/.sevra (no libc dance).
 home = "0.5"

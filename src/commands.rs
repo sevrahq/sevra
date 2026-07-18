@@ -48,7 +48,7 @@ fn str_field<'a>(v: &'a Value, key: &str) -> &'a str {
 
 // --- login / logout / whoami -------------------------------------------------
 
-pub fn login(flag_hub: Option<String>, key: Option<String>) {
+pub fn login(flag_hub: Option<String>, key: Option<String>, no_browser: bool) {
     // Env-blind: login PERSISTS a hub, so a one-off SEVRA_HUB_URL must not
     // silently become the stored default. --hub is the explicit path.
     let hub = flag_hub
@@ -122,11 +122,25 @@ pub fn login(flag_hub: Option<String>, key: Option<String>) {
         return;
     }
 
-    // No key: the approve-in-browser flow is the default. Redemption already
-    // proves the account binding and hands back the account email, so we do
-    // NOT re-probe /me — a probe blip must never strand a key the hub just
-    // minted (it would be lost, unrecoverable, and count against the cap).
-    let signed_in = device_flow_key(&hub);
+    // No key: sign in through the browser. The loopback flow is the automatic
+    // path (nothing to read or type); if this machine can't do it — no
+    // browser, no local port — fall back to the code flow, which is the one
+    // that works over SSH or from another computer.
+    //
+    // Either way the hub already proved the account binding and returned the
+    // email, so we do NOT re-probe /me: a probe blip must never strand a
+    // session the hub just minted.
+    let signed_in = if no_browser {
+        device_flow_key(&hub)
+    } else {
+        match browser_flow(&hub) {
+            Some(signed_in) => signed_in,
+            None => {
+                note("no browser available here — falling back to a sign-in code");
+                device_flow_key(&hub)
+            }
+        }
+    };
     if let Err(e) = config::save(&hub, &signed_in.key, Some(&signed_in.key_id)) {
         fail(&format!("could not write config: {e}"), None);
     }
@@ -148,6 +162,203 @@ struct DeviceLogin {
     key: String,
     email: String,
     key_id: String,
+}
+
+/// Random URL-safe token from OS entropy (the PKCE verifier is a credential).
+fn random_b64url(bytes: usize) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    let mut buf = vec![0u8; bytes];
+    if getrandom::getrandom(&mut buf).is_err() {
+        fail("could not read secure randomness from the OS", None);
+    }
+    URL_SAFE_NO_PAD.encode(buf)
+}
+
+fn challenge_of(verifier: &str) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+}
+
+/// Hand a URL to the platform's browser. Err means we could not even spawn an
+/// opener (headless box, no DE, locked-down Windows) — the caller then falls
+/// back to the code flow rather than leaving the human staring at nothing.
+fn open_browser(url: &str) -> Result<(), String> {
+    let (program, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
+        ("open", vec![url])
+    } else if cfg!(target_os = "windows") {
+        // `start` is a cmd builtin; the empty "" is the window-title slot, and
+        // without it a URL containing & is mis-parsed.
+        ("cmd", vec!["/C", "start", "", url])
+    } else {
+        ("xdg-open", vec![url])
+    };
+    match Command::new(program)
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(_) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+const LOOPBACK_PAGE: &str = "<!doctype html><meta charset=utf-8><title>Signed in</title>\
+<style>body{font-family:ui-sans-serif,system-ui,sans-serif;background:#f4f3ee;color:#020617;\
+display:grid;place-items:center;height:100vh;margin:0}div{text-align:center}\
+p{color:#64748b;font-size:14px}</style>\
+<div><h2>You're signed in.</h2><p>Return to your terminal. You can close this tab.</p></div>";
+
+/// The automatic sign-in: bind a loopback port, send the human to the hub to
+/// approve, and collect the session when the browser is handed back to us.
+/// Returns None when this machine can't do it (no listener, no browser), so
+/// the caller can fall back to the code flow.
+fn browser_flow(hub: &str) -> Option<DeviceLogin> {
+    use std::io::Write;
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").ok()?;
+    let port = listener.local_addr().ok()?.port();
+    let cfg = Config {
+        hub: hub.to_string(),
+        key: None,
+    };
+    let verifier = random_b64url(32);
+    let body = json!({
+        "challenge": challenge_of(&verifier),
+        "port": port,
+        "client": machine_label(),
+    });
+    let started = ensure_ok(
+        request(&cfg, "POST", "/api/hub/auth/cli/start", Some(&body), false),
+        "starting sign-in",
+    );
+    let request_id = str_field(&started, "requestId").to_string();
+    let approve_url = str_field(&started, "approveUrl").to_string();
+    if request_id.is_empty() || approve_url.is_empty() {
+        return None;
+    }
+    let expires_in = started
+        .get("expiresIn")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(600)
+        .clamp(60, 1800);
+
+    if open_browser(&approve_url).is_err() {
+        return None; // headless: the caller falls back to the code flow
+    }
+    if json_mode() {
+        println!(
+            "{}",
+            json!({
+                "status": "awaiting_approval",
+                "method": "browser",
+                "approveUrl": approve_url,
+                "expiresIn": expires_in,
+            })
+        );
+    } else {
+        println!("Approve this sign-in in your browser:");
+        println!("  {approve_url}");
+        println!("Waiting…");
+    }
+
+    // Wait for the browser to be handed back to us. Non-blocking accept so the
+    // wait is bounded by the approval window rather than hanging forever.
+    listener.set_nonblocking(true).ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(expires_in);
+    let mut landed = false;
+    while std::time::Instant::now() < deadline {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                stream.set_nonblocking(false).ok();
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]);
+                // Only the callback counts; browsers also probe /favicon.ico.
+                if head.starts_with("GET /cb") {
+                    let _ = stream.write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            LOOPBACK_PAGE.len(),
+                            LOOPBACK_PAGE
+                        )
+                        .as_bytes(),
+                    );
+                    landed = true;
+                    break;
+                }
+                let _ = stream.write_all(
+                    b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                );
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(_) => break,
+        }
+    }
+    if !landed {
+        fail(
+            "the browser never came back — approve in the browser, or run `sevra login --no-browser` to use a code instead",
+            None,
+        );
+    }
+
+    // The redirect proves approval, but the SESSION comes from the verifier we
+    // never let out of this process.
+    for attempt in 0..5 {
+        let resp = match crate::hub::try_request(
+            &cfg,
+            "POST",
+            "/api/hub/auth/cli/exchange",
+            Some(&json!({ "requestId": request_id, "verifier": verifier })),
+            false,
+        ) {
+            Ok(resp) => resp,
+            Err(_) if attempt < 4 => {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                continue;
+            }
+            Err(t) => fail(
+                &format!("could not reach the hub to finish sign-in: {t}"),
+                None,
+            ),
+        };
+        let body = resp.body.clone().unwrap_or(Value::Null);
+        match (resp.status, str_field(&body, "status")) {
+            (200, "approved") => {
+                let key = crate::hub::clean_key(str_field(&body, "key"));
+                if key.is_empty() {
+                    fail(
+                        "the hub approved the sign-in but sent no key — try again",
+                        None,
+                    );
+                }
+                return Some(DeviceLogin {
+                    key,
+                    email: str_field(&body, "email").to_string(),
+                    key_id: str_field(&body, "keyId").to_string(),
+                });
+            }
+            (200, "pending") => std::thread::sleep(std::time::Duration::from_secs(1)),
+            (200, "denied") => fail("the sign-in was denied in the browser", None),
+            (200, "failed") => fail(
+                &format!(
+                    "the hub could not finish sign-in: {}",
+                    str_field(&body, "error")
+                ),
+                None,
+            ),
+            _ => fail(
+                "the hub no longer recognizes this sign-in — run `sevra login` again",
+                None,
+            ),
+        }
+    }
+    fail("sign-in did not complete — run `sevra login` again", None);
 }
 
 /// The approve-in-browser sign-in (`sevra login` with no key): start a device

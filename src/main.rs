@@ -38,14 +38,18 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Sign in: approve in the browser (default), or --key to store a key.
-    /// Stored at ~/.sevra/config.json. With --json, the browser flow first
-    /// emits one compact awaiting_approval line (relay its URL + code), then
-    /// the final login object.
+    /// Stored at ~/.sevra/config.json. With --json, sign-in first emits one
+    /// compact awaiting_approval line (relay its URL, and its code when there
+    /// is one), then the final login object.
     Login {
         #[arg(long)]
         key: Option<String>,
         #[arg(long)]
         hub: Option<String>,
+        /// Skip the browser and use a sign-in code (SSH, headless, or when
+        /// approving from another computer).
+        #[arg(long)]
+        no_browser: bool,
     },
     /// Remove the stored credential
     Logout,
@@ -209,7 +213,11 @@ fn main() {
 
     // Commands that don't need a loaded credential first.
     match &cli.command {
-        Commands::Login { key, hub } => return commands::login(hub.clone(), key.clone()),
+        Commands::Login {
+            key,
+            hub,
+            no_browser,
+        } => return commands::login(hub.clone(), key.clone(), *no_browser),
         Commands::Logout => return commands::logout(),
         Commands::Validate { dir } => return commands::validate(dir.clone()),
         Commands::Version => return update::cmd_version(),

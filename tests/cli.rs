@@ -592,7 +592,7 @@ fn device_flow_signs_in_end_to_end() {
     ]);
 
     let out = sevra_at_home(home.path())
-        .args(["login", "--hub", &base])
+        .args(["login", "--hub", &base, "--no-browser"])
         .output()
         .unwrap();
     assert!(out.status.success(), "login failed: {}", all_output(&out));
@@ -642,6 +642,41 @@ fn device_flow_signs_in_end_to_end() {
 }
 
 #[test]
+fn browser_flow_falls_back_to_the_code_flow_when_no_browser_opens() {
+    // The automatic path needs a browser. In this environment we force the
+    // code flow with --no-browser and assert the fallback path still signs in
+    // end to end (start + poll + approved), never touching the loopback
+    // endpoints. This is the SSH / headless contract.
+    let home = tempfile::tempdir().unwrap();
+    let approved = format!(
+        r#"{{"status":"approved","key":"{MOCK_KEY}","keyId":"01x","hint":"cdef","email":"t@example.com"}}"#
+    );
+    let (base, log, handle) = mock_hub(vec![(201, device_start_body()), (200, approved)]);
+    let out = sevra_at_home(home.path())
+        .args(["login", "--hub", &base, "--no-browser"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "code-flow login: {}",
+        all_output(&out)
+    );
+    handle.join().unwrap();
+    let reqs = log.lock().unwrap();
+    assert_eq!(
+        reqs[0].path, "/api/hub/auth/device",
+        "went straight to the code flow"
+    );
+    assert!(
+        reqs.iter()
+            .all(|r| !r.path.starts_with("/api/hub/auth/cli")),
+        "--no-browser must not touch the loopback endpoints: {reqs:?}"
+    );
+    let config = std::fs::read_to_string(home.path().join(".sevra/config.json")).unwrap();
+    assert!(config.contains(MOCK_KEY), "session persisted");
+}
+
+#[test]
 fn device_flow_recovers_from_a_transport_blip_mid_poll() {
     // The bug this guards: a poll that hit a transport error used to abort the
     // whole login. Now a dropped connection (status 0) is retried, and the
@@ -656,7 +691,7 @@ fn device_flow_recovers_from_a_transport_blip_mid_poll() {
         (200, approved),
     ]);
     let out = sevra_at_home(home.path())
-        .args(["login", "--hub", &base])
+        .args(["login", "--hub", &base, "--no-browser"])
         .output()
         .unwrap();
     assert!(
@@ -690,7 +725,7 @@ fn logout_revokes_a_device_minted_key_server_side() {
     ]);
 
     let login = sevra_at_home(home.path())
-        .args(["login", "--hub", &base])
+        .args(["login", "--hub", &base, "--no-browser"])
         .output()
         .unwrap();
     assert!(login.status.success(), "login: {}", all_output(&login));
@@ -721,7 +756,7 @@ fn device_flow_denied_is_a_clean_failure() {
         (200, r#"{"status":"denied"}"#.to_string()),
     ]);
     let out = sevra_at_home(home.path())
-        .args(["login", "--hub", &base])
+        .args(["login", "--hub", &base, "--no-browser"])
         .output()
         .unwrap();
     assert!(!out.status.success());
@@ -746,7 +781,7 @@ fn device_flow_expired_code_says_run_again() {
         ),
     ]);
     let out = sevra_at_home(home.path())
-        .args(["login", "--hub", &base])
+        .args(["login", "--hub", &base, "--no-browser"])
         .output()
         .unwrap();
     assert!(!out.status.success());
@@ -764,7 +799,7 @@ fn device_flow_json_emits_awaiting_line_then_result() {
     // No /me response: the device path does not probe. start + one poll only.
     let (base, _log, handle) = mock_hub(vec![(201, device_start_body()), (200, approved)]);
     let out = sevra_at_home(home.path())
-        .args(["login", "--hub", &base, "--json"])
+        .args(["login", "--hub", &base, "--json", "--no-browser"])
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", all_output(&out));
@@ -786,7 +821,7 @@ fn device_flow_json_emits_awaiting_line_then_result() {
 fn device_flow_unreachable_hub_fails_fast() {
     let home = tempfile::tempdir().unwrap();
     sevra_at_home(home.path())
-        .args(["login", "--hub", "http://127.0.0.1:9"])
+        .args(["login", "--hub", "http://127.0.0.1:9", "--no-browser"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("hub unreachable"));
