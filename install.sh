@@ -142,11 +142,11 @@ chmod +x "$staged"
 mv -f "$staged" "$DIR/sevra"
 info "sevra ${version} installed to $DIR/sevra"
 case ":$PATH:" in
-  *":$DIR:"*) info "Next: sevra login --key sevra_account_...   (create a key in the dashboard)" ;;
+  *":$DIR:"*) info "Next: sevra login   (approve once in your browser)" ;;
   *)
     info "Add it to your PATH, then log in:"
     info "  export PATH=\"$DIR:\$PATH\""
-    info "  sevra login --key sevra_account_..." ;;
+    info "  sevra login" ;;
 esac
 
 }

@@ -147,12 +147,12 @@ process.exit(ok ? 0 : 1);
 
     $onPath = ($env:Path -split ';') -contains $Dir
     if ($onPath) {
-      Info 'Next: sevra login --key sevra_account_...   (create a key in the dashboard)'
+      Info 'Next: sevra login   (approve once in your browser)'
     } else {
       Info 'Add it to your PATH (user scope, new shells), then log in:'
       Info "  [Environment]::SetEnvironmentVariable('Path', `"$Dir;`" + [Environment]::GetEnvironmentVariable('Path','User'), 'User')"
       Info "  `$env:Path = `"$Dir;`" + `$env:Path   # this shell too"
-      Info '  sevra login --key sevra_account_...'
+      Info '  sevra login'
     }
 
   } finally {
