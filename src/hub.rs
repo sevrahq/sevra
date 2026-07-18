@@ -114,7 +114,7 @@ pub fn get_presigned(url: &str, max_bytes: u64) -> Vec<u8> {
 /// The one not-logged-in message (also used by `secrets set` to refuse BEFORE
 /// prompting for a value it could never send).
 pub const NOT_LOGGED_IN: &str =
-    "not logged in — run `sevra login --key sevra_account_…` (get a key from the dashboard)";
+    "not logged in — run `sevra login` (approve in the browser; `--key sevra_account_…` also works)";
 
 pub struct HubResponse {
     pub status: u16,
@@ -187,7 +187,9 @@ pub fn clean_key(raw: &str) -> String {
 }
 
 /// Perform a hub request. `auth` toggles the bearer header (the caller passes
-/// false only for the login probe, which supplies its own key inline).
+/// false only for the login probe / device flow, which supply their own
+/// credential inline or none). A transport failure or a mid-body read failure
+/// aborts the process — the right default for a one-shot command.
 pub fn request(
     cfg: &Config,
     method: &str,
@@ -195,6 +197,33 @@ pub fn request(
     body: Option<&Value>,
     auth: bool,
 ) -> HubResponse {
+    match request_inner(cfg, method, path, body, auth) {
+        Ok(resp) => resp,
+        Err(t) => fail(&format!("hub unreachable at {}: {}", cfg.hub, t), None),
+    }
+}
+
+/// Like `request`, but returns a transport/read failure as `Err(message)`
+/// instead of aborting. The device sign-in poll uses this so a brief network
+/// blip mid-wait is retried, not fatal — a ten-minute approval window must
+/// survive a wifi renegotiation.
+pub fn try_request(
+    cfg: &Config,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    auth: bool,
+) -> Result<HubResponse, String> {
+    request_inner(cfg, method, path, body, auth)
+}
+
+fn request_inner(
+    cfg: &Config,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    auth: bool,
+) -> Result<HubResponse, String> {
     assert_safe_hub(&cfg.hub);
     let url = format!("{}{}", cfg.hub, path);
     let credential = if auth {
@@ -221,17 +250,21 @@ pub fn request(
         }
     });
 
-    let (status, resp) = match result {
-        Ok(resp) => (resp.status(), Some(resp)),
+    let resp = match result {
+        Ok(resp) => resp,
         Err(error) => match *error {
-            ureq::Error::Status(code, resp) => (code, Some(resp)),
-            ureq::Error::Transport(t) => {
-                fail(&format!("hub unreachable at {}: {}", cfg.hub, t), None)
+            ureq::Error::Status(code, resp) => {
+                // An HTTP status IS a hub answer — never a transport failure.
+                return finish_response(cfg, code, resp);
             }
+            ureq::Error::Transport(t) => return Err(t.to_string()),
         },
     };
+    let status = resp.status();
+    finish_response(cfg, status, resp)
+}
 
-    let resp = resp.unwrap();
+fn finish_response(cfg: &Config, status: u16, resp: ureq::Response) -> Result<HubResponse, String> {
     // Release-versioned staleness check (once per process; version-based, not
     // deploy-coupled): the CLI learns the latest release from the hub and
     // signed-self-updates when behind.
@@ -242,13 +275,7 @@ pub fn request(
         .take(MAX_RESPONSE_BYTES + 1)
         .read_to_end(&mut buf)
     {
-        fail(
-            &format!(
-                "reading the hub's response failed mid-body: {e} (hub: {})",
-                cfg.hub
-            ),
-            None,
-        );
+        return Err(format!("reading the hub's response failed mid-body: {e}"));
     }
     if buf.len() as u64 > MAX_RESPONSE_BYTES {
         fail(
@@ -261,10 +288,10 @@ pub fn request(
     }
     let text = String::from_utf8_lossy(&buf);
     let parsed: Option<Value> = serde_json::from_str(&text).ok();
-    HubResponse {
+    Ok(HubResponse {
         status,
         body: parsed,
-    }
+    })
 }
 
 /// Unwrap a successful JSON body, or fail. A >=400 surfaces the hub's own

@@ -15,6 +15,11 @@ pub struct FileConfig {
     pub hub: Option<String>,
     #[serde(default)]
     pub key: Option<String>,
+    // Set only when the key was minted by the browser sign-in flow (so
+    // `logout` can revoke it server-side). Absent for a user-supplied
+    // `--key`, which logout leaves untouched — the user may use it elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -69,13 +74,14 @@ pub fn load() -> Config {
 /// world-readable, not even for the write-then-chmod window. Written to a
 /// 0600 temp file in the same dir, then renamed over the target (atomic on
 /// POSIX). Non-Unix platforms get default perms under the user profile.
-pub fn save(hub: &str, key: &str) -> std::io::Result<()> {
+pub fn save(hub: &str, key: &str, key_id: Option<&str>) -> std::io::Result<()> {
     let dir = config_dir();
     fs::create_dir_all(&dir)?;
     let path = config_path();
     let body = serde_json::to_string_pretty(&FileConfig {
         hub: Some(strip_trailing_slash(hub)),
         key: Some(key.to_string()),
+        key_id: key_id.map(String::from),
     })
     .unwrap();
     let tmp = dir.join(format!("config.json.new.{}", std::process::id()));

@@ -25,8 +25,9 @@ Both installers verify the download's SHA-256 against Sevra's independently depl
 ## Commands
 
 ```
-sevra login --key <sevra_account_…> [--hub <url>]   store your credential
-sevra logout
+sevra login [--hub <url>]                        approve in the browser (default)
+sevra login --key <sevra_account_…> [--hub <url>]   or store a key directly
+sevra logout                                     revoke a browser-minted key + forget it
 sevra whoami
 
 sevra brains                                     list your brains

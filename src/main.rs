@@ -37,7 +37,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Store your hub credential (~/.sevra/config.json)
+    /// Sign in: approve in the browser (default), or --key to store a key.
+    /// Stored at ~/.sevra/config.json. With --json, the browser flow first
+    /// emits one compact awaiting_approval line (relay its URL + code), then
+    /// the final login object.
     Login {
         #[arg(long)]
         key: Option<String>,

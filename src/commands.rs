@@ -17,6 +17,9 @@ use crate::hub::{ensure_ok, get_presigned, put_presigned, request, NOT_LOGGED_IN
 use crate::output::{fail, json_mode, note, out, usage_fail};
 use crate::store::{build_pack, read_store};
 
+/// The hub's poll cadence when it does not say otherwise (it always does).
+const POLL_INTERVAL_SECS: u64 = 5;
+
 const MAX_JSON_PUSH_BYTES: usize = 4 * 1024 * 1024;
 const MAX_STORE_FILES: usize = 100_000;
 const MAX_STORE_BYTES: u64 = 512 * 1024 * 1024;
@@ -69,59 +72,292 @@ pub fn login(flag_hub: Option<String>, key: Option<String>) {
             }
         }
     }
-    // The message promises SEVRA_API_KEY works — honor it: --key wins, the
-    // env var is the fallback.
-    let key = key.or_else(|| config::env_nonempty("SEVRA_API_KEY")).unwrap_or_else(|| {
-        fail("provide a key: `sevra login --key sevra_account_…` (create one in the dashboard). SEVRA_API_KEY also works.", None)
-    });
-    // Trim paste artifacts + refuse non-token bytes NOW, so the stored file is
-    // clean and the refusal happens at login, not on the next command.
-    let key = crate::hub::clean_key(&key);
-
-    let probe_cfg = Config {
-        hub: hub.clone(),
-        key: Some(key.clone()),
-    };
-    let probe = request(&probe_cfg, "GET", "/api/hub/me", None, true);
-    let email = probe
-        .body
-        .as_ref()
-        .and_then(|b| b.get("email"))
-        .and_then(|e| e.as_str())
-        .map(String::from);
-    if probe.status != 200 || email.is_none() {
-        let suffix = if probe.body.is_none() {
-            ", non-JSON response"
-        } else {
-            ""
+    // --key wins and SEVRA_API_KEY stays the scripted fallback.
+    if let Some(k) = key.or_else(|| config::env_nonempty("SEVRA_API_KEY")) {
+        // A supplied key: verify it against /me, then persist. No key_id is
+        // stored — this credential is the user's, so `logout` must never
+        // revoke it server-side.
+        let key = crate::hub::clean_key(&k);
+        let probe_cfg = Config {
+            hub: hub.clone(),
+            key: Some(key.clone()),
         };
-        fail(
+        let probe = request(&probe_cfg, "GET", "/api/hub/me", None, true);
+        let email = probe
+            .body
+            .as_ref()
+            .and_then(|b| b.get("email"))
+            .and_then(|e| e.as_str())
+            .map(String::from);
+        if probe.status != 200 || email.is_none() {
+            let suffix = if probe.body.is_none() {
+                ", non-JSON response"
+            } else {
+                ""
+            };
+            fail(
+                &format!(
+                    "that key did not authenticate against {hub} (HTTP {}{suffix})",
+                    probe.status
+                ),
+                None,
+            );
+        }
+        if let Err(e) = config::save(&hub, &key, None) {
+            fail(&format!("could not write config: {e}"), None);
+        }
+        let mut data = probe
+            .body
+            .and_then(|b| b.as_object().cloned())
+            .unwrap_or_default();
+        data.insert("hub".into(), json!(hub));
+        out(
             &format!(
-                "that key did not authenticate against {hub} (HTTP {}{suffix})",
-                probe.status
+                "logged in to {hub} as {} (config: {})",
+                email.unwrap(),
+                config::config_path().display()
             ),
-            None,
+            Some(Value::Object(data)),
         );
+        return;
     }
-    if let Err(e) = config::save(&hub, &key) {
+
+    // No key: the approve-in-browser flow is the default. Redemption already
+    // proves the account binding and hands back the account email, so we do
+    // NOT re-probe /me — a probe blip must never strand a key the hub just
+    // minted (it would be lost, unrecoverable, and count against the cap).
+    let signed_in = device_flow_key(&hub);
+    if let Err(e) = config::save(&hub, &signed_in.key, Some(&signed_in.key_id)) {
         fail(&format!("could not write config: {e}"), None);
     }
-    let mut data = probe
-        .body
-        .and_then(|b| b.as_object().cloned())
-        .unwrap_or_default();
-    data.insert("hub".into(), json!(hub));
+    let who = if signed_in.email.is_empty() {
+        "your account".to_string()
+    } else {
+        signed_in.email.clone()
+    };
     out(
         &format!(
-            "logged in to {hub} as {} (config: {})",
-            email.unwrap(),
+            "logged in to {hub} as {who} (config: {})",
             config::config_path().display()
         ),
-        Some(Value::Object(data)),
+        Some(json!({ "email": signed_in.email, "hub": hub, "keyId": signed_in.key_id })),
     );
 }
 
+struct DeviceLogin {
+    key: String,
+    email: String,
+    key_id: String,
+}
+
+/// The approve-in-browser sign-in (`sevra login` with no key): start a device
+/// authorization, show the human the code + URL, poll until the hub hands
+/// back a fresh account key. The device code never leaves this process; the
+/// human types nothing but a click.
+///
+/// Agent contract for `--json`: the FIRST stdout line is a compact JSON
+/// `awaiting_approval` event (relay its URL + code); the FINAL stdout value is
+/// the pretty-printed login object. Read line 1 as an event, then parse the
+/// remainder as one object.
+fn device_flow_key(hub: &str) -> DeviceLogin {
+    let cfg = Config {
+        hub: hub.to_string(),
+        key: None,
+    };
+    let body = match machine_label() {
+        Some(name) => json!({ "client": name }),
+        None => json!({}),
+    };
+    let started = ensure_ok(
+        request(&cfg, "POST", "/api/hub/auth/device", Some(&body), false),
+        "starting sign-in",
+    );
+    let device_code = str_field(&started, "deviceCode").to_string();
+    let user_code = str_field(&started, "userCode").to_string();
+    if device_code.is_empty() || user_code.is_empty() {
+        fail(
+            "the hub's sign-in answer was missing the codes — is this a Sevra hub? (`sevra login --key …` still works)",
+            None,
+        );
+    }
+    let verify_at = {
+        let complete = str_field(&started, "verificationUriComplete");
+        if complete.is_empty() {
+            format!("{hub}/device")
+        } else {
+            complete.to_string()
+        }
+    };
+    // Clamp the hub-supplied timings: a remote value must never make the CLI
+    // busy-loop (interval 0), sleep for a day (interval huge), overflow the
+    // deadline (expiresIn near u64::MAX), or give up before the first poll
+    // (expiresIn <= interval).
+    let interval = started
+        .get("interval")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(POLL_INTERVAL_SECS)
+        .clamp(1, 60);
+    let expires_in = started
+        .get("expiresIn")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(900)
+        .clamp(interval + 30, 1800);
+
+    if json_mode() {
+        println!(
+            "{}",
+            json!({
+                "status": "awaiting_approval",
+                "userCode": user_code,
+                "verificationUri": str_field(&started, "verificationUri"),
+                "verificationUriComplete": verify_at,
+                "expiresIn": expires_in,
+                "interval": interval,
+            })
+        );
+    } else {
+        println!("First, confirm this code in your browser: {user_code}");
+        println!("Open: {verify_at}");
+        println!("Waiting for approval…");
+    }
+
+    // Backoff grows the gap on throttle or trouble, capped, and never below the
+    // hub's interval; the whole loop is bounded by the deadline.
+    let backoff = |w: u64| w.saturating_mul(2).clamp(interval, 30);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(expires_in);
+    let mut wait = interval;
+    let mut last_trouble: Option<String> = None;
+    loop {
+        if std::time::Instant::now() >= deadline {
+            match last_trouble {
+                Some(t) => fail(
+                    &format!("sign-in did not complete — the hub had trouble ({t}). Run `sevra login` again."),
+                    None,
+                ),
+                None => fail("the approval window closed — run `sevra login` again", None),
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(wait));
+        // try_request, not request: a transport blip mid-wait must be retried,
+        // not fatal.
+        let resp = match crate::hub::try_request(
+            &cfg,
+            "POST",
+            "/api/hub/auth/device/token",
+            Some(&json!({ "deviceCode": device_code })),
+            false,
+        ) {
+            Ok(resp) => resp,
+            Err(t) => {
+                last_trouble = Some(t);
+                wait = backoff(wait);
+                continue;
+            }
+        };
+        match resp.status {
+            200 => {
+                let body = resp.body.unwrap_or(Value::Null);
+                match str_field(&body, "status") {
+                    "pending" => {
+                        wait = interval;
+                        last_trouble = None;
+                    }
+                    "approved" => {
+                        let key = crate::hub::clean_key(str_field(&body, "key"));
+                        if key.is_empty() {
+                            fail(
+                                "the hub approved the sign-in but sent no key — try again",
+                                None,
+                            );
+                        }
+                        return DeviceLogin {
+                            key,
+                            email: str_field(&body, "email").to_string(),
+                            key_id: str_field(&body, "keyId").to_string(),
+                        };
+                    }
+                    "denied" => fail("the sign-in was denied in the dashboard", None),
+                    "failed" => {
+                        let msg = str_field(&body, "error");
+                        fail(
+                            &format!("the hub could not finish sign-in: {msg}"),
+                            Some(body.clone()),
+                        )
+                    }
+                    other => fail(
+                        &format!("unexpected sign-in state from the hub: {other:?}"),
+                        None,
+                    ),
+                }
+            }
+            // Throttled: grow the gap. Repeated 429s back off further, so the
+            // client self-adjusts to whatever pace the hub wants.
+            429 => wait = backoff(wait),
+            400 => {
+                let code = resp
+                    .body
+                    .as_ref()
+                    .and_then(|b| b.get("code"))
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("");
+                if code == "expired" {
+                    fail("the code expired — run `sevra login` again", None);
+                }
+                fail(
+                    "the hub no longer recognizes this sign-in — run `sevra login` again",
+                    None,
+                );
+            }
+            // A transient hub error must not kill the wait: back off and keep
+            // trying until the deadline (not a fixed retry count).
+            s if s >= 500 => {
+                last_trouble = Some(format!("HTTP {s}"));
+                wait = backoff(wait);
+            }
+            s => fail(
+                &format!("unexpected hub answer during sign-in (HTTP {s})"),
+                None,
+            ),
+        }
+    }
+}
+
+/// A cosmetic label for the approval page + the minted key's name. `hostname`
+/// exists on every target OS; anything odd just means no label.
+fn machine_label() -> Option<String> {
+    let out = Command::new("hostname").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
 pub fn logout() {
+    // Revoke a browser-minted key server-side first (best-effort): device
+    // sign-ins each mint a fresh key, so without this they pile up unrevoked
+    // against the account cap. Only keys WE minted carry a key_id; a
+    // user-supplied `--key` has none and is left alone (they may use it
+    // elsewhere). A network failure here must never block the local logout.
+    let file = config::load_file();
+    if let (Some(key), Some(_id)) = (file.key.as_deref(), file.key_id.as_deref()) {
+        let hub = file
+            .hub
+            .clone()
+            .unwrap_or_else(|| config::DEFAULT_HUB.to_string());
+        let cfg = Config {
+            hub,
+            key: Some(key.to_string()),
+        };
+        // auth:true sends the very key we are revoking as the bearer — the hub
+        // revokes exactly the presented credential.
+        let _ = crate::hub::try_request(&cfg, "POST", "/api/hub/keys/revoke-self", None, true);
+    }
+
     // Honest about what happened: a credential file that EXISTS but cannot be
     // removed must be a loud failure (the key would silently survive on disk),
     // and a no-op logout must not claim it removed anything.

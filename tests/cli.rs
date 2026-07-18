@@ -16,6 +16,8 @@ fn sevra() -> Command {
     c.env("USERPROFILE", &home);
     c.env_remove("SEVRA_API_KEY");
     c.env_remove("SEVRA_HUB_URL");
+    // No surprise release-check requests against test hubs.
+    c.env("SEVRA_NO_AUTO_UPDATE", "1");
     c
 }
 
@@ -430,6 +432,361 @@ fn secrets_list_and_delete_hold_the_json_error_contract() {
         .args(["secrets", "delete", "b", "API_KEY"])
         .env("SEVRA_HUB_URL", "http://localhost:9")
         .env("SEVRA_API_KEY", "x")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("hub unreachable"));
+}
+
+// --- device-flow sign-in (`sevra login` with no key), on a mock loopback hub -
+// Loopback HTTP is exempt from the HTTPS guard, so a hand-rolled TcpListener
+// plays the hub: start → poll(pending) → poll(approved with a key) → the /me
+// probe. Zero new dev-deps, same idiom as dbmd's mock hubs.
+
+use std::io::{BufRead, BufReader, Read as IoRead, Write as IoWrite};
+use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
+
+#[derive(Clone, Debug)]
+struct MockReq {
+    method: String,
+    path: String,
+    authorization: Option<String>,
+    body: String,
+}
+
+fn read_mock_request(stream: &mut TcpStream) -> Option<MockReq> {
+    let mut reader = BufReader::new(stream.try_clone().ok()?);
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+    let mut parts = line.split_whitespace();
+    let method = parts.next()?.to_string();
+    let path = parts.next()?.to_string();
+    let mut content_length = 0usize;
+    let mut authorization = None;
+    loop {
+        let mut h = String::new();
+        reader.read_line(&mut h).ok()?;
+        let t = h.trim();
+        if t.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = t.split_once(':') {
+            if k.eq_ignore_ascii_case("content-length") {
+                content_length = v.trim().parse().unwrap_or(0);
+            }
+            if k.eq_ignore_ascii_case("authorization") {
+                authorization = Some(v.trim().to_string());
+            }
+        }
+    }
+    let mut body = vec![0u8; content_length];
+    reader.read_exact(&mut body).ok()?;
+    Some(MockReq {
+        method,
+        path,
+        authorization,
+        body: String::from_utf8_lossy(&body).into_owned(),
+    })
+}
+
+fn respond_json(stream: &mut TcpStream, status: u16, body: &str) {
+    let reason = match status {
+        200 => "OK",
+        201 => "Created",
+        400 => "Bad Request",
+        429 => "Too Many Requests",
+        _ => "Error",
+    };
+    let msg = format!(
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(msg.as_bytes());
+}
+
+/// Serve `responses` in order, one connection each, recording every request.
+/// `{BASE}` inside a body is replaced with the hub's own base URL.
+fn mock_hub(
+    responses: Vec<(u16, String)>,
+) -> (
+    String,
+    Arc<Mutex<Vec<MockReq>>>,
+    std::thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    // Bounded accept: if the client makes FEWER requests than there are queued
+    // responses, the thread must not block on accept() forever (that hangs
+    // handle.join() and, with the shared build lock, the whole suite). Poll
+    // non-blocking against a deadline instead, then return — the test's
+    // request-count assertions surface the mismatch loudly rather than hanging.
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let log: Arc<Mutex<Vec<MockReq>>> = Arc::new(Mutex::new(Vec::new()));
+    let (log2, base2) = (log.clone(), base.clone());
+    let handle = std::thread::spawn(move || {
+        for (status, body) in responses {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            return; // no connection arrived — give up, don't hang
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    Err(_) => return,
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            let Some(req) = read_mock_request(&mut stream) else {
+                continue;
+            };
+            log2.lock().unwrap().push(req);
+            // status 0 = a transport failure: log the request, then drop the
+            // connection without answering (the client sees a reset).
+            if status == 0 {
+                continue;
+            }
+            respond_json(&mut stream, status, &body.replace("{BASE}", &base2));
+        }
+    });
+    (base, log, handle)
+}
+
+fn sevra_at_home(home: &std::path::Path) -> Command {
+    let mut c = Command::cargo_bin("sevra").unwrap();
+    c.env("HOME", home);
+    c.env("USERPROFILE", home);
+    c.env_remove("SEVRA_API_KEY");
+    c.env_remove("SEVRA_HUB_URL");
+    c.env("SEVRA_NO_AUTO_UPDATE", "1");
+    c
+}
+
+const MOCK_KEY: &str =
+    "sevra_account_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+fn device_start_body() -> String {
+    concat!(
+        r#"{"deviceCode":"dev-code-abcdefghijklmnopqrstuv","userCode":"BCDF-GHJK","#,
+        r#""verificationUri":"{BASE}/device","#,
+        r#""verificationUriComplete":"{BASE}/device?code=BCDF-GHJK","#,
+        r#""expiresIn":60,"interval":0}"#
+    )
+    .to_string()
+}
+
+#[test]
+fn device_flow_signs_in_end_to_end() {
+    let home = tempfile::tempdir().unwrap();
+    let approved = format!(
+        r#"{{"status":"approved","key":"{MOCK_KEY}","keyId":"01x","hint":"cdef","email":"t@example.com"}}"#
+    );
+    // No /me probe on the device path: redemption already proves the binding
+    // and returns the email, so start + two polls is the whole conversation.
+    let (base, log, handle) = mock_hub(vec![
+        (201, device_start_body()),
+        (200, r#"{"status":"pending"}"#.to_string()),
+        (200, approved),
+    ]);
+
+    let out = sevra_at_home(home.path())
+        .args(["login", "--hub", &base])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "login failed: {}", all_output(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("BCDF-GHJK"), "code shown: {stdout}");
+    assert!(
+        stdout.contains("/device?code=BCDF-GHJK"),
+        "complete URL shown: {stdout}"
+    );
+    assert!(
+        stdout.contains("logged in to") && stdout.contains("t@example.com"),
+        "final line names the account without a probe: {stdout}"
+    );
+
+    handle.join().unwrap();
+    let reqs = log.lock().unwrap();
+    assert_eq!(reqs.len(), 3, "start + two polls, no /me probe: {reqs:?}");
+    assert_eq!(reqs[0].method, "POST");
+    assert_eq!(reqs[0].path, "/api/hub/auth/device");
+    assert!(reqs[1].path.ends_with("/device/token"));
+    assert!(
+        reqs[1].body.contains("dev-code-abcdefghijklmnopqrstuv"),
+        "poll carries the device code: {:?}",
+        reqs[1]
+    );
+    assert!(
+        reqs.iter().all(|r| r.path != "/api/hub/me"),
+        "device path must not probe /me: {reqs:?}"
+    );
+
+    let config = std::fs::read_to_string(home.path().join(".sevra/config.json")).unwrap();
+    assert!(config.contains(MOCK_KEY), "key persisted");
+    assert!(config.contains(&base), "hub persisted");
+    assert!(
+        config.contains("01x"),
+        "device key_id persisted for logout revoke"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(home.path().join(".sevra/config.json"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "credential file must be 0600");
+    }
+}
+
+#[test]
+fn device_flow_recovers_from_a_transport_blip_mid_poll() {
+    // The bug this guards: a poll that hit a transport error used to abort the
+    // whole login. Now a dropped connection (status 0) is retried, and the
+    // still-valid approval is collected on the next poll.
+    let home = tempfile::tempdir().unwrap();
+    let approved = format!(
+        r#"{{"status":"approved","key":"{MOCK_KEY}","keyId":"01x","hint":"cdef","email":"t@example.com"}}"#
+    );
+    let (base, log, handle) = mock_hub(vec![
+        (201, device_start_body()),
+        (0, String::new()), // wifi blip: connection dropped mid-poll
+        (200, approved),
+    ]);
+    let out = sevra_at_home(home.path())
+        .args(["login", "--hub", &base])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "a transport blip must not kill the login: {}",
+        all_output(&out)
+    );
+    handle.join().unwrap();
+    assert_eq!(
+        log.lock().unwrap().len(),
+        3,
+        "start, dropped poll, retry poll"
+    );
+    let config = std::fs::read_to_string(home.path().join(".sevra/config.json")).unwrap();
+    assert!(config.contains(MOCK_KEY), "key persisted after recovery");
+}
+
+#[test]
+fn logout_revokes_a_device_minted_key_server_side() {
+    // A device login mints a fresh key; logout must revoke it server-side (via
+    // the bearer) so keys don't pile up against the cap — while still removing
+    // the local config.
+    let home = tempfile::tempdir().unwrap();
+    let approved = format!(
+        r#"{{"status":"approved","key":"{MOCK_KEY}","keyId":"01x","hint":"cdef","email":"t@example.com"}}"#
+    );
+    let (base, log, handle) = mock_hub(vec![
+        (201, device_start_body()),
+        (200, approved),
+        (200, r#"{"revoked":true}"#.to_string()), // the logout revoke
+    ]);
+
+    let login = sevra_at_home(home.path())
+        .args(["login", "--hub", &base])
+        .output()
+        .unwrap();
+    assert!(login.status.success(), "login: {}", all_output(&login));
+
+    let logout = sevra_at_home(home.path()).arg("logout").output().unwrap();
+    assert!(logout.status.success(), "logout: {}", all_output(&logout));
+
+    handle.join().unwrap();
+    let reqs = log.lock().unwrap();
+    let revoke = reqs.last().expect("a revoke request");
+    assert_eq!(revoke.path, "/api/hub/keys/revoke-self");
+    assert_eq!(
+        revoke.authorization.as_deref(),
+        Some(format!("Bearer {MOCK_KEY}").as_str()),
+        "revoke presents the very key being revoked"
+    );
+    assert!(
+        !home.path().join(".sevra/config.json").exists(),
+        "local config removed on logout"
+    );
+}
+
+#[test]
+fn device_flow_denied_is_a_clean_failure() {
+    let home = tempfile::tempdir().unwrap();
+    let (base, _log, handle) = mock_hub(vec![
+        (201, device_start_body()),
+        (200, r#"{"status":"denied"}"#.to_string()),
+    ]);
+    let out = sevra_at_home(home.path())
+        .args(["login", "--hub", &base])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("denied"), "names the denial: {stderr}");
+    assert!(
+        !home.path().join(".sevra/config.json").exists(),
+        "no credential written on denial"
+    );
+    handle.join().unwrap();
+}
+
+#[test]
+fn device_flow_expired_code_says_run_again() {
+    let home = tempfile::tempdir().unwrap();
+    let (base, _log, handle) = mock_hub(vec![
+        (201, device_start_body()),
+        (
+            400,
+            r#"{"error":"The code expired. Run `sevra login` again.","code":"expired"}"#
+                .to_string(),
+        ),
+    ]);
+    let out = sevra_at_home(home.path())
+        .args(["login", "--hub", &base])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("expired"), "names the expiry: {stderr}");
+    handle.join().unwrap();
+}
+
+#[test]
+fn device_flow_json_emits_awaiting_line_then_result() {
+    let home = tempfile::tempdir().unwrap();
+    let approved = format!(
+        r#"{{"status":"approved","key":"{MOCK_KEY}","keyId":"01x","hint":"cdef","email":"t@example.com"}}"#
+    );
+    // No /me response: the device path does not probe. start + one poll only.
+    let (base, _log, handle) = mock_hub(vec![(201, device_start_body()), (200, approved)]);
+    let out = sevra_at_home(home.path())
+        .args(["login", "--hub", &base, "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", all_output(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let first_line = stdout.lines().next().unwrap_or("");
+    assert!(
+        first_line.contains("\"awaiting_approval\"")
+            && first_line.contains("/device?code=BCDF-GHJK"),
+        "first stdout line is the compact awaiting event: {first_line}"
+    );
+    assert!(
+        stdout.contains("\"email\": \"t@example.com\""),
+        "final object carries the account: {stdout}"
+    );
+    handle.join().unwrap();
+}
+
+#[test]
+fn device_flow_unreachable_hub_fails_fast() {
+    let home = tempfile::tempdir().unwrap();
+    sevra_at_home(home.path())
+        .args(["login", "--hub", "http://127.0.0.1:9"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("hub unreachable"));
