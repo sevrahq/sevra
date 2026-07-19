@@ -48,6 +48,31 @@ fn str_field<'a>(v: &'a Value, key: &str) -> &'a str {
 
 // --- login / logout / whoami -------------------------------------------------
 
+/// Revoke the session this machine is replacing, best-effort. Overwriting the
+/// config drops its key_id, and without this the displaced session stays live
+/// on the account forever — unrevokable, since nothing on disk points to it
+/// any more — quietly eating one of the ten credential slots on every repeat
+/// login. Only OUR sessions carry a key_id, so a user-supplied --key is never
+/// touched.
+fn revoke_displaced_session(hub: &str) {
+    let file = config::load_file();
+    let (Some(old_key), Some(_)) = (file.key.as_deref(), file.key_id.as_deref()) else {
+        return;
+    };
+    let old_hub = file.hub.clone().unwrap_or_else(|| hub.to_string());
+    let safe = (old_hub.starts_with("https://") || old_hub.starts_with("http://127.0.0.1"))
+        && !old_key.is_empty()
+        && old_key.bytes().all(|b| (0x21..=0x7e).contains(&b));
+    if !safe {
+        return;
+    }
+    let cfg = Config {
+        hub: old_hub,
+        key: Some(old_key.to_string()),
+    };
+    let _ = crate::hub::try_request(&cfg, "POST", "/api/hub/keys/revoke-self", None, true);
+}
+
 pub fn login(flag_hub: Option<String>, key: Option<String>, no_browser: bool) {
     // Env-blind: login PERSISTS a hub, so a one-off SEVRA_HUB_URL must not
     // silently become the stored default. --hub is the explicit path.
@@ -103,6 +128,7 @@ pub fn login(flag_hub: Option<String>, key: Option<String>, no_browser: bool) {
                 None,
             );
         }
+        revoke_displaced_session(&hub);
         if let Err(e) = config::save(&hub, &key, None) {
             fail(&format!("could not write config: {e}"), None);
         }
@@ -141,6 +167,7 @@ pub fn login(flag_hub: Option<String>, key: Option<String>, no_browser: bool) {
             }
         }
     };
+    revoke_displaced_session(&hub);
     if let Err(e) = config::save(&hub, &signed_in.key, Some(&signed_in.key_id)) {
         fail(&format!("could not write config: {e}"), None);
     }

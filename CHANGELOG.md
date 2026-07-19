@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## 0.2.2 — 2026-07-18
+
+- **Self-update now checks the origin's digest as well as the signature.** The
+  publisher key was the only root of trust on a path that runs unattended; the
+  hub serves the expected digest from a separately deployed manifest, so a
+  key compromise alone is no longer enough. A missing or unreachable digest
+  does not block the update (the signature still gates it); a digest that
+  disagrees stops it.
+- Fixed: signing in again left the previous session live on your account
+  forever. Overwriting the stored credential dropped its id, so nothing could
+  revoke it and it quietly consumed one of the ten credential slots on every
+  repeat login. The displaced session is now revoked first.
+- Hardened: the config temp file is created exclusively (`create_new`) so a
+  pre-planted symlink at the predictable temp path cannot capture a session
+  key, and `~/.sevra` is tightened to 0700.
+
 ## 0.2.1 — 2026-07-18
 
 Security and robustness fixes from a full review of the 0.2.0 sign-in work.

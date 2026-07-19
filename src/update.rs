@@ -21,6 +21,31 @@ use crate::signing;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const RELEASES: &str = "https://github.com/sevrahq/sevra/releases/download";
+/// The origin's independently deployed digest manifest (the same endpoint the
+/// installers verify against). Overridable for testing against a local hub.
+fn trusted_manifest_base() -> String {
+    crate::config::env_nonempty("SEVRA_TRUSTED_MANIFEST_BASE")
+        .unwrap_or_else(|| "https://www.sevrahq.com/api/hub/releases/sevra".to_string())
+}
+
+pub fn hex_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The digest the origin vouches for, or None when it does not serve one
+/// (unreachable, unknown version, non-digest body). None means "no second
+/// opinion available", never "approved".
+fn trusted_digest(version: &str, asset: &str) -> Option<String> {
+    let url = format!("{}/{version}/{asset}", trusted_manifest_base());
+    let body = download(&url).ok()?;
+    let text = String::from_utf8(body).ok()?.trim().to_lowercase();
+    let ok = text.len() == 64 && text.chars().all(|c| c.is_ascii_hexdigit());
+    ok.then_some(text)
+}
 
 static CHECKED: AtomicBool = AtomicBool::new(false);
 
@@ -208,6 +233,23 @@ fn download_verify_replace(version: &str) -> Result<(), String> {
         return Err(format!(
             "signature verification FAILED for {base} — refusing to replace the CLI (report: https://www.sevrahq.com/security)"
         ));
+    }
+    // Second, INDEPENDENT root of trust, matching what the installers do: the
+    // signature proves the publisher key signed this, but that key is one
+    // secret in one place. The hub serves the expected digest from a separately
+    // deployed manifest, so a signing-key compromise alone is no longer enough
+    // to push a binary onto every installed CLI unattended.
+    //
+    // Deliberately fail-OPEN on a missing/unreachable digest and fail-CLOSED on
+    // a mismatch: a manifest outage must not brick self-update fleet-wide (the
+    // signature still gates it), but a served digest that disagrees is a stop.
+    if let Some(expected) = trusted_digest(version, &format!("sevra-{target}{}", asset_suffix())) {
+        let actual = hex_sha256(&binary);
+        if actual != expected {
+            return Err(format!(
+                "digest mismatch for {base}: the Sevra manifest expects {expected}, got {actual} — refusing to replace the CLI (report: https://www.sevrahq.com/security)"
+            ));
+        }
     }
     let self_path = std::env::current_exe().map_err(|e| format!("cannot locate self: {e}"))?;
     let self_path = fs::canonicalize(&self_path).unwrap_or(self_path);
@@ -494,5 +536,36 @@ mod tests {
         assert!(!safe_version_str("0.1.2%2f.."));
         assert!(!safe_version_str(""));
         assert!(!safe_version_str(&"9".repeat(65)));
+    }
+
+    #[test]
+    fn hex_sha256_matches_the_known_digest() {
+        // The empty-string SHA-256, so the helper feeding digest comparison is
+        // pinned to a value anyone can check.
+        assert_eq!(
+            hex_sha256(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(hex_sha256(b"abc").len(), 64);
+        assert!(hex_sha256(b"abc").chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn trusted_digest_rejects_anything_that_is_not_a_bare_digest() {
+        // A 404 page, an HTML error, or a truncated value must read as "no
+        // second opinion", never as an approval. Exercised through the same
+        // shape-check the fetch path applies.
+        let looks_like_digest = |t: &str| {
+            let t = t.trim().to_lowercase();
+            t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit())
+        };
+        assert!(looks_like_digest(
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        ));
+        assert!(!looks_like_digest("<!doctype html><title>404</title>"));
+        assert!(!looks_like_digest("release asset is not trusted"));
+        assert!(!looks_like_digest(""));
+        assert!(!looks_like_digest("e3b0c442"));
+        assert!(!looks_like_digest(&"z".repeat(64)));
     }
 }

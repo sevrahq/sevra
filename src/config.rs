@@ -77,6 +77,14 @@ pub fn load() -> Config {
 pub fn save(hub: &str, key: &str, key_id: Option<&str>) -> std::io::Result<()> {
     let dir = config_dir();
     fs::create_dir_all(&dir)?;
+    // The directory holds a credential; the umask default (often 0755) lets
+    // anyone list it. Tighten it best-effort — a pre-existing dir owned by the
+    // user is the normal case, and failing here must not block a login.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+    }
     let path = config_path();
     let body = serde_json::to_string_pretty(&FileConfig {
         hub: Some(strip_trailing_slash(hub)),
@@ -89,10 +97,15 @@ pub fn save(hub: &str, key: &str, key_id: Option<&str>) -> std::io::Result<()> {
     {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
+        // create_new, not create: the temp name is predictable (pid), and with
+        // `create` an existing path is FOLLOWED — including a symlink someone
+        // pre-planted — and `.mode()` is ignored because it only applies on
+        // creation. That would write the session key through the link, at the
+        // target's permissions. create_new refuses to follow anything.
+        let _ = fs::remove_file(&tmp);
         let mut f = fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .open(&tmp)?;
         f.write_all(format!("{body}\n").as_bytes())?;
