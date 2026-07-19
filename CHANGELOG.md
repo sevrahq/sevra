@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.3 — 2026-07-18
 
 - New: **`sevra mcp` — a stdio MCP server over the hub's read surface.** Point
   any MCP client (Claude Code, Claude Desktop) at

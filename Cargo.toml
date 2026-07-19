@@ -1,6 +1,6 @@
 [package]
 name = "sevra"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 # MSRV: enforced by the ci `msrv` job against the LOCKED tree. 1.88 is the
 # tree's true floor (home 0.5.12 requires it; base64ct needs edition2024/1.85).
