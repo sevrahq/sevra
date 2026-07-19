@@ -2,13 +2,47 @@
 
 ## Unreleased
 
+## 0.2.1 — 2026-07-18
+
+Security and robustness fixes from a full review of the 0.2.0 sign-in work.
+**0.2.1 is required to sign in through the browser**: the hub now demands the
+one-time authorization code described below, which 0.2.0 does not send.
+
+- **Security: browser sign-in now requires an authorization code delivered
+  through the loopback redirect**, alongside the PKCE verifier. 0.2.0 relied on
+  the verifier alone, which proves only that you STARTED a sign-in — so someone
+  could start one, get a signed-in person to approve the link, and redeem it
+  themselves. Approving a link you did not start now hands the other party
+  nothing.
+- **Security: the browser URL is built locally** from the configured hub rather
+  than taken from the hub's response, so hub-supplied text can never reach the
+  platform opener (on Windows, `cmd`'s parser).
+- Fixed: a hub-supplied poll interval above 30 seconds panicked the process.
+- Fixed: a connection that opened but sent nothing (browsers preconnect to
+  loopback) could hang sign-in forever; connections now time out, and only a
+  callback carrying the code completes the flow.
+- Fixed: a split TCP read could drop the callback and silently strand sign-in.
+- Fixed: `logout` could exit before removing the local credential when the
+  stored hub or key was malformed, and it now says so when it cannot confirm
+  the server-side revoke instead of always reporting success.
+- Fixed: throttling and transient hub errors during the browser exchange are
+  retried with backoff instead of ending the sign-in.
+- Fixed: the installers treated any `openssl` as an Ed25519 verifier. Stock
+  macOS ships LibreSSL, which cannot verify it, so a good download was reported
+  as a failed publisher signature and the install aborted. They now probe for
+  capability and fall back to the manifest digest when the tool cannot verify.
+
 ## 0.2.0 — 2026-07-18
 
 - New: **`sevra login` signs in through your browser** — no key to paste. It
   binds a loopback port, opens the browser, and collects a session when the
-  approved sign-in is handed back to that port. The credential never travels
-  in the URL (a PKCE verifier held only by the CLI is exchanged for the
-  session), so the flow is phishing-resistant by construction.
+  approved sign-in is handed back to that port. The session is never delivered
+  through the browser URL: completing a sign-in requires both the PKCE
+  verifier (held only by the process that started it) and a one-time
+  authorization code that reaches that process solely through the loopback
+  redirect. Approving a link you did not start therefore hands nothing to
+  whoever sent it. As with any consent screen, only approve a sign-in you just
+  initiated yourself.
 - New: **sign-in code fallback** for headless/SSH or approving from another
   computer — `sevra login` prints a short code and a URL, chosen automatically
   when no browser can open, or forced with `--no-browser`.

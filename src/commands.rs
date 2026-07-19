@@ -184,12 +184,24 @@ fn challenge_of(verifier: &str) -> String {
 /// Hand a URL to the platform's browser. Err means we could not even spawn an
 /// opener (headless box, no DE, locked-down Windows) — the caller then falls
 /// back to the code flow rather than leaving the human staring at nothing.
+///
+/// SAFETY: callers must pass a URL this process BUILT from the validated hub,
+/// never one echoed back by the hub. On Windows the opener is `cmd /C start`,
+/// and Rust's argument quoting is MSVCRT-style — it does not escape for cmd's
+/// own parser when the program IS cmd, so a `&` in an attacker-shaped URL
+/// would separate commands. `open`/`xdg-open` are equally happy to act on
+/// file://, smb://, or a leading `-` parsed as a flag. Constructing the URL
+/// ourselves removes that entire surface rather than trying to sanitize it.
 fn open_browser(url: &str) -> Result<(), String> {
+    // Defense in depth: refuse anything that is not a plain https URL, even
+    // though the only caller builds it.
+    if !url.starts_with("https://") || url.contains(|c: char| c.is_whitespace() || c == '&') {
+        return Err("refusing to open a non-https or unsafe URL".into());
+    }
     let (program, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
         ("open", vec![url])
     } else if cfg!(target_os = "windows") {
-        // `start` is a cmd builtin; the empty "" is the window-title slot, and
-        // without it a URL containing & is mis-parsed.
+        // `start` is a cmd builtin; the empty "" is the window-title slot.
         ("cmd", vec!["/C", "start", "", url])
     } else {
         ("xdg-open", vec![url])
@@ -236,16 +248,25 @@ fn browser_flow(hub: &str) -> Option<DeviceLogin> {
         "starting sign-in",
     );
     let request_id = str_field(&started, "requestId").to_string();
-    let approve_url = str_field(&started, "approveUrl").to_string();
-    if request_id.is_empty() || approve_url.is_empty() {
+    // Build the URL OURSELVES from the already-validated hub plus a strictly
+    // checked id. The hub's own `approveUrl` is never opened: it would be
+    // remote text reaching a process spawner (on Windows, cmd's parser), which
+    // is a command-injection surface no amount of escaping makes comfortable.
+    if request_id.is_empty() || !request_id.chars().all(|c| c.is_ascii_alphanumeric()) {
         return None;
     }
+    let approve_url = format!("{hub}/device?request={request_id}");
     let expires_in = started
         .get("expiresIn")
         .and_then(|v| v.as_u64())
         .unwrap_or(600)
         .clamp(60, 1800);
 
+    // Arm the listener BEFORE opening the browser: if we cannot, we must fall
+    // back without having already sent the human to an approval page.
+    if listener.set_nonblocking(true).is_err() {
+        return None;
+    }
     if open_browser(&approve_url).is_err() {
         return None; // headless: the caller falls back to the code flow
     }
@@ -265,20 +286,46 @@ fn browser_flow(hub: &str) -> Option<DeviceLogin> {
         println!("Waiting…");
     }
 
-    // Wait for the browser to be handed back to us. Non-blocking accept so the
-    // wait is bounded by the approval window rather than hanging forever.
-    listener.set_nonblocking(true).ok()?;
+    // Wait for the browser to hand us the authorization code. Non-blocking
+    // accept so the wait is bounded by the approval window, and a read timeout
+    // on each connection so a socket that never speaks cannot park us forever
+    // (browsers speculatively preconnect to loopback and send nothing).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(expires_in);
-    let mut landed = false;
-    while std::time::Instant::now() < deadline {
+    let mut auth_code: Option<String> = None;
+    while std::time::Instant::now() < deadline && auth_code.is_none() {
         match listener.accept() {
             Ok((mut stream, _)) => {
                 stream.set_nonblocking(false).ok();
-                let mut buf = [0u8; 2048];
-                let n = stream.read(&mut buf).unwrap_or(0);
-                let head = String::from_utf8_lossy(&buf[..n]);
-                // Only the callback counts; browsers also probe /favicon.ico.
-                if head.starts_with("GET /cb") {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                // Read until we have the whole request line; a single read can
+                // split it ("GET /c") and drop the callback on the floor.
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !buf.windows(2).any(|w| w == b"\r\n") && buf.len() < 8192 {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf);
+                let line = head.lines().next().unwrap_or("");
+                // Only a callback CARRYING THE CODE counts. A bare probe (or a
+                // local process poking the port) gets a 404 and we keep
+                // waiting for the real redirect.
+                let code = line
+                    .strip_prefix("GET /cb?")
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .and_then(|q| {
+                        q.split('&')
+                            .find_map(|p| p.strip_prefix("code="))
+                            .map(str::to_string)
+                    })
+                    .filter(|c| {
+                        !c.is_empty()
+                            && c.chars()
+                                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+                    });
+                if let Some(code) = code {
                     let _ = stream.write_all(
                         format!(
                             "HTTP/1.1 200 OK\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
@@ -287,12 +334,12 @@ fn browser_flow(hub: &str) -> Option<DeviceLogin> {
                         )
                         .as_bytes(),
                     );
-                    landed = true;
-                    break;
+                    auth_code = Some(code);
+                } else {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    );
                 }
-                let _ = stream.write_all(
-                    b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
-                );
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(std::time::Duration::from_millis(200));
@@ -300,32 +347,38 @@ fn browser_flow(hub: &str) -> Option<DeviceLogin> {
             Err(_) => break,
         }
     }
-    if !landed {
+    let Some(auth_code) = auth_code else {
         fail(
             "the browser never came back — approve in the browser, or run `sevra login --no-browser` to use a code instead",
             None,
-        );
-    }
+        )
+    };
 
-    // The redirect proves approval, but the SESSION comes from the verifier we
-    // never let out of this process.
-    for attempt in 0..5 {
+    // Two proofs, both required: the verifier (we started this) and the code
+    // (the browser handed it to US, on this machine).
+    let mut wait_secs = 1;
+    for attempt in 0..8 {
         let resp = match crate::hub::try_request(
             &cfg,
             "POST",
             "/api/hub/auth/cli/exchange",
-            Some(&json!({ "requestId": request_id, "verifier": verifier })),
+            Some(&json!({
+                "requestId": request_id,
+                "verifier": verifier,
+                "code": auth_code,
+            })),
             false,
         ) {
             Ok(resp) => resp,
-            Err(_) if attempt < 4 => {
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                continue;
-            }
-            Err(t) => fail(
+            Err(t) if attempt == 7 => fail(
                 &format!("could not reach the hub to finish sign-in: {t}"),
                 None,
             ),
+            Err(_) => {
+                std::thread::sleep(std::time::Duration::from_secs(wait_secs));
+                wait_secs = (wait_secs * 2).min(8);
+                continue;
+            }
         };
         let body = resp.body.clone().unwrap_or(Value::Null);
         match (resp.status, str_field(&body, "status")) {
@@ -352,6 +405,12 @@ fn browser_flow(hub: &str) -> Option<DeviceLogin> {
                 ),
                 None,
             ),
+            // Throttling and hub trouble are transient, not "unrecognized" —
+            // back off and keep trying rather than killing a live sign-in.
+            (429, _) | (500..=599, _) => {
+                std::thread::sleep(std::time::Duration::from_secs(wait_secs));
+                wait_secs = (wait_secs * 2).min(8);
+            }
             _ => fail(
                 "the hub no longer recognizes this sign-in — run `sevra login` again",
                 None,
@@ -434,7 +493,12 @@ fn device_flow_key(hub: &str) -> DeviceLogin {
 
     // Backoff grows the gap on throttle or trouble, capped, and never below the
     // hub's interval; the whole loop is bounded by the deadline.
-    let backoff = |w: u64| w.saturating_mul(2).clamp(interval, 30);
+    // clamp() ASSERTS min <= max, so the floor must never exceed the ceiling:
+    // interval is allowed up to 60, and a hub sending 45 would otherwise panic
+    // the process on the first 429 or 5xx — the clamp block exists precisely
+    // to survive hostile timings, so it must not be the thing that crashes.
+    let ceiling = interval.max(30);
+    let backoff = move |w: u64| w.saturating_mul(2).clamp(interval, ceiling);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(expires_in);
     let mut wait = interval;
     let mut last_trouble: Option<String> = None;
@@ -489,11 +553,10 @@ fn device_flow_key(hub: &str) -> DeviceLogin {
                     }
                     "denied" => fail("the sign-in was denied in the dashboard", None),
                     "failed" => {
+                        // The hub's own message only — never echo its whole
+                        // body to stdout on a credential path.
                         let msg = str_field(&body, "error");
-                        fail(
-                            &format!("the hub could not finish sign-in: {msg}"),
-                            Some(body.clone()),
-                        )
+                        fail(&format!("the hub could not finish sign-in: {msg}"), None)
                     }
                     other => fail(
                         &format!("unexpected sign-in state from the hub: {other:?}"),
@@ -560,13 +623,32 @@ pub fn logout() {
             .hub
             .clone()
             .unwrap_or_else(|| config::DEFAULT_HUB.to_string());
-        let cfg = Config {
-            hub,
-            key: Some(key.to_string()),
-        };
-        // auth:true sends the very key we are revoking as the bearer — the hub
-        // revokes exactly the presented credential.
-        let _ = crate::hub::try_request(&cfg, "POST", "/api/hub/keys/revoke-self", None, true);
+        // Pre-check what the hub client would otherwise ABORT the process over
+        // (a non-HTTPS stored hub, a key with stray bytes). try_request routes
+        // those through fail(), which would exit before we ever remove the
+        // credential file — the exact situation where removing it matters most.
+        let safe_hub = hub.starts_with("https://") || hub.starts_with("http://127.0.0.1");
+        let safe_key = !key.is_empty() && key.bytes().all(|b| (0x21..=0x7e).contains(&b));
+        if safe_hub && safe_key {
+            let cfg = Config {
+                hub,
+                key: Some(key.to_string()),
+            };
+            // auth:true sends the very key we are revoking as the bearer — the
+            // hub revokes exactly the presented credential.
+            let confirmed = matches!(
+                crate::hub::try_request(&cfg, "POST", "/api/hub/keys/revoke-self", None, true),
+                Ok(r) if r.status == 200
+                    && r.body.as_ref().and_then(|b| b.get("revoked")).and_then(|v| v.as_bool()) == Some(true)
+            );
+            // Never silently claim a clean logout: the key is about to leave
+            // this machine, so the human needs to know if it is still live.
+            if !confirmed {
+                note("could not confirm the sign-in was revoked on the hub — revoke it under Account → Sign-ins");
+            }
+        } else {
+            note("skipped the server-side revoke (stored hub or key looks malformed) — revoke under Account → Sign-ins");
+        }
     }
 
     // Honest about what happened: a credential file that EXISTS but cannot be

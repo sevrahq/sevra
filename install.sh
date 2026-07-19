@@ -113,12 +113,21 @@ if have node; then
   ' "$tmp/sevra" "$tmp/sevra.sig" >/dev/null 2>&1; then verified_sig=1; fi
 fi
 if [ "$verified_sig" -eq 0 ] && have openssl; then
-  verifier_available=1
   printf '%s' "$PUBKEY_PEM" > "$tmp/pub.pem"
-  if base64 -d < "$tmp/sevra.sig" > "$tmp/sig.bin" 2>/dev/null \
-     || base64 -D < "$tmp/sevra.sig" > "$tmp/sig.bin" 2>/dev/null; then
-    if openssl pkeyutl -verify -pubin -inkey "$tmp/pub.pem" -rawin -in "$tmp/sevra" -sigfile "$tmp/sig.bin" >/dev/null 2>&1; then
-      verified_sig=1
+  # Capability probe, NOT mere presence: only OpenSSL 3+ can do Ed25519, and
+  # stock macOS ships LibreSSL (which cannot even load this key). Gating on
+  # `have openssl` alone marked those machines as "verifier available", so a
+  # perfectly good download was reported as a failed publisher signature and
+  # the install aborted — on exactly the no-Node machines this path exists to
+  # serve. If the tool cannot load the key, treat it as no verifier and fall
+  # back to the manifest digest; only a CAPABLE verifier's failure is fatal.
+  if openssl pkey -pubin -in "$tmp/pub.pem" -noout >/dev/null 2>&1; then
+    verifier_available=1
+    if base64 -d < "$tmp/sevra.sig" > "$tmp/sig.bin" 2>/dev/null \
+       || base64 -D < "$tmp/sevra.sig" > "$tmp/sig.bin" 2>/dev/null; then
+      if openssl pkeyutl -verify -pubin -inkey "$tmp/pub.pem" -rawin -in "$tmp/sevra" -sigfile "$tmp/sig.bin" >/dev/null 2>&1; then
+        verified_sig=1
+      fi
     fi
   fi
 fi

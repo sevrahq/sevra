@@ -117,14 +117,21 @@ process.exit(ok ? 0 : 1);
       Remove-Item Env:SEVRA_PUBKEY -ErrorAction SilentlyContinue
     }
     if (-not $verifiedSig -and (Have 'openssl')) {
-      $verifierAvailable = $true
       $pubPem = Join-Path $tmp 'pub.pem'
       Set-Content -Path $pubPem -Value $PubkeyPem -NoNewline
-      $sigB64 = (Get-Content (Join-Path $tmp 'sevra.exe.sig') -Raw).Trim()
-      $sigBin = Join-Path $tmp 'sig.bin'
-      [IO.File]::WriteAllBytes($sigBin, [Convert]::FromBase64String($sigB64))
-      & openssl pkeyutl -verify -pubin -inkey $pubPem -rawin -in $bin -sigfile $sigBin 2>$null | Out-Null
-      if ($LASTEXITCODE -eq 0) { $verifiedSig = $true }
+      # Capability probe, not mere presence: only OpenSSL 3+ can do Ed25519.
+      # An older build cannot even load this key, and treating that as an
+      # available verifier turns a good download into "signature failed" and
+      # aborts the install. Only a CAPABLE verifier's failure is fatal.
+      & openssl pkey -pubin -in $pubPem -noout 2>$null | Out-Null
+      if ($LASTEXITCODE -eq 0) {
+        $verifierAvailable = $true
+        $sigB64 = (Get-Content (Join-Path $tmp 'sevra.exe.sig') -Raw).Trim()
+        $sigBin = Join-Path $tmp 'sig.bin'
+        [IO.File]::WriteAllBytes($sigBin, [Convert]::FromBase64String($sigB64))
+        & openssl pkeyutl -verify -pubin -inkey $pubPem -rawin -in $bin -sigfile $sigBin 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) { $verifiedSig = $true }
+      }
     }
     if ($verifiedSig) {
       Info 'signature: verified (ed25519)'
