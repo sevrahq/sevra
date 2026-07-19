@@ -826,3 +826,113 @@ fn device_flow_unreachable_hub_fails_fast() {
         .failure()
         .stderr(predicate::str::contains("hub unreachable"));
 }
+
+// --- mcp: the stdio MCP server over the read surface ---------------------------
+// The protocol core's battery lives in src/mcp.rs; these prove the stdio shell
+// end to end — stdout carries ONLY JSON-RPC frames, and the hub client sends
+// (or omits) the bearer exactly as the resolved credential dictates.
+
+#[test]
+fn mcp_speaks_json_rpc_on_stdout_only() {
+    // initialize + notification + tools/list + garbage: exactly three response
+    // lines (the notification is silent), no network touched. A stray --json
+    // must not corrupt the protocol stream either.
+    let out = sevra()
+        .args(["mcp", "--json"])
+        .write_stdin(concat!(
+            r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            "\n",
+            "not json\n",
+        ))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", all_output(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "init + list + parse error; the notification stays silent: {stdout}"
+    );
+    assert!(
+        lines[0].contains(r#""protocolVersion":"2025-03-26""#) && lines[0].contains("sevra-brain"),
+        "initialize echoes the known protocol: {}",
+        lines[0]
+    );
+    assert!(
+        lines[1].contains(r#""name":"list_brains""#) && lines[1].contains(r#""name":"graph""#),
+        "tools/list names the surface: {}",
+        lines[1]
+    );
+    assert!(lines[2].contains("-32700"), "parse error: {}", lines[2]);
+    // Diagnostics live on stderr: the ready line, and the no-credential warning.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("ready"), "stderr: {stderr}");
+    assert!(stderr.contains("public brains"), "stderr: {stderr}");
+}
+
+#[test]
+fn mcp_tools_call_reaches_the_hub_with_the_stored_bearer() {
+    let (base, log, handle) = mock_hub(vec![(
+        200,
+        r#"{"brains":[{"id":"01brain","slug":"work","name":"Work","scope":"personal"}]}"#
+            .to_string(),
+    )]);
+    let out = sevra()
+        .arg("mcp")
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "sevra_account_mcp")
+        .write_stdin(concat!(
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"list_brains","arguments":{}}}"#,
+            "\n"
+        ))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", all_output(&out));
+    handle.join().unwrap();
+    let reqs = log.lock().unwrap();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].method, "GET");
+    assert_eq!(reqs[0].path, "/api/hub/brains");
+    assert_eq!(
+        reqs[0].authorization.as_deref(),
+        Some("Bearer sevra_account_mcp"),
+        "the resolved credential rides the read call"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(r#""isError":false"#), "{stdout}");
+    assert!(
+        stdout.contains("01brain"),
+        "the tool text carries the hub body: {stdout}"
+    );
+}
+
+#[test]
+fn mcp_without_a_credential_serves_public_reads_unauthenticated() {
+    let (base, log, handle) = mock_hub(vec![(200, r#"{"brains":[]}"#.to_string())]);
+    let out = sevra()
+        .arg("mcp")
+        .env("SEVRA_HUB_URL", &base)
+        .write_stdin(concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_brains","arguments":{}}}"#,
+            "\n"
+        ))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", all_output(&out));
+    handle.join().unwrap();
+    let reqs = log.lock().unwrap();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(
+        reqs[0].authorization, None,
+        "no credential → no bearer, not an empty one"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("public brains"),
+        "warns that only public brains are reachable"
+    );
+}

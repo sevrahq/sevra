@@ -28,7 +28,7 @@ const MAX_PACK_BYTES: u64 = 256 * 1024 * 1024;
 /// paste fails fast, before any request).
 const MAX_SECRET_VALUE_CHARS: usize = 4096;
 
-fn enc(s: &str) -> String {
+pub(crate) fn enc(s: &str) -> String {
     // Percent-encode a path segment for a URL (RFC 3986 unreserved kept).
     let mut o = String::new();
     for b in s.bytes() {

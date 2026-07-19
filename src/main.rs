@@ -10,6 +10,7 @@
 mod commands;
 mod config;
 mod hub;
+mod mcp;
 mod output;
 mod signing;
 mod store;
@@ -103,6 +104,8 @@ enum Commands {
         #[arg(long, value_parser = ["in", "out", "both"])]
         dir: Option<String>,
     },
+    /// Serve your brains to MCP clients over stdio (read-only)
+    Mcp,
     /// Grant a person read (or --write) access
     Grant {
         brain: String,
@@ -250,6 +253,7 @@ fn main() {
         ),
         Commands::Get { brain, reference } => commands::get(&cfg, &brain, &reference),
         Commands::Graph { brain, path, dir } => commands::graph(&cfg, &brain, &path, dir),
+        Commands::Mcp => mcp::serve(&cfg),
         Commands::Grant {
             brain,
             email,

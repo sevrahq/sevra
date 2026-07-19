@@ -34,6 +34,10 @@ Commands:
     push <dir> --brain <id|slug>          # index-on-push; 4 MB JSON cap
     query <brain> [text] [--type --layer --meta-type --tag --where k=v --limit N]
     get <brain> <id|path> | graph <brain> <path> [--dir in|out|both]
+    mcp                                   # stdio MCP server over the read surface
+                                          # (list_brains, search_brain, get_record,
+                                          # graph); client config
+                                          # {"command":"sevra","args":["mcp"]}
     grant <brain> <email> [--write] | grants <brain> | revoke <brain> <grantId>
     shared | publish <brain> | unpublish <brain>
     secrets list|set|delete <brain> [NAME]

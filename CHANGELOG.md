@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- New: **`sevra mcp` — a stdio MCP server over the hub's read surface.** Point
+  any MCP client (Claude Code, Claude Desktop) at
+  `{"command": "sevra", "args": ["mcp"]}`: four read-only tools (list_brains,
+  search_brain, get_record, graph) against your hosted brains, using the
+  stored sign-in (`SEVRA_API_KEY` / `SEVRA_HUB_URL` override it). stdout
+  carries only JSON-RPC frames; diagnostics go to stderr. Without a
+  credential it reaches public brains only. For agents that cannot run a CLI;
+  the CLI stays the primary, recommended surface.
+
 ## 0.2.2 — 2026-07-18
 
 - **Self-update now checks the origin's digest as well as the signature.** The
