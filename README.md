@@ -32,8 +32,10 @@ sevra whoami
 
 sevra brains                                     list your brains
 sevra create <slug> [--name] [--scope] [--public]
-sevra push <dir> --brain <id|slug>               index-on-push
+sevra delete <brain> [--confirm <slug>]          permanently delete a hosted brain (owner-only)
+sevra push <dir> --brain <id|slug> [--force]     replace the hosted store with <dir> (index-on-push)
 sevra query <brain> [text] [--type] [--layer] [--meta-type] [--tag] [--where k=v] [--limit N]
+sevra query --brain <ref> [text] …               the same query, brain as a flag
 sevra get <brain> <db.md-id|path>
 sevra graph <brain> <path> [--dir in|out|both]
 sevra mcp                                        serve your brains to MCP clients (stdio, read-only)
@@ -56,6 +58,8 @@ sevra update                                     signed self-update; checks dbmd
 ```
 
 Config lives at `~/.sevra/config.json` (written 0600). Env `SEVRA_HUB_URL` / `SEVRA_API_KEY` override it.
+
+`push` replaces the brain's whole hosted store with the pushed directory: files absent locally are removed, and a push that would shrink the brain's document count is refused unless `--force` is given. Before anything uploads, the store is checked locally against the hub's snapshot limits (256 MiB compressed, 512 MiB uncompressed, 100,000 files — refusals list the largest files) and scanned for secret-shaped file contents and names (AWS, GitHub, Anthropic, OpenAI, Slack, Google, Stripe key formats, PEM private-key blocks, 1Password share links); `--allow-secrets` overrides the scan. `delete` is permanent: interactive runs ask for the brain's slug, scripts pass `--confirm <slug>`.
 
 `secrets set` binds a write-only value to the brain's published functions ([the vault](https://www.sevrahq.com/docs/publishing.md)). The value is read from stdin only — a hidden prompt on a terminal, or piped (`printf %s "$VALUE" | sevra secrets set <brain> NAME`, exactly one trailing newline trimmed). It is never accepted on the command line and never echoed back, on any path.
 

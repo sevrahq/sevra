@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.2.4 — 2026-07-28
+
+Fixes from the first dogfood onboarding (2026-07-28), against the hub's new
+push/delete contract.
+
+- New: **`push` scans for secrets before anything leaves the machine.**
+  Every file that would be pushed is checked — content AND path, since a
+  secret in a filename lands in the hub index and feed — against a
+  conservative set of vendor-prefixed formats (AWS access key ids, GitHub
+  tokens, Anthropic/OpenAI/Google/Stripe-live keys, Slack tokens, PEM
+  private-key blocks, 1Password share links). On hits the push is refused,
+  naming each hit as `path — kind` with a remediation line; the matched
+  value is never printed, and a path that itself matches is shown redacted.
+  `--allow-secrets` overrides. No binary handling was needed: push carries
+  only UTF-8 text (`.md` + the root `assets.jsonl`), so the content pass
+  covers every byte that would ship.
+- New: **`push` preflights the hub's snapshot limits locally** — 256 MiB
+  compressed pack, 512 MiB uncompressed, 100,000 files — and never starts an
+  upload the hub must reject. A refusal names the limit, the store's actual
+  numbers, and the 10 largest files with human sizes, and suggests trimming
+  sources/ or splitting a deliberately large store. The over-size walk keeps
+  counting (metadata-only) past the cap so the reported totals are real.
+- New: **`push --force` sends `allow_shrink`** on both the JSON push and the
+  pack commit. `push --help` now states plainly that push REPLACES the
+  brain's whole hosted store (files absent locally are removed). Without
+  --force, the hub's 409 `shrink_refused` answer is printed verbatim plus
+  one hint: retry with --force if the replacement is intended.
+- New: **`sevra delete <brain>`** — permanent, owner-only. Interactive runs
+  show what dies and require typing the brain's slug; non-TTY or `--json`
+  runs must pass `--confirm <slug>`. The hub's 400 `confirm_required` maps
+  to the exact rerun command.
+- Fixed: **`query` accepts `--brain <ref>`** as an alias of the positional
+  (push already spelled the brain that way; `sevra query --brain X "text"`
+  was an "unexpected argument" usage error). Both forms naming different
+  brains is a clear exit-2 refusal.
+- Fixed: pack-flow errors no longer collapse to `unknown error`. Wherever a
+  hub answer carries a JSON `error`, that message (plus its `code`) is
+  printed; a non-JSON body (proxy page, HTML) surfaces its first ~200 chars.
+  Presigned upload/download failures now include the storage service's
+  answer instead of a bare status code. A 507 `hub_scratch_exhausted` on the
+  pack commit retries the commit twice after a pause — the pack is already
+  uploaded and is never re-sent.
+- New dependency: regex (MIT/Apache-2.0, with aho-corasick +
+  regex-automata/-syntax) for the compiled secret-pattern set; recorded in
+  THIRD_PARTY_NOTICES.
+
 ## 0.2.3 — 2026-07-18
 
 - New: **`sevra mcp` — a stdio MCP server over the hub's read surface.** Point

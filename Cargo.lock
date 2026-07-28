@@ -884,7 +884,7 @@ dependencies = [
 
 [[package]]
 name = "sevra"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "assert_cmd",
  "base64",
@@ -893,6 +893,7 @@ dependencies = [
  "getrandom 0.2.17",
  "home",
  "predicates",
+ "regex",
  "rpassword",
  "serde",
  "serde_json",

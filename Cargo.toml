@@ -1,6 +1,6 @@
 [package]
 name = "sevra"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 # MSRV: enforced by the ci `msrv` job against the LOCKED tree. 1.88 is the
 # tree's true floor (home 0.5.12 requires it; base64ct needs edition2024/1.85).
@@ -44,6 +44,10 @@ home = "0.5"
 # Prompts + reads /dev/tty directly, so --json stdout stays clean. The
 # ecosystem standard; tiny (rtoolbox + the already-present libc family).
 rpassword = "7"
+# The push secret-scan preflight: one compiled RegexSet over the fixed
+# credential patterns, a single pass per file. The ecosystem standard; adds
+# aho-corasick + regex-automata/-syntax (memchr was already in the tree).
+regex = "1"
 
 [dev-dependencies]
 assert_cmd = "2"

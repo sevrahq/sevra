@@ -67,16 +67,40 @@ pub fn put_presigned(url: &str, headers: &Value, bytes: &[u8]) {
     });
     match result {
         Ok(resp) if resp.status() < 300 => {}
-        Ok(resp) => fail(
-            &format!("pack upload failed (HTTP {})", resp.status()),
-            None,
-        ),
+        Ok(resp) => {
+            let status = resp.status();
+            fail(
+                &format!(
+                    "pack upload failed (HTTP {status}){}",
+                    response_snippet_suffix(resp)
+                ),
+                None,
+            )
+        }
         Err(error) => match *error {
-            ureq::Error::Status(code, _) => {
-                fail(&format!("pack upload failed (HTTP {code})"), None)
-            }
+            ureq::Error::Status(code, resp) => fail(
+                &format!(
+                    "pack upload failed (HTTP {code}){}",
+                    response_snippet_suffix(resp)
+                ),
+                None,
+            ),
             ureq::Error::Transport(err) => fail(&format!("pack upload failed: {err}"), None),
         },
+    }
+}
+
+/// `": <body start>"` of an error response, or "" when there is nothing to
+/// show. Presigned-storage errors are XML/HTML, and the status code alone
+/// ("HTTP 403") hides the actual reason (expiry, signature, clock skew).
+fn response_snippet_suffix(resp: ureq::Response) -> String {
+    let mut buf = Vec::new();
+    let _ = resp.into_reader().take(4096).read_to_end(&mut buf);
+    let snippet = snippet_of(&String::from_utf8_lossy(&buf));
+    if snippet.is_empty() {
+        String::new()
+    } else {
+        format!(": {snippet}")
     }
 }
 
@@ -94,9 +118,13 @@ pub fn get_presigned(url: &str, max_bytes: u64) -> Vec<u8> {
     let resp = match with_connect_retries(|| http.get(url).call().map_err(Box::new)) {
         Ok(resp) => resp,
         Err(error) => match *error {
-            ureq::Error::Status(code, _) => {
-                fail(&format!("pack download failed (HTTP {code})"), None)
-            }
+            ureq::Error::Status(code, resp) => fail(
+                &format!(
+                    "pack download failed (HTTP {code}){}",
+                    response_snippet_suffix(resp)
+                ),
+                None,
+            ),
             ureq::Error::Transport(err) => fail(&format!("pack download failed: {err}"), None),
         },
     };
@@ -119,6 +147,20 @@ pub const NOT_LOGGED_IN: &str =
 pub struct HubResponse {
     pub status: u16,
     pub body: Option<Value>,
+    /// The first ~200 chars of the response text (control chars flattened) —
+    /// surfaced on errors that carry no JSON `error`, so a proxy page or an
+    /// HTML answer is debuggable instead of an opaque "unknown error".
+    pub snippet: String,
+}
+
+/// The first ~200 chars of a body, printable on one line.
+fn snippet_of(text: &str) -> String {
+    text.chars()
+        .take(200)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 fn agent() -> ureq::Agent {
@@ -291,7 +333,31 @@ fn finish_response(cfg: &Config, status: u16, resp: ureq::Response) -> Result<Hu
     Ok(HubResponse {
         status,
         body: parsed,
+        snippet: snippet_of(&text),
     })
+}
+
+/// The best available error text from a hub answer: the body's `error` (plus
+/// its `code` when present), else "unknown error" with the start of whatever
+/// the body actually was — never an unexplained "unknown error" over a body
+/// that said something.
+pub fn hub_error_message(r: &HubResponse) -> String {
+    let error = r
+        .body
+        .as_ref()
+        .and_then(|b| b.get("error"))
+        .and_then(|e| e.as_str());
+    let code = r
+        .body
+        .as_ref()
+        .and_then(|b| b.get("code"))
+        .and_then(|c| c.as_str());
+    match (error, code) {
+        (Some(error), Some(code)) => format!("{error} (code: {code})"),
+        (Some(error), None) => error.to_string(),
+        (None, _) if r.snippet.is_empty() => "unknown error".to_string(),
+        (None, _) => format!("unknown error — body starts: {}", r.snippet),
+    }
 }
 
 /// Unwrap a successful JSON body, or fail. A >=400 surfaces the hub's own
@@ -299,13 +365,7 @@ fn finish_response(cfg: &Config, status: u16, resp: ureq::Response) -> Result<Hu
 /// here rather than deserializing into nothing downstream.
 pub fn ensure_ok(r: HubResponse, what: &str) -> Value {
     if r.status >= 400 {
-        let msg = r
-            .body
-            .as_ref()
-            .and_then(|b| b.get("error"))
-            .and_then(|e| e.as_str())
-            .unwrap_or("unknown error")
-            .to_string();
+        let msg = hub_error_message(&r);
         fail(&format!("{what} failed (HTTP {}): {msg}", r.status), r.body);
     }
     match r.body {

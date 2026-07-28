@@ -911,6 +911,288 @@ fn mcp_tools_call_reaches_the_hub_with_the_stored_bearer() {
     );
 }
 
+// --- push preflights, --force, delete, query --brain (the 0.2.4 surface) -----
+
+/// A minimal valid store on disk; returns the tempdir guard.
+fn store_dir(files: &[(&str, &str)]) -> tempfile::TempDir {
+    let t = tempfile::tempdir().unwrap();
+    for (name, content) in files {
+        std::fs::write(t.path().join(name), content).unwrap();
+    }
+    t
+}
+
+#[test]
+fn push_help_states_replacement_and_the_new_flags() {
+    sevra().args(["push", "--help"]).assert().success().stdout(
+        predicate::str::contains("REPLACES")
+            .and(predicate::str::contains("removed from"))
+            .and(predicate::str::contains("--force"))
+            .and(predicate::str::contains("--allow-secrets")),
+    );
+}
+
+#[test]
+fn query_accepts_brain_as_a_flag() {
+    // The dogfood bug: `sevra query --brain X "text"` was an "unexpected
+    // argument" usage error while push spelled the brain exactly that way.
+    let (base, log, handle) = mock_hub(vec![
+        (200, r#"{"total":0,"results":[]}"#.to_string()),
+        (200, r#"{"total":0,"results":[]}"#.to_string()),
+    ]);
+    sevra()
+        .args(["query", "--brain", "workbrain", "scope creep"])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .assert()
+        .success();
+    // Belt and braces: both forms naming the SAME brain proceed.
+    sevra()
+        .args(["query", "workbrain", "scope creep", "--brain", "workbrain"])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .assert()
+        .success();
+    handle.join().unwrap();
+    let reqs = log.lock().unwrap();
+    assert_eq!(reqs.len(), 2);
+    for req in reqs.iter() {
+        assert_eq!(req.path, "/api/hub/brains/workbrain/query?q=scope%20creep");
+    }
+}
+
+#[test]
+fn query_with_two_differing_brains_is_a_usage_error() {
+    sevra()
+        .args(["query", "one", "text", "--brain", "two"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--brain").and(predicate::str::contains("pass it once")));
+    // The --json contract holds for the refusal.
+    sevra()
+        .args(["query", "one", "text", "--brain", "two", "--json"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("\"error\""));
+}
+
+#[test]
+fn push_force_sends_allow_shrink_and_plain_push_does_not() {
+    let t = store_dir(&[("a.md", "alpha")]);
+    let (base, log, handle) = mock_hub(vec![
+        (200, r#"{"indexed":{"documents":1}}"#.to_string()),
+        (200, r#"{"indexed":{"documents":1}}"#.to_string()),
+    ]);
+    sevra()
+        .args(["push", t.path().to_str().unwrap(), "--brain", "b"])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .assert()
+        .success();
+    sevra()
+        .args([
+            "push",
+            t.path().to_str().unwrap(),
+            "--brain",
+            "b",
+            "--force",
+        ])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .assert()
+        .success();
+    handle.join().unwrap();
+    let reqs = log.lock().unwrap();
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(reqs[0].path, "/api/hub/brains/b/push");
+    assert!(
+        !reqs[0].body.contains("allow_shrink"),
+        "no allow_shrink without --force: {}",
+        reqs[0].body
+    );
+    assert!(
+        reqs[1].body.contains(r#""allow_shrink":true"#),
+        "--force rides as allow_shrink: {}",
+        reqs[1].body
+    );
+}
+
+#[test]
+fn push_shrink_refusal_shows_the_hub_message_and_the_force_hint() {
+    let t = store_dir(&[("a.md", "alpha")]);
+    let (base, _log, handle) = mock_hub(vec![(
+        409,
+        r#"{"error":"replacing 120 documents with 1 shrinks this brain","code":"shrink_refused","currentDocs":120,"incomingDocs":1}"#
+            .to_string(),
+    )]);
+    sevra()
+        .args(["push", t.path().to_str().unwrap(), "--brain", "b"])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("replacing 120 documents with 1 shrinks this brain")
+                .and(predicate::str::contains("retry with --force")),
+        );
+    handle.join().unwrap();
+}
+
+#[test]
+fn push_refuses_secrets_before_any_request_and_never_echoes_them() {
+    // Fixture token built at runtime so no secret-shaped literal sits in the
+    // repo. The hub URL is unreachable: the refusal proves the scan runs
+    // before any network I/O.
+    let key = format!("AKIA{}", "A".repeat(16));
+    let t = store_dir(&[("note.md", &format!("aws key: {key}"))]);
+    let out = sevra()
+        .args(["push", t.path().to_str().unwrap(), "--brain", "b"])
+        .env("SEVRA_HUB_URL", "http://localhost:9")
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let all = all_output(&out);
+    assert!(all.contains("AWS access key id"), "names the kind: {all}");
+    assert!(all.contains("note.md"), "names the file: {all}");
+    assert!(all.contains("--allow-secrets"), "names the override: {all}");
+    assert!(all.contains("rotate"), "remediation line: {all}");
+    assert!(
+        !all.contains(&key),
+        "the matched value must never print: {all}"
+    );
+    assert!(
+        !all.contains("hub unreachable"),
+        "the scan must refuse before any request: {all}"
+    );
+}
+
+#[test]
+fn push_allow_secrets_overrides_the_scan() {
+    let key = format!("AKIA{}", "B".repeat(16));
+    let t = store_dir(&[("note.md", &format!("aws key: {key}"))]);
+    // Same store, with the override: the push proceeds to the (unreachable)
+    // hub — the failure is now transport, not the scan.
+    sevra()
+        .args([
+            "push",
+            t.path().to_str().unwrap(),
+            "--brain",
+            "b",
+            "--allow-secrets",
+        ])
+        .env("SEVRA_HUB_URL", "http://localhost:9")
+        .env("SEVRA_API_KEY", "x")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("hub unreachable"));
+}
+
+#[test]
+fn push_flags_a_secret_in_a_file_name_without_reprinting_it() {
+    let token = format!("ghp_{}", "a".repeat(36));
+    let t = store_dir(&[(&format!("{token}.md"), "clean content")]);
+    let out = sevra()
+        .args(["push", t.path().to_str().unwrap(), "--brain", "b"])
+        .env("SEVRA_HUB_URL", "http://localhost:9")
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let all = all_output(&out);
+    assert!(
+        all.contains("GitHub personal access token"),
+        "names the kind: {all}"
+    );
+    assert!(all.contains("file's name"), "says WHERE it sits: {all}");
+    assert!(
+        !all.contains(&token),
+        "a secret-bearing path must print redacted: {all}"
+    );
+}
+
+#[test]
+fn delete_without_confirm_needs_a_terminal() {
+    // Piped stdin is not a TTY: the refusal must name --confirm and happen
+    // before any network I/O (the hub here is unreachable).
+    sevra()
+        .args(["delete", "workbrain"])
+        .env("SEVRA_HUB_URL", "http://localhost:9")
+        .env("SEVRA_API_KEY", "x")
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("--confirm")
+                .and(predicate::str::contains("hub unreachable").not()),
+        );
+}
+
+#[test]
+fn delete_with_confirm_sends_the_slug_and_reports_the_removal() {
+    let (base, log, handle) = mock_hub(vec![(
+        200,
+        r#"{"deleted":true,"brain":"01brain","r2Objects":7}"#.to_string(),
+    )]);
+    sevra()
+        .args(["delete", "workbrain", "--confirm", "workbrain"])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("deleted").and(predicate::str::contains("7")));
+    handle.join().unwrap();
+    let reqs = log.lock().unwrap();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].method, "DELETE");
+    assert_eq!(reqs[0].path, "/api/hub/brains/workbrain");
+    assert!(
+        reqs[0].body.contains(r#""confirm":"workbrain""#),
+        "the slug rides the body: {}",
+        reqs[0].body
+    );
+}
+
+#[test]
+fn delete_maps_the_hubs_confirm_required_refusal() {
+    let (base, _log, handle) = mock_hub(vec![(
+        400,
+        r#"{"error":"Confirm by sending the brain's slug.","code":"confirm_required"}"#.to_string(),
+    )]);
+    sevra()
+        .args(["delete", "workbrain", "--confirm", "wrong-slug"])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("Confirm by sending the brain's slug.")
+                .and(predicate::str::contains("--confirm")),
+        );
+    handle.join().unwrap();
+}
+
+#[test]
+fn non_json_error_bodies_surface_their_start() {
+    // A proxy answering HTML used to read as a bare "unknown error"; the
+    // start of the actual body now rides along.
+    let (base, _log, handle) = mock_hub(vec![(
+        502,
+        "<html>Bad gateway from an intermediate proxy</html>".to_string(),
+    )]);
+    sevra()
+        .arg("brains")
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("unknown error").and(predicate::str::contains(
+                "Bad gateway from an intermediate proxy",
+            )),
+        );
+    handle.join().unwrap();
+}
+
 #[test]
 fn mcp_without_a_credential_serves_public_reads_unauthenticated() {
     let (base, log, handle) = mock_hub(vec![(200, r#"{"brains":[]}"#.to_string())]);

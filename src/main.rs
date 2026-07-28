@@ -12,13 +12,14 @@ mod config;
 mod hub;
 mod mcp;
 mod output;
+mod scan;
 mod signing;
 mod store;
 mod update;
 
 use clap::{Parser, Subcommand};
 
-use output::set_json_mode;
+use output::{set_json_mode, usage_fail};
 
 #[derive(Parser)]
 #[command(
@@ -68,16 +69,44 @@ enum Commands {
         #[arg(long)]
         public: bool,
     },
-    /// Push a local db.md store (index-on-push)
+    /// Permanently delete a brain and everything the hub holds for it
+    /// (owner-only). Interactive runs show what dies and ask for the brain's
+    /// slug; scripts and agents pass --confirm <slug>. There is no undo.
+    Delete {
+        brain: String,
+        /// The brain's exact slug — confirms without the interactive prompt
+        #[arg(long, value_name = "SLUG")]
+        confirm: Option<String>,
+    },
+    /// Push a local db.md store (index-on-push). Push REPLACES the brain's
+    /// whole hosted store with <DIR>: files absent locally are removed from
+    /// the hub. A push that would shrink the brain's document count is
+    /// refused unless --force is given. Before anything uploads, the store is
+    /// checked against the hub's snapshot limits and scanned for
+    /// secret-shaped file contents and names (--allow-secrets overrides).
     Push {
         dir: String,
         #[arg(long)]
         brain: String,
+        /// Allow a shrinking replacement (fewer documents than the hub holds)
+        #[arg(long)]
+        force: bool,
+        /// Push even when the secret scan finds matches
+        #[arg(long)]
+        allow_secrets: bool,
     },
     /// Query a brain by text + frontmatter filters
     Query {
-        brain: String,
+        /// The brain (with --brain given, this positional is the search text)
+        #[arg(value_name = "BRAIN")]
+        brain: Option<String>,
+        /// Free-text search
+        #[arg(value_name = "TEXT")]
         text: Option<String>,
+        /// The brain to query — an alias of the first positional (the same
+        /// flag `push` uses)
+        #[arg(long = "brain", value_name = "BRAIN")]
+        brain_flag: Option<String>,
         #[arg(long = "type")]
         type_: Option<String>,
         #[arg(long)]
@@ -237,10 +266,17 @@ fn main() {
             scope,
             public,
         } => commands::create(&cfg, &slug, name, scope, public),
-        Commands::Push { dir, brain } => commands::push(&cfg, &dir, &brain),
+        Commands::Delete { brain, confirm } => commands::delete(&cfg, &brain, confirm),
+        Commands::Push {
+            dir,
+            brain,
+            force,
+            allow_secrets,
+        } => commands::push(&cfg, &dir, &brain, force, allow_secrets),
         Commands::Query {
             brain,
             text,
+            brain_flag,
             type_,
             layer,
             meta_type,
@@ -248,9 +284,15 @@ fn main() {
             order,
             limit,
             r#where,
-        } => commands::query(
-            &cfg, &brain, text, type_, layer, meta_type, tag, order, limit, r#where,
-        ),
+        } => {
+            let (brain, text) = match commands::resolve_query_target(brain_flag, brain, text) {
+                Ok(target) => target,
+                Err(msg) => usage_fail(&msg),
+            };
+            commands::query(
+                &cfg, &brain, text, type_, layer, meta_type, tag, order, limit, r#where,
+            )
+        }
         Commands::Get { brain, reference } => commands::get(&cfg, &brain, &reference),
         Commands::Graph { brain, path, dir } => commands::graph(&cfg, &brain, &path, dir),
         Commands::Mcp => mcp::serve(&cfg),

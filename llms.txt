@@ -31,8 +31,17 @@ Agent contract:
 Commands:
     login [--hub <url>] [--no-browser] [--key <k>] | logout | whoami
     brains | create <slug> [--name --scope --public]
-    push <dir> --brain <id|slug>          # index-on-push; 4 MB JSON cap
-    query <brain> [text] [--type --layer --meta-type --tag --where k=v --limit N]
+    delete <brain> [--confirm <slug>]     # PERMANENT, owner-only. Non-TTY/scripted runs
+                                          # must pass --confirm with the brain's exact slug;
+                                          # interactive runs are prompted for it.
+    push <dir> --brain <id|slug> [--force] [--allow-secrets]
+                                          # REPLACES the hosted store with <dir> (files absent
+                                          # locally are removed); --force allows a shrinking
+                                          # replacement. Preflights the hub limits locally
+                                          # (256 MiB pack / 512 MiB raw / 100k files, largest
+                                          # files listed) and refuses secret-shaped content or
+                                          # file names unless --allow-secrets.
+    query <brain|--brain <ref>> [text] [--type --layer --meta-type --tag --where k=v --limit N]
     get <brain> <id|path> | graph <brain> <path> [--dir in|out|both]
     mcp                                   # stdio MCP server over the read surface
                                           # (list_brains, search_brain, get_record,

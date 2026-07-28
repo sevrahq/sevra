@@ -13,9 +13,10 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::config::{self, Config, DEFAULT_HUB};
-use crate::hub::{ensure_ok, get_presigned, put_presigned, request, NOT_LOGGED_IN};
+use crate::hub::{ensure_ok, get_presigned, put_presigned, request, HubResponse, NOT_LOGGED_IN};
 use crate::output::{fail, json_mode, note, out, usage_fail};
-use crate::store::{build_pack, read_store};
+use crate::scan::{scan_store, SecretHit};
+use crate::store::{build_pack, read_store, StoreError};
 
 /// The hub's poll cadence when it does not say otherwise (it always does).
 const POLL_INTERVAL_SECS: u64 = 5;
@@ -769,34 +770,288 @@ pub fn create(cfg: &Config, slug: &str, name: Option<String>, scope: Option<Stri
     );
 }
 
+/// Interactive confirmation for `delete`: show what dies, require the slug
+/// typed back. Scripted callers (no TTY, or --json) must pass --confirm.
+fn prompt_delete_confirmation(cfg: &Config, brain: &str) -> String {
+    use std::io::IsTerminal;
+    if json_mode() || !std::io::stdin().is_terminal() {
+        fail(
+            "deleting a brain is permanent and needs confirmation — rerun with --confirm <slug> (the brain's exact slug; `sevra brains` lists them)",
+            None,
+        );
+    }
+    // Show what will be deleted — and learn the slug the hub will demand,
+    // so an id-referenced delete still confirms against the right word.
+    let r = ensure_ok(request(cfg, "GET", "/api/hub/brains", None, true), "delete");
+    let list = r
+        .get("brains")
+        .and_then(|b| b.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let Some(b) = list
+        .iter()
+        .find(|b| str_field(b, "slug") == brain || str_field(b, "id") == brain)
+    else {
+        fail(
+            &format!("no brain '{brain}' in your account — `sevra brains` lists yours"),
+            None,
+        )
+    };
+    let slug = str_field(b, "slug").to_string();
+    let name = str_field(b, "name");
+    let label = if name.is_empty() || name == slug {
+        format!("'{slug}'")
+    } else {
+        format!("'{slug}' ({name})")
+    };
+    eprintln!(
+        "This permanently deletes {label} from the hub — every hosted file, its index, published pages, and grants. There is no undo."
+    );
+    eprint!("type the brain's slug to confirm: ");
+    let mut typed = String::new();
+    if std::io::stdin().read_line(&mut typed).is_err() {
+        fail(
+            "could not read the confirmation — nothing was deleted",
+            None,
+        );
+    }
+    let typed = typed.trim();
+    if typed != slug {
+        fail(
+            &format!("confirmation did not match the slug '{slug}' — nothing was deleted"),
+            None,
+        );
+    }
+    typed.to_string()
+}
+
+pub fn delete(cfg: &Config, brain: &str, confirm: Option<String>) {
+    let confirm = confirm.unwrap_or_else(|| prompt_delete_confirmation(cfg, brain));
+    let resp = request(
+        cfg,
+        "DELETE",
+        &format!("/api/hub/brains/{}", enc(brain)),
+        Some(&json!({ "confirm": confirm })),
+        true,
+    );
+    // The hub's own guard: a missing or mismatched confirm answers 400
+    // confirm_required. Map it to the action that unblocks.
+    if resp.status == 400 && body_code(&resp) == Some("confirm_required") {
+        let server = resp
+            .body
+            .as_ref()
+            .and_then(|b| b.get("error"))
+            .and_then(|e| e.as_str())
+            .unwrap_or("the hub requires the brain's slug to confirm")
+            .to_string();
+        fail(
+            &format!(
+                "delete refused (HTTP 400): {server}\nconfirm with the brain's exact slug: sevra delete {brain} --confirm <slug> (`sevra brains` lists slugs)"
+            ),
+            resp.body,
+        );
+    }
+    let r = ensure_ok(resp, "delete");
+    let objects = r.get("r2Objects").and_then(|v| v.as_i64()).unwrap_or(0);
+    out(
+        &format!("deleted {brain} permanently ({objects} hosted object(s) removed)"),
+        Some(r),
+    );
+}
+
 // --- push --------------------------------------------------------------------
 
-pub fn push(cfg: &Config, dir: &str, brain: &str) {
+/// Bytes for humans, in the binary units the hub's limits are defined in.
+fn human_size(bytes: u64) -> String {
+    const K: f64 = 1024.0;
+    let b = bytes as f64;
+    if b >= K * K * K {
+        format!("{:.1} GiB", b / (K * K * K))
+    } else if b >= K * K {
+        format!("{:.1} MiB", b / (K * K))
+    } else if b >= K {
+        format!("{:.1} KiB", b / K)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// 100000 → "100,000" — counts read at a glance in refusal messages.
+fn commas(n: u64) -> String {
+    let digits = n.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(c);
+    }
+    grouped
+}
+
+/// Refuse, locally, a push the hub's snapshot limits would reject anyway —
+/// before a single byte is uploaded — naming the limit, the actual numbers,
+/// and the largest files so the operator knows what to trim.
+fn fail_snapshot_limit(problem: &str, largest: &[(String, u64)], data: Value) -> ! {
+    let mut msg = format!("{problem}\nlargest files:");
+    for (path, bytes) in largest {
+        msg.push_str(&format!("\n  {:>9}  {path}", human_size(*bytes)));
+    }
+    msg.push_str(
+        "\ntrim what should not ship (sources/ usually holds the bulk); for a deliberately large store, split it across brains and push each part separately",
+    );
+    let mut data = data;
+    if let Some(obj) = data.as_object_mut() {
+        obj.insert(
+            "largestFiles".into(),
+            json!(largest
+                .iter()
+                .map(|(path, bytes)| json!({ "path": path, "bytes": bytes }))
+                .collect::<Vec<_>>()),
+        );
+    }
+    fail(&msg, Some(data));
+}
+
+/// The secret-scan refusal: each hit as `path — kind`, never a matched value
+/// (paths that themselves match are already redacted by the scanner).
+fn fail_secret_hits(hits: &[SecretHit]) -> ! {
+    const SHOWN: usize = 20;
+    let mut msg = format!(
+        "push refused: {} match(es) for known secret formats in the store (matched values are never shown):",
+        hits.len()
+    );
+    for hit in hits.iter().take(SHOWN) {
+        let place = if hit.in_path {
+            " (in the file's name)"
+        } else {
+            ""
+        };
+        msg.push_str(&format!("\n  {} — {}{place}", hit.path, hit.kind));
+    }
+    if hits.len() > SHOWN {
+        msg.push_str(&format!("\n  … and {} more", hits.len() - SHOWN));
+    }
+    msg.push_str(
+        "\nrotate anything that ever lived here; keep live secrets in a password manager and references to them in the brain. If this store must ship as-is, push again with --allow-secrets.",
+    );
+    fail(
+        &msg,
+        Some(json!({
+            "secretHits": hits
+                .iter()
+                .take(SHOWN)
+                .map(|h| json!({ "path": h.path, "kind": h.kind, "inPath": h.in_path }))
+                .collect::<Vec<_>>(),
+            "total": hits.len(),
+        })),
+    );
+}
+
+fn body_code(r: &HubResponse) -> Option<&str> {
+    r.body
+        .as_ref()
+        .and_then(|b| b.get("code"))
+        .and_then(|c| c.as_str())
+}
+
+/// `ensure_ok` for the push verbs, with the shrink guard mapped: without
+/// --force, a 409 `shrink_refused` (the hub protecting a brain from a smaller
+/// replacement) prints the hub's message verbatim plus the one hint that
+/// unblocks an intended replacement.
+fn ensure_push_ok(r: HubResponse, what: &str, force: bool) -> Value {
+    if !force && r.status == 409 && body_code(&r) == Some("shrink_refused") {
+        let server = r
+            .body
+            .as_ref()
+            .and_then(|b| b.get("error"))
+            .and_then(|e| e.as_str())
+            .unwrap_or("the hub refused to shrink the brain")
+            .to_string();
+        fail(
+            &format!(
+                "{what} failed (HTTP 409): {server}\nretry with --force if the replacement is intended"
+            ),
+            r.body,
+        );
+    }
+    ensure_ok(r, what)
+}
+
+/// Commit an uploaded pack. A 507 `hub_scratch_exhausted` means the pack IS
+/// uploaded and only the hub's unpack scratch is busy — retry the commit
+/// after a pause, never the upload.
+fn commit_pack(cfg: &Config, brain: &str, commit: &Value, force: bool) -> Value {
+    let mut attempt: u64 = 0;
+    loop {
+        let resp = request(
+            cfg,
+            "POST",
+            &format!("/api/hub/brains/{}/packs/commit", enc(brain)),
+            Some(commit),
+            true,
+        );
+        if resp.status == 507 && body_code(&resp) == Some("hub_scratch_exhausted") && attempt < 2 {
+            attempt += 1;
+            let pause = 5 * attempt;
+            note(&format!(
+                "the hub's unpack scratch is busy — the pack is already uploaded; retrying the commit in {pause}s ({attempt}/2)"
+            ));
+            std::thread::sleep(std::time::Duration::from_secs(pause));
+            continue;
+        }
+        return ensure_push_ok(resp, "commit pack", force);
+    }
+}
+
+pub fn push(cfg: &Config, dir: &str, brain: &str, force: bool, allow_secrets: bool) {
     if !Path::new(dir).exists() {
         fail(&format!("store directory not found: {dir}"), None);
     }
-    let store = match read_store(dir, MAX_STORE_BYTES) {
-        Ok(s) => s,
-        Err(None) => fail(
-            "store exceeds the hub's 512 MB uncompressed snapshot limit",
-            Some(json!({ "cap": MAX_STORE_BYTES })),
+    let (store, stats) = match read_store(dir, MAX_STORE_BYTES) {
+        Ok(pair) => pair,
+        Err(StoreError::OverCap(stats)) => fail_snapshot_limit(
+            &format!(
+                "store is {} uncompressed across {} files — the hub caps one snapshot at {} uncompressed",
+                human_size(stats.bytes),
+                commas(stats.files as u64),
+                human_size(MAX_STORE_BYTES)
+            ),
+            &stats.largest,
+            json!({ "limitBytes": MAX_STORE_BYTES, "storeBytes": stats.bytes, "files": stats.files }),
         ),
-        Err(Some(e)) => fail(&format!("could not read {dir}: {e}"), None),
+        Err(StoreError::Io(e)) => fail(&format!("could not read {dir}: {e}"), None),
     };
     if store.files.is_empty() {
         fail(&format!("no .md files under {dir}"), None);
     }
     if store.files.len() > MAX_STORE_FILES {
-        fail(
-            "store exceeds the hub's 100,000-file snapshot limit",
-            Some(json!({ "cap": MAX_STORE_FILES, "files": store.files.len() })),
+        fail_snapshot_limit(
+            &format!(
+                "store has {} files — the hub caps one snapshot at {} files",
+                commas(store.files.len() as u64),
+                commas(MAX_STORE_FILES as u64)
+            ),
+            &stats.largest,
+            json!({ "limitFiles": MAX_STORE_FILES, "files": store.files.len() }),
         );
     }
-    let payload = serde_json::to_value(&store).unwrap();
+    // The last gate before bytes leave the machine: refuse secret-shaped
+    // content and file names unless the operator explicitly overrides.
+    if !allow_secrets {
+        let hits = scan_store(&store);
+        if !hits.is_empty() {
+            fail_secret_hits(&hits);
+        }
+    }
+    let mut payload = serde_json::to_value(&store).unwrap();
+    if force {
+        payload["allow_shrink"] = json!(true);
+    }
     let file_count = store.files.len();
     let payload_bytes = payload.to_string().len();
     let r = if payload_bytes <= MAX_JSON_PUSH_BYTES {
-        ensure_ok(
+        ensure_push_ok(
             request(
                 cfg,
                 "POST",
@@ -805,14 +1060,20 @@ pub fn push(cfg: &Config, dir: &str, brain: &str) {
                 true,
             ),
             "push",
+            force,
         )
     } else {
         let pack = build_pack(&store)
             .unwrap_or_else(|e| fail(&format!("could not build store pack: {e}"), None));
         if pack.len() as u64 > MAX_PACK_BYTES {
-            fail(
-                "compressed store snapshot exceeds the hub's 256 MB limit",
-                Some(json!({ "cap": MAX_PACK_BYTES, "bytes": pack.len() })),
+            fail_snapshot_limit(
+                &format!(
+                    "compressed store pack is {} — the hub caps one pack at {} compressed",
+                    human_size(pack.len() as u64),
+                    human_size(MAX_PACK_BYTES)
+                ),
+                &stats.largest,
+                json!({ "limitBytes": MAX_PACK_BYTES, "packBytes": pack.len() }),
             );
         }
         let sha256 = format!("{:x}", Sha256::digest(&pack));
@@ -832,16 +1093,11 @@ pub fn push(cfg: &Config, dir: &str, brain: &str) {
             .and_then(Value::as_str)
             .unwrap_or_else(|| fail("hub returned no pack upload URL", None));
         put_presigned(url, presigned.get("headers").unwrap_or(&Value::Null), &pack);
-        ensure_ok(
-            request(
-                cfg,
-                "POST",
-                &format!("/api/hub/brains/{}/packs/commit", enc(brain)),
-                Some(&meta),
-                true,
-            ),
-            "commit pack",
-        )
+        let mut commit = meta;
+        if force {
+            commit["allow_shrink"] = json!(true);
+        }
+        commit_pack(cfg, brain, &commit, force)
     };
     let s = r.get("indexed").cloned().unwrap_or(json!({}));
     let n = |k: &str| s.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
@@ -858,6 +1114,36 @@ pub fn push(cfg: &Config, dir: &str, brain: &str) {
 }
 
 // --- query / get / graph -----------------------------------------------------
+
+/// `query` takes its brain positionally or via `--brain` (the flag `push`
+/// uses — the two commands must not disagree). With `--brain` present the
+/// first positional is the search text; the belt-and-braces shape
+/// `query <brain> <text> --brain <ref>` must agree with the flag.
+pub fn resolve_query_target(
+    flag: Option<String>,
+    first: Option<String>,
+    second: Option<String>,
+) -> Result<(String, Option<String>), String> {
+    match (flag, first, second) {
+        (None, Some(brain), text) => Ok((brain, text)),
+        // clap fills positionals in order, so second without first cannot occur.
+        (None, None, _) => Err(
+            "which brain? `sevra query <brain> [text]`, or `sevra query --brain <ref> [text]`"
+                .into(),
+        ),
+        (Some(flag), None, text) => Ok((flag, text)),
+        (Some(flag), Some(text), None) => Ok((flag, Some(text))),
+        (Some(flag), Some(first), Some(text)) => {
+            if first == flag {
+                Ok((flag, Some(text)))
+            } else {
+                Err(format!(
+                    "the brain was given twice and differs: '{first}' (positional) vs '{flag}' (--brain) — pass it once"
+                ))
+            }
+        }
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn query(
@@ -1784,6 +2070,60 @@ mod tests {
                 bad.escape_debug()
             );
         }
+    }
+
+    #[test]
+    fn human_size_speaks_the_hub_limit_units() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(1023), "1023 B");
+        assert_eq!(human_size(1024), "1.0 KiB");
+        assert_eq!(human_size(256 * 1024 * 1024), "256.0 MiB");
+        assert_eq!(human_size(512 * 1024 * 1024), "512.0 MiB");
+        assert_eq!(human_size(3 * 1024 * 1024 * 1024), "3.0 GiB");
+    }
+
+    #[test]
+    fn commas_group_thousands() {
+        assert_eq!(commas(0), "0");
+        assert_eq!(commas(999), "999");
+        assert_eq!(commas(1000), "1,000");
+        assert_eq!(commas(100_000), "100,000");
+        assert_eq!(commas(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn query_target_resolves_positional_flag_and_conflicts() {
+        let s = |v: &str| Some(v.to_string());
+        // Positional form, unchanged.
+        assert_eq!(
+            resolve_query_target(None, s("b"), s("text")),
+            Ok(("b".into(), Some("text".into())))
+        );
+        assert_eq!(
+            resolve_query_target(None, s("b"), None),
+            Ok(("b".into(), None))
+        );
+        // The flag alone, and the flag with text.
+        assert_eq!(
+            resolve_query_target(s("b"), None, None),
+            Ok(("b".into(), None))
+        );
+        assert_eq!(
+            resolve_query_target(s("b"), s("text"), None),
+            Ok(("b".into(), Some("text".into())))
+        );
+        // Both forms: same brain proceeds, different brains refuse.
+        assert_eq!(
+            resolve_query_target(s("b"), s("b"), s("text")),
+            Ok(("b".into(), Some("text".into())))
+        );
+        assert!(resolve_query_target(s("b"), s("other"), s("text"))
+            .unwrap_err()
+            .contains("--brain"));
+        // No brain anywhere.
+        assert!(resolve_query_target(None, None, None)
+            .unwrap_err()
+            .contains("which brain"));
     }
 
     #[test]
