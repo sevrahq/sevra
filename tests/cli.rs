@@ -917,7 +917,9 @@ fn mcp_tools_call_reaches_the_hub_with_the_stored_bearer() {
 fn store_dir(files: &[(&str, &str)]) -> tempfile::TempDir {
     let t = tempfile::tempdir().unwrap();
     for (name, content) in files {
-        std::fs::write(t.path().join(name), content).unwrap();
+        let path = t.path().join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
     }
     t
 }
@@ -928,7 +930,9 @@ fn push_help_states_replacement_and_the_new_flags() {
         predicate::str::contains("REPLACES")
             .and(predicate::str::contains("removed from"))
             .and(predicate::str::contains("--force"))
-            .and(predicate::str::contains("--allow-secrets")),
+            .and(predicate::str::contains("--allow-secrets"))
+            .and(predicate::str::contains(".sevralocal"))
+            .and(predicate::str::contains("never part of the cargo")),
     );
 }
 
@@ -1055,7 +1059,6 @@ fn push_refuses_secrets_before_any_request_and_never_echoes_them() {
     let all = all_output(&out);
     assert!(all.contains("AWS access key id"), "names the kind: {all}");
     assert!(all.contains("note.md"), "names the file: {all}");
-    assert!(all.contains("--allow-secrets"), "names the override: {all}");
     assert!(all.contains("rotate"), "remediation line: {all}");
     assert!(
         !all.contains(&key),
@@ -1064,6 +1067,14 @@ fn push_refuses_secrets_before_any_request_and_never_echoes_them() {
     assert!(
         !all.contains("hub unreachable"),
         "the scan must refuse before any request: {all}"
+    );
+    // The three exits, in order: keep home · edit · override.
+    let quarantine = all.find("secrets quarantine").expect("names quarantine");
+    let edit = all.find("edit the files").expect("names the edit path");
+    let allow = all.find("--allow-secrets").expect("names the override");
+    assert!(
+        quarantine < edit && edit < allow,
+        "exits out of order: {all}"
     );
 }
 
@@ -1191,6 +1202,492 @@ fn non_json_error_bodies_surface_their_start() {
             )),
         );
     handle.join().unwrap();
+}
+
+// --- .sevralocal + secrets scan/quarantine (the 0.2.5 surface) ----------------
+// Secrets get a place that is not the hub: a kept-home list the push walk
+// honors, a read-only scan, and a quarantine that appends hit files to the
+// list. Everything here is offline except the push wiring against mock hubs.
+
+#[test]
+fn push_keeps_sevralocal_files_home_and_reports_it() {
+    let t = store_dir(&[
+        ("a.md", "rides"),
+        ("private.md", "stays-home"),
+        (".sevralocal", "private.md\n"),
+    ]);
+    let (base, log, handle) = mock_hub(vec![
+        (200, r#"{"indexed":{"documents":1}}"#.to_string()),
+        (200, r#"{"indexed":{"documents":1}}"#.to_string()),
+    ]);
+    sevra()
+        .args(["push", t.path().to_str().unwrap(), "--brain", "b"])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("pushed 1 files").and(predicate::str::contains(
+                "1 file(s) kept home (.sevralocal)",
+            )),
+        );
+    // --json carries the same fact for machines.
+    sevra()
+        .args(["push", t.path().to_str().unwrap(), "--brain", "b", "--json"])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"keptHome\": 1"));
+    handle.join().unwrap();
+    let reqs = log.lock().unwrap();
+    assert_eq!(reqs.len(), 2);
+    for req in reqs.iter() {
+        assert!(req.body.contains("a.md"), "the riding file: {}", req.body);
+        assert!(
+            !req.body.contains("private.md") && !req.body.contains("stays-home"),
+            "a kept-home file must never leave the machine: {}",
+            req.body
+        );
+        assert!(
+            !req.body.contains("sevralocal"),
+            "the list itself never uploads: {}",
+            req.body
+        );
+    }
+}
+
+#[test]
+fn push_with_an_active_sevralocal_keeps_derived_catalogs_home() {
+    // Active by entry (even one matching nothing): catalogs carry every
+    // file's name/title/summary — kept-home files included — so they stay
+    // home too; the hub rebuilds its own.
+    let with = store_dir(&[
+        ("a.md", "rides"),
+        ("index.md", "catalog"),
+        ("sub/index.md", "catalog2"),
+        (".sevralocal", "ghost.md\n"),
+    ]);
+    let without = store_dir(&[("a.md", "rides"), ("index.md", "catalog")]);
+    let (base, log, handle) = mock_hub(vec![
+        (200, r#"{"indexed":{"documents":1}}"#.to_string()),
+        (200, r#"{"indexed":{"documents":2}}"#.to_string()),
+    ]);
+    sevra()
+        .args(["push", with.path().to_str().unwrap(), "--brain", "b"])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "2 derived catalog(s) kept home (the hub rebuilds its own)",
+        ));
+    sevra()
+        .args(["push", without.path().to_str().unwrap(), "--brain", "b"])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("kept home").not());
+    handle.join().unwrap();
+    let reqs = log.lock().unwrap();
+    assert!(
+        !reqs[0].body.contains("index.md"),
+        "catalogs stay home while the list is active: {}",
+        reqs[0].body
+    );
+    assert!(
+        reqs[1].body.contains("index.md"),
+        "no list, catalogs ride as before: {}",
+        reqs[1].body
+    );
+}
+
+#[test]
+fn a_sevralocal_covering_hub_files_refuses_push_and_quarantine() {
+    // The compiled set is evaluated against the two must-ride names, which
+    // also catches broad globs like `**`. Push fails before any network I/O;
+    // quarantine fails before any write.
+    for entry in ["**\n", "DB.md\n", "assets.jsonl\n"] {
+        let t = store_dir(&[("a.md", "x"), (".sevralocal", entry)]);
+        sevra()
+            .args(["push", t.path().to_str().unwrap(), "--brain", "b"])
+            .env("SEVRA_HUB_URL", "http://localhost:9")
+            .env("SEVRA_API_KEY", "x")
+            .assert()
+            .failure()
+            .stderr(
+                predicate::str::contains("ride every push")
+                    .and(predicate::str::contains("hub unreachable").not()),
+            );
+        sevra()
+            .args(["secrets", "quarantine", t.path().to_str().unwrap()])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("ride every push"));
+    }
+}
+
+#[test]
+fn push_empty_after_exclusion_names_the_kept_home_count() {
+    let t = store_dir(&[("private.md", "stays"), (".sevralocal", "private.md\n")]);
+    sevra()
+        .args(["push", t.path().to_str().unwrap(), "--brain", "b"])
+        .env("SEVRA_HUB_URL", "http://localhost:9")
+        .env("SEVRA_API_KEY", "x")
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("all 1 file(s) are kept home (.sevralocal)")
+                .and(predicate::str::contains("hub unreachable").not()),
+        );
+}
+
+#[test]
+fn push_shrink_refusal_notes_kept_home_documents() {
+    let t = store_dir(&[
+        ("a.md", "rides"),
+        ("kept.md", "stays"),
+        (".sevralocal", "kept.md\n"),
+    ]);
+    let (base, _log, handle) = mock_hub(vec![(
+        409,
+        r#"{"error":"replacing 3 documents with 1 shrinks this brain","code":"shrink_refused"}"#
+            .to_string(),
+    )]);
+    sevra()
+        .args(["push", t.path().to_str().unwrap(), "--brain", "b"])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("retry with --force").and(predicate::str::contains(
+                "(1 document(s) are kept home by .sevralocal and not part of this push)",
+            )),
+        );
+    handle.join().unwrap();
+}
+
+#[test]
+fn secrets_scan_is_clean_exit_zero_and_hits_exit_one_in_the_push_shape() {
+    // Clean store: exit 0, no login, no network.
+    let clean = store_dir(&[("a.md", "notes about rotating keys")]);
+    sevra()
+        .args(["secrets", "scan", clean.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "no matches for known secret formats across 1 file(s)",
+        ));
+    // Hits: exit 1, the push-refusal shape, minus the push framing.
+    let key = format!("AKIA{}", "D".repeat(16));
+    let dirty = store_dir(&[("creds.md", &format!("k: {key}"))]);
+    for json in [false, true] {
+        let mut c = sevra();
+        c.args(["secrets", "scan", dirty.path().to_str().unwrap()]);
+        if json {
+            c.arg("--json");
+        }
+        let out = c.output().unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        let all = all_output(&out);
+        assert!(!all.contains(&key), "value must never print: {all}");
+        assert!(!all.contains("push refused"), "no push framing: {all}");
+        assert!(
+            all.contains("AWS access key id") && all.contains("creds.md"),
+            "names the hit: {all}"
+        );
+        assert!(all.contains("secrets quarantine"), "names the exit: {all}");
+        if json {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            for field in ["\"secretHits\"", "\"inPath\"", "\"total\"", "\"error\""] {
+                assert!(stdout.contains(field), "missing {field}: {stdout}");
+            }
+        }
+    }
+}
+
+#[test]
+fn secrets_scan_respects_kept_home_files() {
+    // A hit inside a kept-home file is not a push problem — scan sees what a
+    // push would carry, and says what it skipped.
+    let key = format!("AKIA{}", "E".repeat(16));
+    let t = store_dir(&[
+        ("a.md", "clean"),
+        ("vault.md", &format!("k: {key}")),
+        (".sevralocal", "vault.md\n"),
+    ]);
+    sevra()
+        .args(["secrets", "scan", t.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no matches"))
+        .stderr(predicate::str::contains("1 file(s) kept home"));
+}
+
+#[test]
+fn secrets_quarantine_marks_hits_and_reruns_append_nothing() {
+    let key = format!("AKIA{}", "F".repeat(16));
+    let t = store_dir(&[("a.md", "clean"), ("creds.md", &format!("k: {key}"))]);
+    let list = t.path().join(".sevralocal");
+    let out = sevra()
+        .args(["secrets", "quarantine", t.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", all_output(&out));
+    let all = all_output(&out);
+    assert!(
+        all.contains("kept home (.sevralocal): 1 file(s)") && all.contains("creds.md"),
+        "reports the mark: {all}"
+    );
+    assert!(
+        all.contains("forward-only") && all.contains("erases nothing"),
+        "states the forward-only truth: {all}"
+    );
+    assert!(!all.contains(&key), "value must never print: {all}");
+    assert_eq!(
+        std::fs::read_to_string(&list).unwrap(),
+        "creds.md\n",
+        "exact path, single trailing newline"
+    );
+    // Idempotent: the re-run appends nothing and exits 0.
+    let out = sevra()
+        .args(["secrets", "quarantine", t.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", all_output(&out));
+    let all = all_output(&out);
+    assert!(
+        all.contains("nothing new to mark")
+            && all.contains("1 hit file(s) already covered by .sevralocal"),
+        "reports the coverage: {all}"
+    );
+    assert_eq!(std::fs::read_to_string(&list).unwrap(), "creds.md\n");
+    // And the push preflight now reads clean.
+    sevra()
+        .args(["secrets", "scan", t.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+fn secrets_quarantine_dry_run_previews_in_both_modes_and_writes_nothing() {
+    let key = format!("AKIA{}", "G".repeat(16));
+    let t = store_dir(&[("creds.md", &format!("k: {key}"))]);
+    sevra()
+        .args([
+            "secrets",
+            "quarantine",
+            t.path().to_str().unwrap(),
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "would keep home (.sevralocal): 1 file(s)",
+        ));
+    let out = sevra()
+        .args([
+            "secrets",
+            "quarantine",
+            t.path().to_str().unwrap(),
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", all_output(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for field in [
+        "\"marked\"",
+        "\"closureMarked\"",
+        "\"alreadyCovered\"",
+        "\"warnings\"",
+        "\"total\"",
+        "\"note\"",
+    ] {
+        assert!(stdout.contains(field), "missing {field}: {stdout}");
+    }
+    assert!(stdout.contains("creds.md"), "names the file: {stdout}");
+    assert!(stdout.contains("forward-only"), "the note field: {stdout}");
+    assert!(
+        !t.path().join(".sevralocal").exists(),
+        "--dry-run writes nothing"
+    );
+}
+
+#[test]
+fn secrets_quarantine_never_marks_the_hub_files() {
+    // A hit inside DB.md or assets.jsonl is an edit case: they ride every
+    // push, so marking them would manufacture the structural refusal.
+    let key = format!("AKIA{}", "H".repeat(16));
+    let slack = format!("xoxb-{}", "8".repeat(10));
+    let t = store_dir(&[
+        ("DB.md", &format!("config with {key}")),
+        ("assets.jsonl", &format!("{{\"note\":\"{slack}\"}}")),
+        ("a.md", "clean"),
+    ]);
+    let out = sevra()
+        .args(["secrets", "quarantine", t.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", all_output(&out));
+    let all = all_output(&out);
+    assert!(all.contains("nothing new to mark"), "{all}");
+    assert!(
+        all.contains("rides every push") && all.contains("never marked"),
+        "warns about the must-ride files: {all}"
+    );
+    assert!(
+        !all.contains(&key) && !all.contains(&slack),
+        "no echo: {all}"
+    );
+    assert!(
+        !t.path().join(".sevralocal").exists(),
+        "must-ride hits alone create no list"
+    );
+}
+
+#[test]
+fn secrets_quarantine_redacts_filename_secrets_but_writes_the_exact_path() {
+    let token = format!("ghp_{}", "b".repeat(36));
+    let t = store_dir(&[(&format!("{token}.md"), "clean content")]);
+    let out = sevra()
+        .args(["secrets", "quarantine", t.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", all_output(&out));
+    let all = all_output(&out);
+    assert!(
+        !all.contains(&token),
+        "the token filename must never print: {all}"
+    );
+    assert!(
+        all.contains('\u{2026}'),
+        "shows the redacted spelling: {all}"
+    );
+    assert!(
+        all.contains("the filename itself is the secret") && all.contains("consider renaming"),
+        "warns about the name: {all}"
+    );
+    // The list needs the EXACT path to match the file — it lives in the
+    // store and never uploads.
+    let list = std::fs::read_to_string(t.path().join(".sevralocal")).unwrap();
+    assert_eq!(list, format!("{token}.md\n"));
+    // And the marked file is now covered: a scoped scan reads clean.
+    sevra()
+        .args(["secrets", "scan", t.path().to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+fn secrets_quarantine_warns_when_the_manifest_names_kept_home_files() {
+    // The manifest rides every push; entries under kept-home paths are the
+    // operator's deliberate edit. Malformed JSONL lines are tolerated.
+    let t = store_dir(&[
+        ("a.md", "clean"),
+        (
+            "assets.jsonl",
+            "{\"path\":\"private/img.png\",\"sha256\":\"x\"}\nnot json at all\n{\"path\":\"public/img.png\"}\n",
+        ),
+        (".sevralocal", "private/**\n"),
+    ]);
+    let out = sevra()
+        .args(["secrets", "quarantine", t.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", all_output(&out));
+    let all = all_output(&out);
+    assert!(
+        all.contains("assets.jsonl names private/img.png") && all.contains("deliberate edit"),
+        "warns with the named path: {all}"
+    );
+    assert!(
+        !all.contains("public/img.png"),
+        "a riding asset is no warning: {all}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(t.path().join(".sevralocal")).unwrap(),
+        "private/**\n",
+        "warnings are reported, never acted on"
+    );
+}
+
+// The closure tests fake `dbmd` with a shell script on PATH (unix-only, the
+// same #[cfg(unix)] posture as the store's symlink test).
+#[cfg(unix)]
+fn fake_dbmd(bin_dir: &std::path::Path, emit_json: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = bin_dir.join("dbmd");
+    // `echo` is a sh builtin: the script works even though PATH holds only
+    // the fake bin dir (the canned JSON carries no quotes echo would eat).
+    std::fs::write(&path, format!("#!/bin/sh\necho '{emit_json}'\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn secrets_quarantine_closure_marks_the_linked_component() {
+    let key = format!("AKIA{}", "J".repeat(16));
+    let t = store_dir(&[
+        ("creds.md", &format!("k: {key}")),
+        ("linked.md", "clean, but attached"),
+        ("unrelated.md", "clean and free"),
+    ]);
+    let bin = tempfile::tempdir().unwrap();
+    fake_dbmd(
+        bin.path(),
+        r#"{"store":".","files":[{"path":"creds.md","links":["linked.md"]},{"path":"linked.md","links":[]},{"path":"unrelated.md","links":[]}],"summary":{"files":3,"sources":0,"records":3}}"#,
+    );
+    let out = sevra()
+        .args([
+            "secrets",
+            "quarantine",
+            t.path().to_str().unwrap(),
+            "--closure",
+        ])
+        .env("PATH", bin.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", all_output(&out));
+    let all = all_output(&out);
+    assert!(
+        all.contains("closure added 1 linked file(s)") && all.contains("linked.md"),
+        "prints every path closure adds: {all}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(t.path().join(".sevralocal")).unwrap(),
+        "creds.md\nlinked.md\n",
+        "hit + its component, sorted; the free file stays"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn secrets_quarantine_closure_without_dbmd_fails_before_writing() {
+    let key = format!("AKIA{}", "K".repeat(16));
+    let t = store_dir(&[("creds.md", &format!("k: {key}"))]);
+    let empty_bin = tempfile::tempdir().unwrap();
+    sevra()
+        .args([
+            "secrets",
+            "quarantine",
+            t.path().to_str().unwrap(),
+            "--closure",
+        ])
+        .env("PATH", empty_bin.path())
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("--closure needs dbmd")
+                .and(predicate::str::contains("www.sevrahq.com/install")),
+        );
+    assert!(
+        !t.path().join(".sevralocal").exists(),
+        "a missing dbmd must fail before anything is written"
+    );
 }
 
 #[test]

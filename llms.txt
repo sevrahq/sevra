@@ -40,7 +40,14 @@ Commands:
                                           # replacement. Preflights the hub limits locally
                                           # (256 MiB pack / 512 MiB raw / 100k files, largest
                                           # files listed) and refuses secret-shaped content or
-                                          # file names unless --allow-secrets.
+                                          # file names unless --allow-secrets. A `.sevralocal`
+                                          # at the store root (one path/glob per line, `#`
+                                          # comments) keeps matching files HOME: part of the
+                                          # brain, never part of the cargo; the list never
+                                          # uploads either, and while it has entries derived
+                                          # index.md catalogs stay home too. DB.md and
+                                          # assets.jsonl must always ride (a list covering
+                                          # them is refused).
     query <brain|--brain <ref>> [text] [--type --layer --meta-type --tag --where k=v --limit N]
     get <brain> <id|path> | graph <brain> <path> [--dir in|out|both]
     mcp                                   # stdio MCP server over the read surface
@@ -55,6 +62,20 @@ Commands:
                                           # pipe it: printf %s "$V" | sevra secrets set b NAME
                                           # (one trailing newline trimmed); NEVER argv,
                                           # never echoed. NAME: ^[A-Z][A-Z0-9_]{0,63}$
+    secrets scan [dir]                    # push's secret scan, read-only, offline: exit 1 on
+                                          # matches ({"secretHits":[{path,kind,inPath}],
+                                          # "total", "error"}), 0 clean; values never shown;
+                                          # honors .sevralocal (kept-home files never ride)
+    secrets quarantine [dir] [--dry-run] [--closure]
+                                          # keep hit files home: scans the FULL store and
+                                          # appends each hit file's exact path to .sevralocal
+                                          # (created if absent; idempotent). Forward-only:
+                                          # earlier snapshots keep what already rode; marking
+                                          # affects the NEXT push only. --closure also marks
+                                          # wiki-linked files (needs dbmd). Never marks DB.md
+                                          # or assets.jsonl (they ride; edit those). --json:
+                                          # {marked, closureMarked, alreadyCovered, warnings,
+                                          # total, note}
     inbox list|drain <brain>              # drain prints full JSON (BYO-agent read half)
     export <brain> [dir]                  # your brain back on disk
     validate [dir]                        # shells `dbmd validate --all`

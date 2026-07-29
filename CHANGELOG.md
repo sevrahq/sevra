@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.2.5 — 2026-07-28
+
+Secrets get a place that is not the hub. 0.2.4's scan left two exits — edit
+the files or `--allow-secrets` — and both punish keeping real credentials in
+the brain. 0.2.5 adds the right one: keep them home. Files marked kept-home
+are part of the brain but never part of the cargo.
+
+- New: **`.sevralocal` — the store's local scope.** One store-relative path
+  or glob per line at the store root (`#` comments and blank lines skipped;
+  matching is byte-wise and case-sensitive against the same POSIX paths the
+  push walk computes). Matching files are excluded from the push and counted
+  separately: "N file(s) kept home (.sevralocal)". They do not count toward
+  the hub's snapshot limits — they never ride. The list itself never uploads
+  (the walk's dot-skip, now pinned by a test). While the list has at least
+  one effective entry, every derived `index.md` catalog stays home too:
+  catalogs carry every file's name/title/summary, kept-home ones included,
+  and the hub rebuilds its own from what rides. `DB.md` and `assets.jsonl`
+  must always ride: a list whose compiled set covers either — which also
+  catches broad globs like `**` — refuses push and quarantine both; a secret
+  inside those two is an edit case the scanner already flags.
+- New: **`sevra secrets scan [dir]`** — push's secret scan as a read-only,
+  offline report (no login): same patterns, same refusal shape (`--json`
+  carries `secretHits` capped at 20, `total`, and the `error` string), exit
+  1 on matches and 0 clean. Matched values are never shown. It honors
+  `.sevralocal`, reporting exactly what a push would carry.
+- New: **`sevra secrets quarantine [dir]`** — scan the FULL store (kept-home
+  files included) and append each hit file's exact path to `.sevralocal`,
+  creating it when absent; existing lines are preserved verbatim, new
+  entries append sorted, single trailing newline. Idempotent — a re-run
+  appends nothing and exits 0; `--dry-run` previews. Every run states the
+  forward-only truth: files that already rode a push remain in earlier
+  snapshots; marking removes them from the next snapshot and erases
+  nothing. It warns — and never acts — when the FILENAME is the secret
+  (consider renaming; a future feed removal would record the name, path
+  shown redacted) and when the asset manifest names kept-home files (the
+  manifest rides; removing entries is the operator's deliberate edit). It
+  never marks `DB.md` or `assets.jsonl`. The only file sevra ever edits is
+  `.sevralocal`, and only by appending.
+- New: **`quarantine --closure`** — also keep home every file connected to a
+  marked one through wiki-links (the undirected component over the content
+  graph from `dbmd emit --json`; catalogs and the store config are never
+  bridges, so nothing over-marks through derived files). Requires `dbmd`; a
+  missing binary fails up front, before anything is written. Every path
+  closure adds is printed. Works with `--dry-run`.
+- `push` integration: the secret refusal now names the three exits in
+  order — `sevra secrets quarantine <dir>` (keep these files home) · edit
+  the files yourself · `--allow-secrets` (push them verbatim). A shrink
+  refusal (hub 409) appends the line that explains kept-home documents. A
+  store where everything is kept home refuses with the count instead of the
+  bare empty-store error. `push --help` documents `.sevralocal`.
+- New dependency: globset (MIT/Unlicense, the regex family; adds bstr) for
+  `.sevralocal` matching; recorded in THIRD_PARTY_NOTICES.
+
 ## 0.2.4 — 2026-07-28
 
 Fixes from the first dogfood onboarding (2026-07-28), against the hub's new

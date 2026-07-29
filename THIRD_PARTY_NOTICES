@@ -12,11 +12,11 @@ option):
 
 MIT and/or Apache-2.0 (the bulk of the tree)
   adler2, aho-corasick, anstream, anstyle, anstyle-parse, anstyle-query,
-  anstyle-wincon, base64, block-buffer, cc, cfg-if, clap, clap_builder,
+  anstyle-wincon, base64, block-buffer, bstr, cc, cfg-if, clap, clap_builder,
   clap_derive, clap_lex, colorchoice, cpufeatures, crc32fast, crypto-common,
   curve25519-dalek-derive, digest, displaydoc, ed25519, fiat-crypto,
-  find-msvc-tools, flate2, form_urlencoded, generic-array, getrandom, heck,
-  home, idna, idna_adapter, is_terminal_polyfill, itoa, libc, log, memchr,
+  find-msvc-tools, flate2, form_urlencoded, generic-array, getrandom, globset,
+  heck, home, idna, idna_adapter, is_terminal_polyfill, itoa, libc, log, memchr,
   miniz_oxide, once_cell, once_cell_polyfill, percent-encoding, proc-macro2,
   quote, regex, regex-automata, regex-syntax, rustc_version, rustls-pki-types,
   semver, serde, serde_core, serde_derive, serde_json, sha2, shlex, signature,
@@ -50,7 +50,7 @@ Zlib
   miniz_oxide (multi-licensed; also MIT/Apache-2.0)
 
 Unlicense
-  aho-corasick, memchr (multi-licensed; also MIT)
+  aho-corasick, globset, memchr (multi-licensed; also MIT)
 
 Apache-2.0 WITH LLVM-exception
   wasi (multi-licensed; also MIT/Apache-2.0)

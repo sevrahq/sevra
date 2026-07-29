@@ -5,6 +5,7 @@
 //! its library — Sevra's product tool consumes the standard through the same
 //! public binary any third party gets.
 
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -14,9 +15,10 @@ use sha2::{Digest, Sha256};
 
 use crate::config::{self, Config, DEFAULT_HUB};
 use crate::hub::{ensure_ok, get_presigned, put_presigned, request, HubResponse, NOT_LOGGED_IN};
+use crate::local;
 use crate::output::{fail, json_mode, note, out, usage_fail};
-use crate::scan::{scan_store, SecretHit};
-use crate::store::{build_pack, read_store, StoreError};
+use crate::scan::{redact_path, scan_store, SecretHit};
+use crate::store::{build_pack, read_store, read_store_unscoped, Store, StoreError, WalkStats};
 
 /// The hub's poll cadence when it does not say otherwise (it always does).
 const POLL_INTERVAL_SECS: u64 = 5;
@@ -913,15 +915,15 @@ fn fail_snapshot_limit(problem: &str, largest: &[(String, u64)], data: Value) ->
     fail(&msg, Some(data));
 }
 
-/// The secret-scan refusal: each hit as `path — kind`, never a matched value
-/// (paths that themselves match are already redacted by the scanner).
-fn fail_secret_hits(hits: &[SecretHit]) -> ! {
-    const SHOWN: usize = 20;
-    let mut msg = format!(
-        "push refused: {} match(es) for known secret formats in the store (matched values are never shown):",
-        hits.len()
-    );
-    for hit in hits.iter().take(SHOWN) {
+/// How many secret hits a refusal shows before eliding.
+const SECRET_HITS_SHOWN: usize = 20;
+
+/// The hit list block shared by push's refusal and `secrets scan`: each hit
+/// as `path — kind`, never a matched value (paths that themselves match are
+/// already redacted by the scanner), capped at `SECRET_HITS_SHOWN`.
+fn secret_hits_block(hits: &[SecretHit]) -> String {
+    let mut msg = String::new();
+    for hit in hits.iter().take(SECRET_HITS_SHOWN) {
         let place = if hit.in_path {
             " (in the file's name)"
         } else {
@@ -929,23 +931,39 @@ fn fail_secret_hits(hits: &[SecretHit]) -> ! {
         };
         msg.push_str(&format!("\n  {} — {}{place}", hit.path, hit.kind));
     }
-    if hits.len() > SHOWN {
-        msg.push_str(&format!("\n  … and {} more", hits.len() - SHOWN));
+    if hits.len() > SECRET_HITS_SHOWN {
+        msg.push_str(&format!(
+            "\n  … and {} more",
+            hits.len() - SECRET_HITS_SHOWN
+        ));
     }
-    msg.push_str(
-        "\nrotate anything that ever lived here; keep live secrets in a password manager and references to them in the brain. If this store must ship as-is, push again with --allow-secrets.",
+    msg
+}
+
+/// The machine half of the same refusal — one shape for push and scan.
+fn secret_hits_data(hits: &[SecretHit]) -> Value {
+    json!({
+        "secretHits": hits
+            .iter()
+            .take(SECRET_HITS_SHOWN)
+            .map(|h| json!({ "path": h.path, "kind": h.kind, "inPath": h.in_path }))
+            .collect::<Vec<_>>(),
+        "total": hits.len(),
+    })
+}
+
+/// The push secret-scan refusal, naming the three exits in order: keep the
+/// files home, edit them, or ship them anyway.
+fn fail_secret_hits(hits: &[SecretHit], dir: &str) -> ! {
+    let mut msg = format!(
+        "push refused: {} match(es) for known secret formats in the store (matched values are never shown):",
+        hits.len()
     );
-    fail(
-        &msg,
-        Some(json!({
-            "secretHits": hits
-                .iter()
-                .take(SHOWN)
-                .map(|h| json!({ "path": h.path, "kind": h.kind, "inPath": h.in_path }))
-                .collect::<Vec<_>>(),
-            "total": hits.len(),
-        })),
-    );
+    msg.push_str(&secret_hits_block(hits));
+    msg.push_str(&format!(
+        "\nrotate anything that ever lived here; keep live secrets in a password manager and references to them in the brain.\nthree ways out, in order: `sevra secrets quarantine {dir}` (keep these files home) · edit the files yourself · `--allow-secrets` (push them verbatim)"
+    ));
+    fail(&msg, Some(secret_hits_data(hits)));
 }
 
 fn body_code(r: &HubResponse) -> Option<&str> {
@@ -958,8 +976,9 @@ fn body_code(r: &HubResponse) -> Option<&str> {
 /// `ensure_ok` for the push verbs, with the shrink guard mapped: without
 /// --force, a 409 `shrink_refused` (the hub protecting a brain from a smaller
 /// replacement) prints the hub's message verbatim plus the one hint that
-/// unblocks an intended replacement.
-fn ensure_push_ok(r: HubResponse, what: &str, force: bool) -> Value {
+/// unblocks an intended replacement — and, when the walk kept files home,
+/// the line that explains part of the difference.
+fn ensure_push_ok(r: HubResponse, what: &str, force: bool, kept_home: usize) -> Value {
     if !force && r.status == 409 && body_code(&r) == Some("shrink_refused") {
         let server = r
             .body
@@ -968,12 +987,15 @@ fn ensure_push_ok(r: HubResponse, what: &str, force: bool) -> Value {
             .and_then(|e| e.as_str())
             .unwrap_or("the hub refused to shrink the brain")
             .to_string();
-        fail(
-            &format!(
-                "{what} failed (HTTP 409): {server}\nretry with --force if the replacement is intended"
-            ),
-            r.body,
+        let mut msg = format!(
+            "{what} failed (HTTP 409): {server}\nretry with --force if the replacement is intended"
         );
+        if kept_home > 0 {
+            msg.push_str(&format!(
+                "\n({kept_home} document(s) are kept home by .sevralocal and not part of this push)"
+            ));
+        }
+        fail(&msg, r.body);
     }
     ensure_ok(r, what)
 }
@@ -981,7 +1003,7 @@ fn ensure_push_ok(r: HubResponse, what: &str, force: bool) -> Value {
 /// Commit an uploaded pack. A 507 `hub_scratch_exhausted` means the pack IS
 /// uploaded and only the hub's unpack scratch is busy — retry the commit
 /// after a pause, never the upload.
-fn commit_pack(cfg: &Config, brain: &str, commit: &Value, force: bool) -> Value {
+fn commit_pack(cfg: &Config, brain: &str, commit: &Value, force: bool, kept_home: usize) -> Value {
     let mut attempt: u64 = 0;
     loop {
         let resp = request(
@@ -1000,15 +1022,20 @@ fn commit_pack(cfg: &Config, brain: &str, commit: &Value, force: bool) -> Value 
             std::thread::sleep(std::time::Duration::from_secs(pause));
             continue;
         }
-        return ensure_push_ok(resp, "commit pack", force);
+        return ensure_push_ok(resp, "commit pack", force, kept_home);
     }
 }
 
-pub fn push(cfg: &Config, dir: &str, brain: &str, force: bool, allow_secrets: bool) {
-    if !Path::new(dir).exists() {
-        fail(&format!("store directory not found: {dir}"), None);
-    }
-    let (store, stats) = match read_store(dir, MAX_STORE_BYTES) {
+/// The shared store read for push, scan, and quarantine — every store error
+/// maps to the same refusal push uses. `scoped` reads what a push would
+/// carry (`.sevralocal` honored); unscoped is quarantine's full view.
+fn read_store_checked(dir: &str, scoped: bool) -> (Store, WalkStats) {
+    let result = if scoped {
+        read_store(dir, MAX_STORE_BYTES)
+    } else {
+        read_store_unscoped(dir, MAX_STORE_BYTES)
+    };
+    match result {
         Ok(pair) => pair,
         Err(StoreError::OverCap(stats)) => fail_snapshot_limit(
             &format!(
@@ -1020,9 +1047,28 @@ pub fn push(cfg: &Config, dir: &str, brain: &str, force: bool, allow_secrets: bo
             &stats.largest,
             json!({ "limitBytes": MAX_STORE_BYTES, "storeBytes": stats.bytes, "files": stats.files }),
         ),
+        Err(StoreError::Scope(msg)) => fail(&msg, None),
         Err(StoreError::Io(e)) => fail(&format!("could not read {dir}: {e}"), None),
-    };
+    }
+}
+
+pub fn push(cfg: &Config, dir: &str, brain: &str, force: bool, allow_secrets: bool) {
+    if !Path::new(dir).exists() {
+        fail(&format!("store directory not found: {dir}"), None);
+    }
+    let (store, stats) = read_store_checked(dir, true);
     if store.files.is_empty() {
+        let kept = stats.kept_home + stats.catalogs_kept;
+        if kept > 0 {
+            fail(
+                &format!(
+                    "no .md files to push under {dir} — all {kept} file(s) are kept home (.sevralocal)"
+                ),
+                Some(
+                    json!({ "keptHome": stats.kept_home, "catalogsKeptHome": stats.catalogs_kept }),
+                ),
+            );
+        }
         fail(&format!("no .md files under {dir}"), None);
     }
     if store.files.len() > MAX_STORE_FILES {
@@ -1041,7 +1087,7 @@ pub fn push(cfg: &Config, dir: &str, brain: &str, force: bool, allow_secrets: bo
     if !allow_secrets {
         let hits = scan_store(&store);
         if !hits.is_empty() {
-            fail_secret_hits(&hits);
+            fail_secret_hits(&hits, dir);
         }
     }
     let mut payload = serde_json::to_value(&store).unwrap();
@@ -1049,6 +1095,9 @@ pub fn push(cfg: &Config, dir: &str, brain: &str, force: bool, allow_secrets: bo
         payload["allow_shrink"] = json!(true);
     }
     let file_count = store.files.len();
+    // Everything the walk kept home — the honest count when the hub's shrink
+    // guard asks where the missing documents went.
+    let kept_total = stats.kept_home + stats.catalogs_kept;
     let payload_bytes = payload.to_string().len();
     let r = if payload_bytes <= MAX_JSON_PUSH_BYTES {
         ensure_push_ok(
@@ -1061,6 +1110,7 @@ pub fn push(cfg: &Config, dir: &str, brain: &str, force: bool, allow_secrets: bo
             ),
             "push",
             force,
+            kept_total,
         )
     } else {
         let pack = build_pack(&store)
@@ -1097,20 +1147,38 @@ pub fn push(cfg: &Config, dir: &str, brain: &str, force: bool, allow_secrets: bo
         if force {
             commit["allow_shrink"] = json!(true);
         }
-        commit_pack(cfg, brain, &commit, force)
+        commit_pack(cfg, brain, &commit, force, kept_total)
     };
     let s = r.get("indexed").cloned().unwrap_or(json!({}));
     let n = |k: &str| s.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
-    out(
-        &format!(
-            "pushed {file_count} files → indexed {} docs, {} edges ({} broken), {} assets",
-            n("documents"),
-            n("edges"),
-            n("brokenEdges"),
-            n("assets")
-        ),
-        Some(r),
+    let mut human = format!(
+        "pushed {file_count} files → indexed {} docs, {} edges ({} broken), {} assets",
+        n("documents"),
+        n("edges"),
+        n("brokenEdges"),
+        n("assets")
     );
+    // What stayed home, reported alongside what rode.
+    let mut data = r;
+    if stats.kept_home > 0 {
+        human.push_str(&format!(
+            "\n{} file(s) kept home (.sevralocal)",
+            stats.kept_home
+        ));
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert("keptHome".into(), json!(stats.kept_home));
+        }
+    }
+    if stats.catalogs_kept > 0 {
+        human.push_str(&format!(
+            "\n{} derived catalog(s) kept home (the hub rebuilds its own)",
+            stats.catalogs_kept
+        ));
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert("catalogsKeptHome".into(), json!(stats.catalogs_kept));
+        }
+    }
+    out(&human, Some(data));
 }
 
 // --- query / get / graph -----------------------------------------------------
@@ -1992,6 +2060,329 @@ pub fn secrets_delete(cfg: &Config, brain: &str, name: &str) {
     );
 }
 
+// --- secrets scan / quarantine (the local store, no hub) -----------------------
+//
+// The other half of the vault story: secrets that are FILES in the store.
+// `scan` is push's secret gate as a read-only report; `quarantine` gives the
+// third exit — keep the files home in `.sevralocal` instead of shipping or
+// editing them. Both are offline and need no credential. The one file sevra
+// ever edits is `.sevralocal`, and only by appending.
+
+/// The forward-only truth, stated on every quarantine run.
+const FORWARD_ONLY_NOTE: &str = "kept-home is forward-only — files that already rode a push remain in earlier snapshots; marking removes them from the next snapshot and erases nothing";
+
+/// `secrets scan [dir]` — the push secret scan, read-only: report what a
+/// push of <dir> would refuse on, in exactly the push-refusal shape. Exit 1
+/// on matches, 0 on a clean store; matched values are never shown. Honors
+/// `.sevralocal`: kept-home files never ride, so they are not scanned here
+/// (quarantine's full view is the one that sees them).
+pub fn secrets_scan(dir: Option<String>) {
+    let dir = dir.unwrap_or_else(|| ".".into());
+    if !Path::new(&dir).is_dir() {
+        fail(&format!("directory not found: {dir}"), None);
+    }
+    let (store, stats) = read_store_checked(&dir, true);
+    if stats.kept_home > 0 {
+        note(&format!(
+            "{} file(s) kept home (.sevralocal) — not scanned; they never ride a push",
+            stats.kept_home
+        ));
+    }
+    let hits = scan_store(&store);
+    if hits.is_empty() {
+        out(
+            &format!(
+                "no matches for known secret formats across {} file(s)",
+                stats.files
+            ),
+            Some(json!({ "secretHits": [], "total": 0 })),
+        );
+        return;
+    }
+    let mut msg = format!(
+        "{} match(es) for known secret formats in the store (matched values are never shown):",
+        hits.len()
+    );
+    msg.push_str(&secret_hits_block(&hits));
+    msg.push_str(&format!(
+        "\nrotate anything that ever lived here; keep live secrets in a password manager and references to them in the brain.\nkeep the files home instead of shipping them: `sevra secrets quarantine {dir}` — or edit them yourself"
+    ));
+    fail(&msg, Some(secret_hits_data(&hits)));
+}
+
+/// `secrets quarantine [dir]` — keep secret-bearing files home: scan the
+/// FULL store (kept-home files included — that is what `alreadyCovered`
+/// counts) and append each hit file's exact path to `.sevralocal`, creating
+/// it when absent. Idempotent; `--dry-run` previews; `--closure` also marks
+/// the files connected to a marked one through wiki-links (via `dbmd emit`).
+/// `DB.md` and `assets.jsonl` are never marked — they ride every push, so a
+/// secret inside them stays an edit case (warned, not acted on).
+pub fn secrets_quarantine(dir: Option<String>, dry_run: bool, closure: bool) {
+    let dir = dir.unwrap_or_else(|| ".".into());
+    if !Path::new(&dir).is_dir() {
+        fail(&format!("directory not found: {dir}"), None);
+    }
+    // Load the scope directly (not through the walk): quarantine needs the
+    // verbatim text to preserve, and a structurally invalid `.sevralocal`
+    // refuses here exactly as push refuses.
+    let scope = local::load(Path::new(&dir)).unwrap_or_else(|msg| fail(&msg, None));
+    let covered = |p: &str| scope.as_ref().is_some_and(|s| s.keeps_home(p));
+    let (store, _stats) = read_store_checked(&dir, false);
+    let hits = scan_store(&store);
+
+    // Unique hit files: exact path → shown (redacted) spelling.
+    let mut hit_files: BTreeMap<String, String> = BTreeMap::new();
+    for hit in &hits {
+        hit_files
+            .entry(hit.store_path.clone())
+            .or_insert_with(|| hit.path.clone());
+    }
+    let mut warnings: Vec<(&'static str, String)> = Vec::new();
+    // Warning: the filename itself is the secret. Reported per file, never
+    // acted on — renaming is the operator's move (and the path is already
+    // shown redacted by the scanner).
+    let in_path_files: BTreeSet<&String> = hits
+        .iter()
+        .filter(|h| h.in_path)
+        .map(|h| &h.store_path)
+        .collect();
+    for exact in &in_path_files {
+        warnings.push(("filename_secret", hit_files[*exact].clone()));
+    }
+
+    let mut marked: Vec<(String, String)> = Vec::new(); // (exact, shown)
+    let mut already_covered = 0usize;
+    for (exact, shown) in &hit_files {
+        if local::MUST_RIDE.contains(&exact.as_str()) {
+            warnings.push(("must_ride", shown.clone()));
+        } else if covered(exact) {
+            already_covered += 1;
+        } else {
+            marked.push((exact.clone(), shown.clone()));
+        }
+    }
+
+    // --closure: computed BEFORE any write — a missing dbmd fails up front.
+    let closure_marked: Vec<String> = if closure {
+        let emit = run_dbmd_emit(&dir);
+        let seeds: BTreeSet<String> = marked.iter().map(|(exact, _)| exact.clone()).collect();
+        closure_component(&emit, &seeds)
+            .into_iter()
+            .filter(|p| {
+                !seeds.contains(p) && !covered(p) && !local::MUST_RIDE.contains(&p.as_str())
+            })
+            .collect() // BTreeSet iteration: already sorted
+    } else {
+        Vec::new()
+    };
+
+    // Warning: the asset manifest rides every push and still names kept-home
+    // files (existing entries and this run's marks alike). Read-only over
+    // the JSONL; malformed lines are tolerated silently.
+    if let Some(assets) = store.assets.as_deref() {
+        let mut named: BTreeSet<String> = BTreeSet::new();
+        for line in assets.lines() {
+            let Ok(v) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let Some(p) = v.get("path").and_then(Value::as_str) else {
+                continue;
+            };
+            let kept = covered(p)
+                || marked.iter().any(|(exact, _)| exact == p)
+                || closure_marked.iter().any(|exact| exact == p);
+            if kept {
+                named.insert(p.to_string());
+            }
+        }
+        for p in named {
+            warnings.push(("manifest_names_kept_home", redact_path(&p)));
+        }
+    }
+    warnings.sort();
+
+    // The write — the only file sevra ever edits, append-only. Exact paths
+    // (escaped where a filename carries glob metacharacters), sorted.
+    let mut new_entries: Vec<String> = marked
+        .iter()
+        .map(|(exact, _)| local::entry_for(exact))
+        .chain(closure_marked.iter().map(|exact| local::entry_for(exact)))
+        .collect();
+    new_entries.sort();
+    if !dry_run && !new_entries.is_empty() {
+        let raw = scope.as_ref().map(|s| s.raw()).unwrap_or("");
+        let body = local::append_entries(raw, &new_entries);
+        std::fs::write(Path::new(&dir).join(local::FILE_NAME), body)
+            .unwrap_or_else(|e| fail(&format!("could not write {}: {e}", local::FILE_NAME), None));
+    }
+
+    // Report. Shown spellings only (redacted wherever a path matched).
+    let mut marked_shown: Vec<String> = marked.iter().map(|(_, shown)| shown.clone()).collect();
+    marked_shown.sort();
+    let closure_shown: Vec<String> = closure_marked.iter().map(|p| redact_path(p)).collect();
+    let mut human = if hits.is_empty() {
+        "no matches for known secret formats — nothing to keep home".to_string()
+    } else if marked.is_empty() {
+        "nothing new to mark".to_string()
+    } else {
+        let verb = if dry_run {
+            "would keep home"
+        } else {
+            "kept home"
+        };
+        let mut s = format!("{verb} (.sevralocal): {} file(s)", marked_shown.len());
+        for shown in &marked_shown {
+            s.push_str(&format!("\n  {shown}"));
+        }
+        s
+    };
+    if !closure_shown.is_empty() {
+        let verb = if dry_run { "would add" } else { "added" };
+        human.push_str(&format!(
+            "\nclosure {verb} {} linked file(s):",
+            closure_shown.len()
+        ));
+        for shown in &closure_shown {
+            human.push_str(&format!("\n  {shown}"));
+        }
+    }
+    if already_covered > 0 {
+        human.push_str(&format!(
+            "\n{already_covered} hit file(s) already covered by .sevralocal"
+        ));
+    }
+    for (kind, path) in &warnings {
+        let line = match *kind {
+            "filename_secret" => format!(
+                "warning: {path} — the filename itself is the secret — consider renaming; a future feed removal would record the name"
+            ),
+            "must_ride" => format!(
+                "warning: {path} carries a match but rides every push (store config / asset manifest) — never marked; edit it, the scanner keeps flagging it"
+            ),
+            _ => format!(
+                "warning: assets.jsonl names {path} under a kept-home entry — the manifest rides and carries these names; removing entries is your deliberate edit"
+            ),
+        };
+        human.push_str(&format!("\n{line}"));
+    }
+    if !json_mode() {
+        note(FORWARD_ONLY_NOTE);
+    }
+    out(
+        &human,
+        Some(json!({
+            "marked": marked_shown,
+            "closureMarked": closure_shown,
+            "alreadyCovered": already_covered,
+            "warnings": warnings
+                .iter()
+                .map(|(kind, path)| json!({ "kind": kind, "path": path }))
+                .collect::<Vec<_>>(),
+            "total": hits.len(),
+            "note": FORWARD_ONLY_NOTE,
+        })),
+    );
+}
+
+/// `--closure`'s graph source: `dbmd emit --json` run in the store. A
+/// missing dbmd fails up front — before anything is written — with the
+/// install hint; so does a failed or unparseable emit. Third-party error
+/// text passes through the secret redactor before it is shown.
+fn run_dbmd_emit(dir: &str) -> Value {
+    let output = match Command::new("dbmd")
+        .args(["emit", "--json"])
+        .current_dir(dir)
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => fail(
+            &format!(
+                "--closure needs dbmd and it could not run (is it installed? https://www.sevrahq.com/install): {e}"
+            ),
+            None,
+        ),
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let first: String = stderr
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .chars()
+            .take(200)
+            .collect();
+        fail(
+            &format!(
+                "--closure: `dbmd emit` failed in {dir}: {}",
+                redact_path(first.trim())
+            ),
+            None,
+        );
+    }
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        fail(
+            &format!("--closure: `dbmd emit --json` produced unparseable output: {e}"),
+            None,
+        )
+    })
+}
+
+/// The undirected reachability component of `seeds` over the content graph
+/// `dbmd emit --json` describes (`files[].links`; targets arrive normalized
+/// with `.md` appended). Nodes are the emitted files MINUS the root `DB.md`:
+/// emit does include the store config, but it links broadly and must never
+/// bridge otherwise-unconnected components (derived catalogs and the log are
+/// already absent from emit, so over-marking through them cannot happen
+/// either). An edge exists only between two emitted files — a dangling
+/// target is nobody's bridge. Returns the component, seeds included.
+fn closure_component(emit: &Value, seeds: &BTreeSet<String>) -> BTreeSet<String> {
+    let files = emit
+        .get("files")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let nodes: BTreeSet<&str> = files
+        .iter()
+        .filter_map(|f| f.get("path").and_then(Value::as_str))
+        .filter(|p| *p != "DB.md")
+        .collect();
+    let mut adj: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for f in &files {
+        let Some(p) = f.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        if p == "DB.md" {
+            continue;
+        }
+        for link in f
+            .get("links")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(t) = link.as_str() else { continue };
+            if t != p && nodes.contains(t) {
+                adj.entry(p).or_default().push(t);
+                adj.entry(t).or_default().push(p);
+            }
+        }
+    }
+    let mut component: BTreeSet<String> = seeds.clone();
+    let mut queue: VecDeque<&str> = nodes
+        .iter()
+        .copied()
+        .filter(|n| seeds.contains(*n))
+        .collect();
+    while let Some(n) = queue.pop_front() {
+        for next in adj.get(n).into_iter().flatten().copied() {
+            if component.insert(next.to_string()) {
+                queue.push_back(next);
+            }
+        }
+    }
+    component
+}
+
 // --- validate (shells dbmd) --------------------------------------------------
 
 pub fn validate(dir: Option<String>) {
@@ -2124,6 +2515,89 @@ mod tests {
         assert!(resolve_query_target(None, None, None)
             .unwrap_err()
             .contains("which brain"));
+    }
+
+    fn emit_of(files: &[(&str, &[&str])]) -> Value {
+        json!({
+            "store": ".",
+            "files": files
+                .iter()
+                .map(|(path, links)| json!({ "path": path, "links": links }))
+                .collect::<Vec<_>>(),
+            "summary": { "files": files.len() },
+        })
+    }
+
+    fn seeds_of(paths: &[&str]) -> BTreeSet<String> {
+        paths.iter().map(|p| p.to_string()).collect()
+    }
+
+    fn sorted(set: BTreeSet<String>) -> Vec<String> {
+        set.into_iter().collect()
+    }
+
+    #[test]
+    fn closure_component_walks_links_undirected() {
+        // a → b ← c: seeding a reaches c THROUGH b against the arrows.
+        let emit = emit_of(&[
+            ("a.md", &["b.md"]),
+            ("b.md", &[]),
+            ("c.md", &["b.md"]),
+            ("d.md", &[]),
+        ]);
+        assert_eq!(
+            sorted(closure_component(&emit, &seeds_of(&["a.md"]))),
+            ["a.md", "b.md", "c.md"],
+            "undirected through b; the isolated d stays out"
+        );
+    }
+
+    #[test]
+    fn closure_component_never_bridges_through_db_md_or_dangling_targets() {
+        // DB.md links half the store — it must not connect components. Two
+        // files sharing only a DANGLING target are not connected either.
+        let emit = emit_of(&[
+            ("DB.md", &["a.md", "d.md"]),
+            ("a.md", &["DB.md"]),
+            ("d.md", &[]),
+            ("e.md", &["ghost.md"]),
+            ("f.md", &["ghost.md"]),
+        ]);
+        assert_eq!(
+            sorted(closure_component(&emit, &seeds_of(&["a.md"]))),
+            ["a.md"],
+            "DB.md is not a node, so it bridges nothing"
+        );
+        assert_eq!(
+            sorted(closure_component(&emit, &seeds_of(&["e.md"]))),
+            ["e.md"],
+            "a dangling target is nobody's bridge"
+        );
+    }
+
+    #[test]
+    fn closure_component_keeps_unknown_seeds_and_survives_self_links() {
+        let emit = emit_of(&[("g.md", &["g.md", "h.md"]), ("h.md", &[])]);
+        // A seed emit never saw (e.g. a root-level hit file outside the
+        // sources/records layers) rides through untouched.
+        assert_eq!(
+            sorted(closure_component(&emit, &seeds_of(&["outside.md"]))),
+            ["outside.md"]
+        );
+        // A self-link is ignored; the real edge still walks.
+        assert_eq!(
+            sorted(closure_component(&emit, &seeds_of(&["g.md"]))),
+            ["g.md", "h.md"]
+        );
+    }
+
+    #[test]
+    fn closure_component_tolerates_shapeless_emit_json() {
+        assert_eq!(
+            sorted(closure_component(&json!({}), &seeds_of(&["a.md"]))),
+            ["a.md"],
+            "no files array: the seeds are the component"
+        );
     }
 
     #[test]

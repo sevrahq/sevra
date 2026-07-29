@@ -1,7 +1,9 @@
 //! Local db.md store read for `push`: walk a directory, collect `.md` files
 //! (relative POSIX paths) + an optional `assets.jsonl`, following symlinks with
 //! cycle protection (Obsidian-style vaults symlink shared folders), skipping
-//! dotfiles. Mirrors the TS CLI's readStoreFiles.
+//! dotfiles. Mirrors the TS CLI's readStoreFiles. A `.sevralocal` at the
+//! store root (see `crate::local`) keeps matching files home: excluded from
+//! the collected store, counted separately in the stats.
 
 use std::collections::HashSet;
 use std::fs;
@@ -9,6 +11,8 @@ use std::io::{Cursor, Write};
 use std::path::Path;
 
 use serde::Serialize;
+
+use crate::local::LocalScope;
 
 #[derive(Serialize)]
 pub struct StoreFile {
@@ -68,6 +72,14 @@ pub struct WalkStats {
     /// The largest counted files (path, bytes), descending, at most
     /// `LARGEST_TRACKED`.
     pub largest: Vec<(String, u64)>,
+    /// Files `.sevralocal` kept home: excluded from the collected store AND
+    /// from every limit total above — a kept-home file never rides, so it
+    /// never counts toward the hub's snapshot caps.
+    pub kept_home: usize,
+    /// Derived `index.md` catalogs excluded because the local scope is
+    /// active — catalogs carry every file's name/title/summary, kept-home
+    /// files included, and the hub rebuilds its own from what rides.
+    pub catalogs_kept: usize,
 }
 
 #[derive(Debug)]
@@ -75,6 +87,10 @@ pub enum StoreError {
     /// The store's counted files exceed the byte cap. The walk finished
     /// metadata-only past the cap, so the stats are the real totals.
     OverCap(WalkStats),
+    /// The store's `.sevralocal` is unreadable, uncompilable, or covers a
+    /// must-ride hub file. The message is complete and never echoes entry
+    /// bytes that could themselves be a secret.
+    Scope(String),
     Io(std::io::Error),
 }
 
@@ -115,6 +131,7 @@ fn walk(
     dir: &Path,
     visited: &mut HashSet<std::path::PathBuf>,
     st: &mut WalkState,
+    scope: Option<&LocalScope>,
 ) -> std::io::Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -134,12 +151,33 @@ fn walk(
             if !visited.insert(real) {
                 continue;
             }
-            walk(root, &full, visited, st)?;
+            walk(root, &full, visited, st, scope)?;
         } else if meta.is_file() {
             let rel = rel_posix(root, &full);
             let counts = rel == "assets.jsonl" || rel.to_lowercase().ends_with(".md");
             if !counts {
+                // (`index.jsonl` never reaches the collected store on any
+                // path: it is not `.md` and only the ROOT `assets.jsonl`
+                // counts, so it needs no kept-home handling below.)
                 continue;
+            }
+            if let Some(scope) = scope {
+                // Kept-home exclusions happen BEFORE any counting: a file
+                // that never rides must not count toward the hub's snapshot
+                // limits either. (`DB.md` and `assets.jsonl` can never land
+                // here — a scope covering them is refused at load.)
+                if scope.keeps_home(&rel) {
+                    st.stats.kept_home += 1;
+                    continue;
+                }
+                // An ACTIVE local scope also keeps every derived catalog
+                // home: catalogs list every file's name/title/summary —
+                // kept-home files included — and the hub rebuilds its own
+                // from what actually rides.
+                if scope.active() && rel.rsplit('/').next() == Some("index.md") {
+                    st.stats.catalogs_kept += 1;
+                    continue;
+                }
             }
             st.stats.files += 1;
             st.stats.bytes = st.stats.bytes.saturating_add(meta.len());
@@ -162,13 +200,30 @@ fn walk(
     Ok(())
 }
 
-/// Read the store, refusing once raw bytes exceed `max_bytes` — a store whose
-/// raw file bytes exceed the cap cannot fit under it as JSON either (escaping
-/// only grows), so a symlinked multi-GB vault is never read into memory
-/// before a post-hoc check. On the cap refusal the walk continues without
-/// reading, so `StoreError::OverCap` carries the store's true totals and its
-/// largest files.
+/// Read the store as a push would carry it: the walk honors `.sevralocal`
+/// (kept-home files and, when the scope is active, derived catalogs are
+/// excluded and counted in the stats), refusing once raw riding bytes exceed
+/// `max_bytes` — a store whose raw file bytes exceed the cap cannot fit
+/// under it as JSON either (escaping only grows), so a symlinked multi-GB
+/// vault is never read into memory before a post-hoc check. On the cap
+/// refusal the walk continues without reading, so `StoreError::OverCap`
+/// carries the store's true totals and its largest files.
 pub fn read_store(dir: &str, max_bytes: u64) -> Result<(Store, WalkStats), StoreError> {
+    let scope = crate::local::load(Path::new(dir)).map_err(StoreError::Scope)?;
+    read_store_impl(dir, max_bytes, scope.as_ref())
+}
+
+/// The FULL store, `.sevralocal` ignored — `secrets quarantine` reads this:
+/// its whole job is seeing hits inside kept-home files.
+pub fn read_store_unscoped(dir: &str, max_bytes: u64) -> Result<(Store, WalkStats), StoreError> {
+    read_store_impl(dir, max_bytes, None)
+}
+
+fn read_store_impl(
+    dir: &str,
+    max_bytes: u64,
+    scope: Option<&LocalScope>,
+) -> Result<(Store, WalkStats), StoreError> {
     let root = Path::new(dir);
     let mut st = WalkState {
         store: Store {
@@ -179,6 +234,8 @@ pub fn read_store(dir: &str, max_bytes: u64) -> Result<(Store, WalkStats), Store
             files: 0,
             bytes: 0,
             largest: Vec::new(),
+            kept_home: 0,
+            catalogs_kept: 0,
         },
         // budget hits zero exactly when the running total EXCEEDS max_bytes —
         // a store of exactly max_bytes raw bytes is still allowed through to
@@ -187,7 +244,7 @@ pub fn read_store(dir: &str, max_bytes: u64) -> Result<(Store, WalkStats), Store
     };
     let mut visited = HashSet::new();
     visited.insert(fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()));
-    match walk(root, root, &mut visited, &mut st) {
+    match walk(root, root, &mut visited, &mut st, scope) {
         Ok(()) if st.budget == 0 => Err(StoreError::OverCap(st.stats)),
         Ok(()) => Ok((st.store, st.stats)),
         Err(e) => Err(StoreError::Io(e)),
@@ -266,6 +323,111 @@ mod tests {
         assert_eq!(largest.len(), LARGEST_TRACKED);
         let sizes: Vec<u64> = largest.iter().map(|(_, l)| *l).collect();
         assert_eq!(sizes, [24, 23, 22, 21, 20, 19, 18, 17, 16, 15]);
+    }
+
+    #[test]
+    fn sevralocal_keeps_files_home_and_out_of_every_total() {
+        let t = tempfile::tempdir().unwrap();
+        write(t.path(), "a.md", b"ride");
+        write(t.path(), "notes/b.md", b"ride2");
+        write(t.path(), "private/keys.md", b"stay-home");
+        write(t.path(), ".sevralocal", b"# mine\n\nprivate/**\r\n");
+        let (s, stats) = read_store(t.path().to_str().unwrap(), 1024).unwrap();
+        let mut paths: Vec<&str> = s.files.iter().map(|f| f.path.as_str()).collect();
+        paths.sort();
+        assert_eq!(paths, ["a.md", "notes/b.md"]);
+        assert_eq!(stats.kept_home, 1);
+        assert_eq!(stats.files, 2, "kept-home files never count toward limits");
+        assert_eq!(stats.bytes, 9, "kept-home bytes never count either");
+        assert!(stats
+            .largest
+            .iter()
+            .all(|(p, _)| !p.starts_with("private/")));
+    }
+
+    #[test]
+    fn the_sevralocal_file_itself_never_rides_on_any_walk() {
+        // The dot-skip invariant, pinned: the list is a dotfile, so BOTH the
+        // scoped walk and quarantine's unscoped walk exclude and never count
+        // it — the list of what stays home stays home too.
+        let t = tempfile::tempdir().unwrap();
+        write(t.path(), "a.md", b"ride");
+        write(t.path(), ".sevralocal", b"ghost.md\n");
+        for (store, stats) in [
+            read_store(t.path().to_str().unwrap(), 1024).unwrap(),
+            read_store_unscoped(t.path().to_str().unwrap(), 1024).unwrap(),
+        ] {
+            assert_eq!(store.files.len(), 1);
+            assert_eq!(store.files[0].path, "a.md");
+            assert_eq!(stats.files, 1);
+        }
+    }
+
+    #[test]
+    fn active_sevralocal_keeps_derived_catalogs_home() {
+        // Active by ENTRY, not by match: one effective entry (even one that
+        // matches nothing) is enough to keep every `index.md` catalog home.
+        let t = tempfile::tempdir().unwrap();
+        write(t.path(), "a.md", b"ride");
+        write(t.path(), "index.md", b"catalog");
+        write(t.path(), "sub/index.md", b"catalog2");
+        write(t.path(), ".sevralocal", b"ghost.md\n");
+        let (s, stats) = read_store(t.path().to_str().unwrap(), 1024).unwrap();
+        let paths: Vec<&str> = s.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["a.md"]);
+        assert_eq!(stats.kept_home, 0, "ghost.md matched nothing");
+        assert_eq!(stats.catalogs_kept, 2);
+    }
+
+    #[test]
+    fn without_sevralocal_or_with_an_inactive_one_catalogs_ride() {
+        let t = tempfile::tempdir().unwrap();
+        write(t.path(), "a.md", b"ride");
+        write(t.path(), "index.md", b"catalog");
+        let read = |dir: &std::path::Path| {
+            let (s, stats) = read_store(dir.to_str().unwrap(), 1024).unwrap();
+            let mut paths: Vec<String> = s.files.iter().map(|f| f.path.clone()).collect();
+            paths.sort();
+            (paths, stats)
+        };
+        let (paths, stats) = read(t.path());
+        assert_eq!(paths, ["a.md", "index.md"], "no list — catalogs ride");
+        assert_eq!(stats.catalogs_kept, 0);
+        // A comment-only list is inactive: still no catalog exclusion.
+        write(t.path(), ".sevralocal", b"# nothing effective\n");
+        let (paths, stats) = read(t.path());
+        assert_eq!(paths, ["a.md", "index.md"]);
+        assert_eq!(stats.catalogs_kept, 0);
+    }
+
+    #[test]
+    fn sevralocal_matching_is_case_sensitive() {
+        let t = tempfile::tempdir().unwrap();
+        write(t.path(), "notes.md", b"ride");
+        write(t.path(), ".sevralocal", b"NOTES.md\n");
+        let (s, stats) = read_store(t.path().to_str().unwrap(), 1024).unwrap();
+        assert_eq!(s.files.len(), 1, "no case folding: notes.md rides");
+        assert_eq!(stats.kept_home, 0);
+    }
+
+    #[test]
+    fn sevralocal_covering_hub_files_is_a_scope_refusal() {
+        for entry in ["DB.md\n", "assets.jsonl\n", "**\n"] {
+            let t = tempfile::tempdir().unwrap();
+            write(t.path(), "a.md", b"ride");
+            write(t.path(), ".sevralocal", entry.as_bytes());
+            match read_store(t.path().to_str().unwrap(), 1024) {
+                Err(StoreError::Scope(msg)) => {
+                    assert!(msg.contains("ride every push"), "{entry:?}: {msg}")
+                }
+                other => panic!(
+                    "{entry:?} must refuse, got {:?}",
+                    other.map(|_| "ok").map_err(|e| format!("{e:?}"))
+                ),
+            }
+            // The unscoped walk (quarantine's full view) ignores the list.
+            assert!(read_store_unscoped(t.path().to_str().unwrap(), 1024).is_ok());
+        }
     }
 
     #[cfg(unix)]

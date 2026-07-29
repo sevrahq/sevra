@@ -10,6 +10,7 @@
 mod commands;
 mod config;
 mod hub;
+mod local;
 mod mcp;
 mod output;
 mod scan;
@@ -84,6 +85,13 @@ enum Commands {
     /// refused unless --force is given. Before anything uploads, the store is
     /// checked against the hub's snapshot limits and scanned for
     /// secret-shaped file contents and names (--allow-secrets overrides).
+    ///
+    /// A `.sevralocal` file at the store root keeps files home: one
+    /// store-relative path or glob per line (`#` comments). Matching files
+    /// are part of the brain but never part of the cargo — they stay on this
+    /// machine, and the list itself never uploads either. While the list has
+    /// entries, derived index.md catalogs stay home too (the hub rebuilds
+    /// its own). `sevra secrets quarantine` maintains the list.
     Push {
         dir: String,
         #[arg(long)]
@@ -199,6 +207,27 @@ enum SecretsAction {
         /// The secret's name
         #[arg(value_parser = commands::parse_secret_name)]
         name: String,
+    },
+    /// Scan a local store for secret-shaped file contents and names — the
+    /// same scan `push` runs, read-only and offline. Exit 1 on matches, 0
+    /// when clean; matched values are never shown. Honors `.sevralocal`
+    /// (kept-home files never ride, so they are not scanned).
+    Scan { dir: Option<String> },
+    /// Keep secret-bearing files home: scan the full store and append each
+    /// hit file's exact path to `.sevralocal` (created if absent), so the
+    /// NEXT push leaves those files on this machine. Forward-only: files
+    /// that already rode a push remain in earlier snapshots; marking erases
+    /// nothing. DB.md and assets.jsonl are never marked — they ride every
+    /// push, so a secret inside them is an edit case.
+    Quarantine {
+        dir: Option<String>,
+        /// Show what would be marked; write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Also mark every file connected to a marked one through
+        /// wiki-links (undirected), computed via `dbmd emit`
+        #[arg(long)]
+        closure: bool,
     },
 }
 
@@ -318,6 +347,13 @@ fn main() {
                 commands::secrets_set(&cfg, &brain, &name, value_in_argv)
             }
             SecretsAction::Delete { brain, name } => commands::secrets_delete(&cfg, &brain, &name),
+            // Local-store commands: no credential, no network.
+            SecretsAction::Scan { dir } => commands::secrets_scan(dir),
+            SecretsAction::Quarantine {
+                dir,
+                dry_run,
+                closure,
+            } => commands::secrets_quarantine(dir, dry_run, closure),
         },
         Commands::Inbox { action, brain } => commands::inbox(&cfg, &action, &brain),
         Commands::Export { brain, dir } => commands::export(&cfg, &brain, dir),

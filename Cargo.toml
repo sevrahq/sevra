@@ -1,6 +1,6 @@
 [package]
 name = "sevra"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 # MSRV: enforced by the ci `msrv` job against the LOCKED tree. 1.88 is the
 # tree's true floor (home 0.5.12 requires it; base64ct needs edition2024/1.85).
@@ -48,6 +48,10 @@ rpassword = "7"
 # credential patterns, a single pass per file. The ecosystem standard; adds
 # aho-corasick + regex-automata/-syntax (memchr was already in the tree).
 regex = "1"
+# `.sevralocal` (the store's local scope) entries are paths or globs; globset
+# compiles the whole list into one matcher. BurntSushi, same family as regex
+# (shares aho-corasick/regex-automata/-syntax; adds bstr). log feature off.
+globset = { version = "0.4", default-features = false }
 
 [dev-dependencies]
 assert_cmd = "2"

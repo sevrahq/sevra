@@ -39,6 +39,11 @@ pub struct SecretHit {
     /// The file's path, redacted wherever the path itself matched — safe to
     /// print even when the secret sits in the filename.
     pub path: String,
+    /// The EXACT store-relative path, unredacted — it may itself BE the
+    /// secret, so it is never printed on any channel. `secrets quarantine`
+    /// writes it into `.sevralocal`, which lives in the store and never
+    /// uploads (the walk's dot-skip).
+    pub store_path: String,
     pub kind: &'static str,
     /// True when the match is in the file's PATH rather than its content.
     pub in_path: bool,
@@ -65,8 +70,24 @@ fn scanner() -> &'static Scanner {
     })
 }
 
+/// Redact every secret-format match inside `text` (each replaced with `…`).
+/// For path spellings and third-party error strings that must stay printable
+/// even when a secret sits inside them; text with no match passes through
+/// unchanged.
+pub fn redact_path(text: &str) -> String {
+    let sc = scanner();
+    let matches: Vec<usize> = sc.set.matches(text).into_iter().collect();
+    let mut redacted = text.to_string();
+    for idx in matches {
+        redacted = sc.each[idx].replace_all(&redacted, "\u{2026}").into_owned();
+    }
+    redacted
+}
+
 /// Scan every file that would be pushed — content and path both. Hits carry
-/// only the (redacted) path and the pattern kind, never matched bytes.
+/// the (redacted) shown path and the pattern kind for printing, plus the
+/// exact store path for `secrets quarantine` — never matched bytes on any
+/// printable field.
 pub fn scan_store(store: &Store) -> Vec<SecretHit> {
     let sc = scanner();
     let mut hits = Vec::new();
@@ -75,15 +96,12 @@ pub fn scan_store(store: &Store) -> Vec<SecretHit> {
         let shown = if path_matches.is_empty() {
             path.to_string()
         } else {
-            let mut redacted = path.to_string();
-            for &idx in &path_matches {
-                redacted = sc.each[idx].replace_all(&redacted, "\u{2026}").into_owned();
-            }
-            redacted
+            redact_path(path)
         };
         for idx in path_matches {
             hits.push(SecretHit {
                 path: shown.clone(),
+                store_path: path.to_string(),
                 kind: PATTERNS[idx].0,
                 in_path: true,
             });
@@ -91,6 +109,7 @@ pub fn scan_store(store: &Store) -> Vec<SecretHit> {
         for idx in sc.set.matches(content) {
             hits.push(SecretHit {
                 path: shown.clone(),
+                store_path: path.to_string(),
                 kind: PATTERNS[idx].0,
                 in_path: false,
             });
@@ -202,6 +221,17 @@ mod tests {
             hits[0].path
         );
         assert!(hits[0].path.starts_with("sources/"));
+        // The exact path rides on the non-printable field, for quarantine.
+        assert_eq!(hits[0].store_path, format!("sources/{token}.md"));
+    }
+
+    #[test]
+    fn redact_path_blanks_matches_and_passes_clean_text_through() {
+        let token = fake("xoxb-", "9", 10);
+        let redacted = redact_path(&format!("notes/{token}.md"));
+        assert!(!redacted.contains(&token), "got: {redacted}");
+        assert_eq!(redacted, "notes/\u{2026}.md");
+        assert_eq!(redact_path("notes/plain.md"), "notes/plain.md");
     }
 
     #[test]

@@ -49,6 +49,8 @@ sevra unpublish <brain>                          pull all public pages
 sevra secrets list <brain>                       the vault: secret names + function bindings
 sevra secrets set <brain> NAME                   value from stdin (hidden prompt / pipe), write-only
 sevra secrets delete <brain> NAME                unbind + forget one secret
+sevra secrets scan [dir]                         the push secret scan, read-only (exit 1 on matches)
+sevra secrets quarantine [dir] [--dry-run] [--closure]   keep hit files home in .sevralocal
 sevra inbox list|drain <brain>                   read the evidence inbox (drain = full JSON)
 sevra export <brain> [dir]                       write your brain back to disk (you own it)
 
@@ -60,6 +62,10 @@ sevra update                                     signed self-update; checks dbmd
 Config lives at `~/.sevra/config.json` (written 0600). Env `SEVRA_HUB_URL` / `SEVRA_API_KEY` override it.
 
 `push` replaces the brain's whole hosted store with the pushed directory: files absent locally are removed, and a push that would shrink the brain's document count is refused unless `--force` is given. Before anything uploads, the store is checked locally against the hub's snapshot limits (256 MiB compressed, 512 MiB uncompressed, 100,000 files — refusals list the largest files) and scanned for secret-shaped file contents and names (AWS, GitHub, Anthropic, OpenAI, Slack, Google, Stripe key formats, PEM private-key blocks, 1Password share links); `--allow-secrets` overrides the scan. `delete` is permanent: interactive runs ask for the brain's slug, scripts pass `--confirm <slug>`.
+
+A `.sevralocal` file at the store root keeps files home: one store-relative path or glob per line (`#` comments, blank lines skipped; matched byte-wise and case-sensitively against the pushed paths). Matching files are part of the brain but never part of the cargo — push leaves them on the machine and reports how many stayed home, and while the list has entries every derived `index.md` catalog stays home too (catalogs carry every file's name and summary, kept-home ones included; the hub rebuilds its own). The list itself never uploads. `DB.md` and `assets.jsonl` always ride: a list that covers either (including via a broad glob like `**`) is refused.
+
+`secrets scan [dir]` runs push's secret scan read-only (exit 1 on matches, 0 clean; matched values never shown). `secrets quarantine [dir]` appends each hit file's exact path to `.sevralocal`, creating it when absent — the third exit besides editing files and `--allow-secrets`. `--dry-run` previews; `--closure` also marks every file connected to a marked one through wiki-links (computed via `dbmd emit`). Kept-home is forward-only: files that already rode a push remain in earlier snapshots; marking removes them from the next snapshot and erases nothing. The only file sevra ever edits is `.sevralocal`, and only by appending.
 
 `secrets set` binds a write-only value to the brain's published functions ([the vault](https://www.sevrahq.com/docs/publishing.md)). The value is read from stdin only — a hidden prompt on a terminal, or piped (`printf %s "$VALUE" | sevra secrets set <brain> NAME`, exactly one trailing newline trimmed). It is never accepted on the command line and never echoed back, on any path.
 

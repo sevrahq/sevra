@@ -412,6 +412,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "globset"
+version = "0.4.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e47d37d2ae4464254884b60ab7071be2b876a9c35b696bd018ddcc76847309cd"
+dependencies = [
+ "aho-corasick",
+ "bstr",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -884,13 +896,14 @@ dependencies = [
 
 [[package]]
 name = "sevra"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "assert_cmd",
  "base64",
  "clap",
  "ed25519-dalek",
  "getrandom 0.2.17",
+ "globset",
  "home",
  "predicates",
  "regex",
