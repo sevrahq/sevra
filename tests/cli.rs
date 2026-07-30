@@ -416,6 +416,24 @@ fn secrets_set_refuses_empty_and_oversized_values_without_echo() {
         !all.contains("xxxxxxxx"),
         "value bytes echoed into output: {all}"
     );
+
+    // The byte-level ceiling fires before UTF-8 decoding/character counting,
+    // bounding memory even when a hostile producer never sends a newline.
+    let byte_flood = "x".repeat(4096 * 4 + 3);
+    let out = sevra()
+        .args(["secrets", "set", "b", "API_KEY"])
+        .env("SEVRA_HUB_URL", "http://localhost:9")
+        .env("SEVRA_API_KEY", "x")
+        .write_stdin(byte_flood)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let all = all_output(&out);
+    assert!(all.contains("too large"), "should name the boundary: {all}");
+    assert!(
+        !all.contains("xxxxxxxx"),
+        "value bytes echoed into output: {all}"
+    );
 }
 
 #[test]
@@ -1075,6 +1093,42 @@ fn push_refuses_secrets_before_any_request_and_never_echoes_them() {
     assert!(
         quarantine < edit && edit < allow,
         "exits out of order: {all}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn push_refuses_an_external_symlink_before_any_request_or_read() {
+    let store = store_dir(&[("DB.md", "# safe")]);
+    let outside = tempfile::tempdir().unwrap();
+    let secret = "EXTERNAL-CONTENT-MUST-NOT-RIDE";
+    std::fs::write(outside.path().join("private.md"), secret).unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("private.md"),
+        store.path().join("shared.md"),
+    )
+    .unwrap();
+
+    let out = sevra()
+        .args(["push", store.path().to_str().unwrap(), "--brain", "b"])
+        .env("SEVRA_HUB_URL", "http://localhost:9")
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let all = all_output(&out);
+    assert!(all.contains("shared.md"), "names the hostile link: {all}");
+    assert!(
+        all.contains("resolves outside the store"),
+        "explains the boundary: {all}"
+    );
+    assert!(
+        !all.contains(secret),
+        "external bytes leaked into output: {all}"
+    );
+    assert!(
+        !all.contains("hub unreachable"),
+        "the filesystem refusal must happen before the request: {all}"
     );
 }
 

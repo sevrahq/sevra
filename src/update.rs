@@ -10,7 +10,7 @@
 //! notice); `sevra update` stays the explicit path.
 
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::{json, Value};
@@ -213,6 +213,30 @@ fn download(url: &str) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
+fn write_staged_binary(path: &std::path::Path, binary: &[u8]) -> Result<(), String> {
+    // A same-user stale file is recoverable; a planted symlink must be removed,
+    // never followed. create_new then closes the remove→open race safely: if
+    // anything appears in between, the update refuses instead of truncating
+    // its target.
+    let _ = fs::remove_file(path);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o700);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|e| format!("write failed: {e}"))?;
+    if let Err(error) = file.write_all(binary) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(format!("write failed: {error}"));
+    }
+    Ok(())
+}
+
 /// Download the platform asset for `version`, verify its signature, and replace
 /// the running binary atomically. Returns Ok on success.
 fn download_verify_replace(version: &str) -> Result<(), String> {
@@ -256,10 +280,7 @@ fn download_verify_replace(version: &str) -> Result<(), String> {
     // Write-then-rename so a failed write can never leave a truncated CLI —
     // and a failed WRITE cleans its own partial temp up too.
     let tmp = self_path.with_extension(format!("new.{}", std::process::id()));
-    fs::write(&tmp, &binary).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!("write failed: {e}")
-    })?;
+    write_staged_binary(&tmp, &binary)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -567,5 +588,24 @@ mod tests {
         assert!(!looks_like_digest(""));
         assert!(!looks_like_digest("e3b0c442"));
         assert!(!looks_like_digest(&"z".repeat(64)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_update_replaces_a_planted_symlink_without_touching_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let staged = dir.path().join("sevra.new.1");
+        fs::write(&target, b"do not truncate").unwrap();
+        std::os::unix::fs::symlink(&target, &staged).unwrap();
+
+        write_staged_binary(&staged, b"signed binary").unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"do not truncate");
+        assert_eq!(fs::read(&staged).unwrap(), b"signed binary");
+        assert!(!fs::symlink_metadata(&staged)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 }

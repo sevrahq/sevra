@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.6 — 2026-07-30
+
+- Security: push and secret scanning now refuse any file or directory symlink
+  whose resolved target is outside the selected store. A hostile cloned brain
+  can no longer smuggle a sibling tree, home-directory credential, or other
+  external Markdown file into a snapshot. In-store links still work, while
+  real-path deduplication keeps cycles and aliases bounded.
+- Fixed: large pack commits receive a verb-specific 330-second deadline,
+  matching the hub's 300-second unpack, validation, indexing, and publication
+  budget. Healthy large-brain commits no longer fail at the CLI's generic
+  120-second read timeout.
+- Security: the self-updater creates its staged binary without following a
+  pre-planted symlink, and Windows browser sign-in launches Explorer directly
+  instead of sending a URL through `cmd /C start`. Store entries with
+  non-UTF-8 names are refused rather than being lossily renamed into an
+  ambiguous upload path.
+- Security: MCP stdio frames are capped at 1 MiB and piped secret input is
+  byte-bounded before UTF-8 decoding. Malformed local peers can no longer grow
+  the long-lived MCP process or a secret command without limit.
+
 ## 0.2.5 — 2026-07-28
 
 Secrets get a place that is not the hub. 0.2.4's scan left two exits — edit

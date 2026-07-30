@@ -239,7 +239,7 @@ pub fn request(
     body: Option<&Value>,
     auth: bool,
 ) -> HubResponse {
-    match request_inner(cfg, method, path, body, auth) {
+    match request_inner(cfg, method, path, body, auth, None) {
         Ok(resp) => resp,
         Err(t) => fail(&format!("hub unreachable at {}: {}", cfg.hub, t), None),
     }
@@ -256,7 +256,25 @@ pub fn try_request(
     body: Option<&Value>,
     auth: bool,
 ) -> Result<HubResponse, String> {
-    request_inner(cfg, method, path, body, auth)
+    request_inner(cfg, method, path, body, auth, None)
+}
+
+/// A hub request with a verb-specific total deadline. Pack commit performs
+/// server-side unpack, validation, indexing, and durable publication under a
+/// 300-second route budget, so the ordinary 120-second read window is too
+/// short even while the server is making healthy progress.
+pub fn request_with_timeout(
+    cfg: &Config,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    auth: bool,
+    timeout: std::time::Duration,
+) -> HubResponse {
+    match request_inner(cfg, method, path, body, auth, Some(timeout)) {
+        Ok(resp) => resp,
+        Err(t) => fail(&format!("hub unreachable at {}: {}", cfg.hub, t), None),
+    }
 }
 
 fn request_inner(
@@ -265,6 +283,7 @@ fn request_inner(
     path: &str,
     body: Option<&Value>,
     auth: bool,
+    timeout: Option<std::time::Duration>,
 ) -> Result<HubResponse, String> {
     assert_safe_hub(&cfg.hub);
     let url = format!("{}{}", cfg.hub, path);
@@ -280,6 +299,9 @@ fn request_inner(
     let http = agent();
     let result = with_connect_retries(|| {
         let mut req = http.request(method, &url);
+        if let Some(timeout) = timeout {
+            req = req.timeout(timeout);
+        }
         if let Some(value) = &credential {
             req = req.set("authorization", value);
         }
@@ -415,6 +437,39 @@ mod tests {
         let response = request(&cfg, "GET", "/retry", None, false);
         assert_eq!(response.status, 200);
         assert_eq!(response.body, Some(serde_json::json!({ "ok": true })));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn request_specific_timeout_overrides_the_agent_read_window() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request_bytes = [0_u8; 1024];
+            let _ = stream.read(&mut request_bytes).unwrap();
+            thread::sleep(Duration::from_millis(150));
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+            );
+        });
+        let cfg = Config {
+            hub: format!("http://{address}"),
+            key: None,
+        };
+
+        let result = request_inner(
+            &cfg,
+            "GET",
+            "/slow",
+            None,
+            false,
+            Some(Duration::from_millis(40)),
+        );
+        assert!(
+            result.is_err(),
+            "the request-level deadline must be honored"
+        );
         server.join().unwrap();
     }
 }

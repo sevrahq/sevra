@@ -1,6 +1,6 @@
 //! The command handlers — full parity with the retired TS CLI, including the
 //! quality-pass behaviors (env-blind login, https-only hubs, non-JSON refusal,
-//! symlink-following bounded push, export path containment + slug
+//! symlink-contained bounded push, export path containment + slug
 //! validation, gated-page reporting). `validate` shells `dbmd` and never links
 //! its library — Sevra's product tool consumes the standard through the same
 //! public binary any third party gets.
@@ -14,7 +14,10 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::config::{self, Config, DEFAULT_HUB};
-use crate::hub::{ensure_ok, get_presigned, put_presigned, request, HubResponse, NOT_LOGGED_IN};
+use crate::hub::{
+    ensure_ok, get_presigned, put_presigned, request, request_with_timeout, HubResponse,
+    NOT_LOGGED_IN,
+};
 use crate::local;
 use crate::output::{fail, json_mode, note, out, usage_fail};
 use crate::scan::{redact_path, scan_store, SecretHit};
@@ -27,9 +30,14 @@ const MAX_JSON_PUSH_BYTES: usize = 4 * 1024 * 1024;
 const MAX_STORE_FILES: usize = 100_000;
 const MAX_STORE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_PACK_BYTES: u64 = 256 * 1024 * 1024;
+const PACK_COMMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(330);
 /// The hub's cap on one secret value (mirrored client-side so an oversized
 /// paste fails fast, before any request).
 const MAX_SECRET_VALUE_CHARS: usize = 4096;
+/// Four UTF-8 bytes per allowed scalar plus one optional CRLF. Piped input is
+/// bounded before UTF-8 decoding so a hostile producer cannot grow memory
+/// without limit before the character-count check runs.
+const MAX_SECRET_STDIN_BYTES: usize = MAX_SECRET_VALUE_CHARS * 4 + 2;
 
 pub(crate) fn enc(s: &str) -> String {
     // Percent-encode a path segment for a URL (RFC 3986 unreserved kept).
@@ -215,24 +223,26 @@ fn challenge_of(verifier: &str) -> String {
 /// opener (headless box, no DE, locked-down Windows) — the caller then falls
 /// back to the code flow rather than leaving the human staring at nothing.
 ///
-/// SAFETY: callers must pass a URL this process BUILT from the validated hub,
-/// never one echoed back by the hub. On Windows the opener is `cmd /C start`,
-/// and Rust's argument quoting is MSVCRT-style — it does not escape for cmd's
-/// own parser when the program IS cmd, so a `&` in an attacker-shaped URL
-/// would separate commands. `open`/`xdg-open` are equally happy to act on
-/// file://, smb://, or a leading `-` parsed as a flag. Constructing the URL
-/// ourselves removes that entire surface rather than trying to sanitize it.
+/// SAFETY: callers pass a URL this process BUILT from the validated hub, never
+/// one echoed back by the hub. Windows launches Explorer directly rather than
+/// routing the URL through `cmd /C start`, so shell metacharacters are never
+/// interpreted. `open`/`xdg-open` receive a parsed HTTPS URL that cannot begin
+/// with an option or switch schemes.
 fn open_browser(url: &str) -> Result<(), String> {
-    // Defense in depth: refuse anything that is not a plain https URL, even
-    // though the only caller builds it.
-    if !url.starts_with("https://") || url.contains(|c: char| c.is_whitespace() || c == '&') {
+    let parsed =
+        url::Url::parse(url).map_err(|_| "refusing to open an invalid browser URL".to_string())?;
+    if parsed.scheme() != "https"
+        || parsed.host().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
         return Err("refusing to open a non-https or unsafe URL".into());
     }
     let (program, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
         ("open", vec![url])
     } else if cfg!(target_os = "windows") {
-        // `start` is a cmd builtin; the empty "" is the window-title slot.
-        ("cmd", vec!["/C", "start", "", url])
+        ("explorer.exe", vec![url])
     } else {
         ("xdg-open", vec![url])
     };
@@ -1006,12 +1016,13 @@ fn ensure_push_ok(r: HubResponse, what: &str, force: bool, kept_home: usize) -> 
 fn commit_pack(cfg: &Config, brain: &str, commit: &Value, force: bool, kept_home: usize) -> Value {
     let mut attempt: u64 = 0;
     loop {
-        let resp = request(
+        let resp = request_with_timeout(
             cfg,
             "POST",
             &format!("/api/hub/brains/{}/packs/commit", enc(brain)),
             Some(commit),
             true,
+            PACK_COMMIT_TIMEOUT,
         );
         if resp.status == 507 && body_code(&resp) == Some("hub_scratch_exhausted") && attempt < 2 {
             attempt += 1;
@@ -1902,13 +1913,30 @@ fn secret_value_from_stdin(name: &str) -> String {
             ),
         }
     } else {
-        let mut buf = String::new();
-        if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+        let stdin = std::io::stdin();
+        let mut bytes = Vec::with_capacity(MAX_SECRET_STDIN_BYTES.min(8192));
+        let mut limited = stdin.lock().take((MAX_SECRET_STDIN_BYTES + 1) as u64);
+        if let Err(e) = limited.read_to_end(&mut bytes) {
             fail(
                 &format!("could not read the value from stdin (it must be UTF-8): {e}"),
                 None,
             );
         }
+        if bytes.len() > MAX_SECRET_STDIN_BYTES {
+            fail(
+                &format!(
+                    "the value is too large — the hub caps one secret at {MAX_SECRET_VALUE_CHARS} characters"
+                ),
+                None,
+            );
+        }
+        let buf = match String::from_utf8(bytes) {
+            Ok(buf) => buf,
+            Err(_) => fail(
+                "could not read the value from stdin (it must be UTF-8)",
+                None,
+            ),
+        };
         trim_one_newline(buf)
     };
     if value.is_empty() {

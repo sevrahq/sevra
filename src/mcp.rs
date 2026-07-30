@@ -16,7 +16,7 @@
 //! waiting on the reply). Every diagnostic goes to stderr. The hub client is
 //! injected as a trait so the protocol core is testable without a network.
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 
 use serde_json::{json, Map, Value};
 
@@ -31,6 +31,9 @@ use crate::output::set_json_mode;
 const PREFERRED_PROTOCOL: &str = "2025-06-18";
 const KNOWN_PROTOCOLS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 const SERVER_NAME: &str = "sevra-brain";
+/// MCP is a local protocol boundary, not a trusted one. A malformed client
+/// must not make the long-lived server buffer an arbitrarily large line.
+const MAX_MCP_FRAME_BYTES: usize = 1024 * 1024;
 
 const INSTRUCTIONS: &str = "A Sevra brain over MCP: a db.md store (plain-file records + sources). \
      Prefer the `dbmd` CLI for local/write-heavy work; these tools are the read/reach surface. \
@@ -316,6 +319,40 @@ fn handle_line(line: &str, client: &dyn McpHubClient) -> Option<Value> {
 
 // --- the stdio shell ---------------------------------------------------------
 
+#[derive(Debug, PartialEq, Eq)]
+enum FrameRead {
+    Eof,
+    Line(String),
+    InvalidUtf8,
+    TooLarge,
+}
+
+/// Read one newline-delimited frame without ever allocating past the wire
+/// ceiling. An oversized frame is terminal for the session: its unread tail
+/// cannot be safely re-synchronized without letting a hostile peer hold the
+/// process open indefinitely.
+fn read_frame<R: BufRead>(input: &mut R) -> std::io::Result<FrameRead> {
+    let mut bytes = Vec::with_capacity(8192);
+    let mut limited = (&mut *input).take((MAX_MCP_FRAME_BYTES + 1) as u64);
+    let read = limited.read_until(b'\n', &mut bytes)?;
+    if read == 0 {
+        return Ok(FrameRead::Eof);
+    }
+    if bytes.len() > MAX_MCP_FRAME_BYTES {
+        return Ok(FrameRead::TooLarge);
+    }
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    match String::from_utf8(bytes) {
+        Ok(line) => Ok(FrameRead::Line(line)),
+        Err(_) => Ok(FrameRead::InvalidUtf8),
+    }
+}
+
 /// The real client: every tool is a GET against the hub read API, bearer-
 /// authed with the resolved credential (`config::load()`: SEVRA_API_KEY over
 /// the stored login). No credential → unauthenticated, public brains only.
@@ -361,9 +398,34 @@ pub fn serve(cfg: &Config) {
     let client = ApiClient { cfg };
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
+    let mut input = stdin.lock();
     let mut out = stdout.lock();
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
+    loop {
+        let line = match read_frame(&mut input) {
+            Ok(FrameRead::Eof) => break,
+            Ok(FrameRead::Line(line)) => line,
+            Ok(FrameRead::InvalidUtf8) => {
+                let response = err(Value::Null, -32700, "Parse error");
+                if writeln!(out, "{response}")
+                    .and_then(|()| out.flush())
+                    .is_err()
+                {
+                    break;
+                }
+                continue;
+            }
+            Ok(FrameRead::TooLarge) => {
+                log("protocol frame exceeded the 1 MiB limit; closing the session");
+                let response = err(
+                    Value::Null,
+                    -32700,
+                    "Parse error: protocol frame exceeds 1 MiB",
+                );
+                let _ = writeln!(out, "{response}").and_then(|()| out.flush());
+                break;
+            }
+            Err(_) => break,
+        };
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -723,6 +785,26 @@ mod tests {
         assert_eq!(resp["error"]["code"], -32700);
         assert_eq!(resp["error"]["message"], "Parse error");
         assert_eq!(resp["id"], Value::Null);
+    }
+
+    #[test]
+    fn frame_reader_bounds_memory_and_handles_line_endings() {
+        let mut normal = std::io::Cursor::new(b"{\"ok\":true}\r\nnext\n".to_vec());
+        assert_eq!(
+            read_frame(&mut normal).unwrap(),
+            FrameRead::Line("{\"ok\":true}".into())
+        );
+        assert_eq!(
+            read_frame(&mut normal).unwrap(),
+            FrameRead::Line("next".into())
+        );
+        assert_eq!(read_frame(&mut normal).unwrap(), FrameRead::Eof);
+
+        let mut invalid = std::io::Cursor::new(vec![0xff, b'\n']);
+        assert_eq!(read_frame(&mut invalid).unwrap(), FrameRead::InvalidUtf8);
+
+        let mut oversized = std::io::Cursor::new(vec![b'x'; MAX_MCP_FRAME_BYTES + 1]);
+        assert_eq!(read_frame(&mut oversized).unwrap(), FrameRead::TooLarge);
     }
 
     #[test]

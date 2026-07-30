@@ -1,7 +1,8 @@
 //! Local db.md store read for `push`: walk a directory, collect `.md` files
-//! (relative POSIX paths) + an optional `assets.jsonl`, following symlinks with
-//! cycle protection (Obsidian-style vaults symlink shared folders), skipping
-//! dotfiles. Mirrors the TS CLI's readStoreFiles. A `.sevralocal` at the
+//! (relative POSIX paths) + an optional `assets.jsonl`. Symlinks may point
+//! elsewhere inside the store, but any link that resolves outside is refused:
+//! a cloned brain must never smuggle ~/.ssh or another sibling tree into a
+//! push. Cycles are deduplicated and dotfiles are skipped. A `.sevralocal` at the
 //! store root (see `crate::local`) keeps matching files home: excluded from
 //! the collected store, counted separately in the stats.
 
@@ -128,6 +129,7 @@ struct WalkState {
 
 fn walk(
     root: &Path,
+    root_real: &Path,
     dir: &Path,
     visited: &mut HashSet<std::path::PathBuf>,
     st: &mut WalkState,
@@ -135,24 +137,45 @@ fn walk(
 ) -> std::io::Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
+        let entry_name = entry.file_name();
+        let name = entry_name.to_str().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "refusing a store entry whose name is not valid UTF-8",
+            )
+        })?;
         if name.starts_with('.') {
             continue;
         }
         let full = entry.path();
-        // Resolve type via metadata (follows symlinks); a dangling link is skipped.
-        let meta = match fs::metadata(&full) {
+        // Resolve once and enforce the real-path boundary before metadata,
+        // sizing, or content reads. Reading the canonical file also avoids a
+        // leaf symlink swap between the containment check and fs::read.
+        let real = match fs::canonicalize(&full) {
+            Ok(path) => path,
+            Err(_) => continue, // dangling or unreadable links do not ride
+        };
+        if !real.starts_with(root_real) {
+            let rel = rel_posix(root, &full);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("{rel}: refusing a symlink that resolves outside the store"),
+            ));
+        }
+        let meta = match fs::metadata(&real) {
             Ok(m) => m,
             Err(_) => continue,
         };
         if meta.is_dir() {
             // Cycle guard on the real path.
-            let real = fs::canonicalize(&full).unwrap_or(full.clone());
             if !visited.insert(real) {
                 continue;
             }
-            walk(root, &full, visited, st, scope)?;
+            walk(root, root_real, &full, visited, st, scope)?;
         } else if meta.is_file() {
+            if !visited.insert(real.clone()) {
+                continue;
+            }
             let rel = rel_posix(root, &full);
             let counts = rel == "assets.jsonl" || rel.to_lowercase().ends_with(".md");
             if !counts {
@@ -190,9 +213,9 @@ fn walk(
                 continue;
             }
             if rel == "assets.jsonl" {
-                st.store.assets = Some(read_named(&full, &rel)?);
+                st.store.assets = Some(read_named(&real, &rel)?);
             } else {
-                let content = read_named(&full, &rel)?;
+                let content = read_named(&real, &rel)?;
                 st.store.files.push(StoreFile { path: rel, content });
             }
         }
@@ -225,6 +248,7 @@ fn read_store_impl(
     scope: Option<&LocalScope>,
 ) -> Result<(Store, WalkStats), StoreError> {
     let root = Path::new(dir);
+    let root_real = fs::canonicalize(root).map_err(StoreError::Io)?;
     let mut st = WalkState {
         store: Store {
             files: Vec::new(),
@@ -243,8 +267,8 @@ fn read_store_impl(
         budget: max_bytes.saturating_add(1),
     };
     let mut visited = HashSet::new();
-    visited.insert(fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()));
-    match walk(root, root, &mut visited, &mut st, scope) {
+    visited.insert(root_real.clone());
+    match walk(root, &root_real, root, &mut visited, &mut st, scope) {
         Ok(()) if st.budget == 0 => Err(StoreError::OverCap(st.stats)),
         Ok(()) => Ok((st.store, st.stats)),
         Err(e) => Err(StoreError::Io(e)),
@@ -438,6 +462,68 @@ mod tests {
         std::os::unix::fs::symlink(t.path(), t.path().join("a/loop")).unwrap();
         let (s, _) = read_store(t.path().to_str().unwrap(), 4096).unwrap();
         assert_eq!(s.files.len(), 1, "the cycled file must be collected once");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_file_symlink_is_refused_before_content_can_ride() {
+        let store = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write(store.path(), "DB.md", b"# safe");
+        write(outside.path(), "credential.md", b"TOP SECRET");
+        std::os::unix::fs::symlink(
+            outside.path().join("credential.md"),
+            store.path().join("leak.md"),
+        )
+        .unwrap();
+
+        match read_store(store.path().to_str().unwrap(), 4096) {
+            Err(StoreError::Io(error)) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                assert!(error.to_string().contains("outside the store"));
+                assert!(error.to_string().contains("leak.md"));
+            }
+            other => panic!("expected symlink refusal, got {:?}", other.map(|_| "ok")),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_directory_symlink_is_refused_before_descending() {
+        let store = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write(store.path(), "DB.md", b"# safe");
+        write(outside.path(), "credential.md", b"TOP SECRET");
+        std::os::unix::fs::symlink(outside.path(), store.path().join("shared")).unwrap();
+
+        match read_store(store.path().to_str().unwrap(), 4096) {
+            Err(StoreError::Io(error)) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                assert!(error.to_string().contains("shared"));
+            }
+            other => panic!("expected symlink refusal, got {:?}", other.map(|_| "ok")),
+        }
+    }
+
+    // APFS rejects the invalid byte sequence at creation time; Linux filesystems
+    // permit it, which is where the lossy-path regression can be exercised.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_store_entry_is_refused_instead_of_lossily_renamed() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let store = tempfile::tempdir().unwrap();
+        write(store.path(), "DB.md", b"# safe");
+        let name = std::ffi::OsString::from_vec(b"bad-\xff.md".to_vec());
+        fs::write(store.path().join(name), b"must not ride under another name").unwrap();
+
+        match read_store(store.path().to_str().unwrap(), 4096) {
+            Err(StoreError::Io(error)) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                assert!(error.to_string().contains("not valid UTF-8"));
+            }
+            other => panic!("expected path refusal, got {:?}", other.map(|_| "ok")),
+        }
     }
 
     #[test]
