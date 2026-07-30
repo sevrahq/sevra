@@ -874,7 +874,7 @@ pub fn delete(cfg: &Config, brain: &str, confirm: Option<String>) {
 // --- push --------------------------------------------------------------------
 
 /// Bytes for humans, in the binary units the hub's limits are defined in.
-fn human_size(bytes: u64) -> String {
+pub(crate) fn human_size(bytes: u64) -> String {
     const K: f64 = 1024.0;
     let b = bytes as f64;
     if b >= K * K * K {
@@ -1063,7 +1063,14 @@ fn read_store_checked(dir: &str, scoped: bool) -> (Store, WalkStats) {
     }
 }
 
-pub fn push(cfg: &Config, dir: &str, brain: &str, force: bool, allow_secrets: bool) {
+pub fn push(
+    cfg: &Config,
+    dir: &str,
+    brain: &str,
+    force: bool,
+    allow_secrets: bool,
+    skip_assets: bool,
+) {
     if !Path::new(dir).exists() {
         fail(&format!("store directory not found: {dir}"), None);
     }
@@ -1187,6 +1194,40 @@ pub fn push(cfg: &Config, dir: &str, brain: &str, force: bool, allow_secrets: bo
         ));
         if let Some(obj) = data.as_object_mut() {
             obj.insert("catalogsKeptHome".into(), json!(stats.catalogs_kept));
+        }
+    }
+
+    // The byte half of the asset story: the snapshot just ingested the
+    // manifest, so every declared hash is now uploadable — ship what the hub
+    // reports missing. Strictly after the commit (the hub refuses undeclared
+    // hashes) and skippable for a metadata-only push.
+    let manifest_assets = n("assets");
+    if !skip_assets && manifest_assets > 0 {
+        let scope = crate::local::load(Path::new(dir)).ok().flatten();
+        let sync = crate::assets::sync_after_push(cfg, brain, dir, scope.as_ref());
+        if sync.uploaded > 0 {
+            human.push_str(&format!(
+                "\nassets: {} uploaded ({})",
+                sync.uploaded,
+                human_size(sync.uploaded_bytes)
+            ));
+        } else if sync.missing_local == 0 && sync.drifted == 0 {
+            human.push_str(&format!("\nassets: all {manifest_assets} present"));
+        }
+        if sync.kept_home > 0 {
+            human.push_str(&format!(
+                "\nassets: {} kept home (.sevralocal)",
+                sync.kept_home
+            ));
+        }
+        if sync.missing_local > 0 || sync.drifted > 0 {
+            human.push_str(&format!(
+                "\nassets: {} missing locally, {} drifted — run `dbmd assets scan` and push again",
+                sync.missing_local, sync.drifted
+            ));
+        }
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert("assetSync".into(), sync.to_json());
         }
     }
     out(&human, Some(data));
@@ -1634,7 +1675,7 @@ pub fn inbox(cfg: &Config, action: &str, brain: &str) {
 }
 
 /// Normalize + contain: the resolved write path must stay inside `root`.
-fn contained(root: &Path, rel: &str) -> Option<PathBuf> {
+pub(crate) fn contained(root: &Path, rel: &str) -> Option<PathBuf> {
     if rel.is_empty() || rel.contains('\0') {
         return None;
     }
@@ -1698,7 +1739,7 @@ fn entries_from_pack(bytes: Vec<u8>) -> Vec<(String, Vec<u8>)> {
     entries
 }
 
-pub fn export(cfg: &Config, brain: &str, dir: Option<String>) {
+pub fn export(cfg: &Config, brain: &str, dir: Option<String>, skip_assets: bool) {
     let r = ensure_ok(
         request(
             cfg,
@@ -1835,10 +1876,31 @@ pub fn export(cfg: &Config, brain: &str, dir: Option<String>) {
     data.remove("url");
     data.insert("dir".into(), json!(dir));
     data.insert("fileCount".into(), json!(entries.len()));
-    out(
-        &format!("exported {} file(s) → {dir}", entries.len()),
-        Some(Value::Object(data)),
-    );
+    let mut human = format!("exported {} file(s) → {dir}", entries.len());
+
+    // The byte half of the export: the store's manifest names every declared
+    // blob — restore what is absent (or drifted) beside the markdown, each
+    // download SHA-verified and containment-checked. The export is complete
+    // files-on-disk either way; a failed asset names itself and the rest
+    // continue.
+    if !skip_assets {
+        if let Some(restore) = crate::assets::restore_assets(cfg, brain, &root) {
+            if restore.restored > 0 {
+                human.push_str(&format!(
+                    "\nassets: {} restored ({})",
+                    restore.restored,
+                    human_size(restore.restored_bytes)
+                ));
+            } else if restore.failed == 0 && restore.present > 0 {
+                human.push_str(&format!("\nassets: all {} present", restore.present));
+            }
+            if restore.failed > 0 {
+                human.push_str(&format!("\nassets: {} failed to restore", restore.failed));
+            }
+            data.insert("assetRestore".into(), restore.to_json());
+        }
+    }
+    out(&human, Some(Value::Object(data)));
 }
 
 fn normalize(p: &Path) -> PathBuf {

@@ -1769,3 +1769,131 @@ fn mcp_without_a_credential_serves_public_reads_unauthenticated() {
         "warns that only public brains are reachable"
     );
 }
+
+// --- asset byte sync (push) and restore (export) ------------------------------
+// The manifest rides the snapshot; the BYTES ride the content-addressed flow
+// after commit. sha256("BLOB") below is the fixture blob's real hash — the
+// mock hub echoes it so list → presign → PUT → confirm exercises the whole
+// client contract, loopback-only, zero new dev-deps.
+
+const BLOB_SHA: &str = "671a0d168d8e3d31819402ac7c3a3cc0abedebbf6a4cda26deacd89724bd6bdc";
+
+fn asset_store() -> tempfile::TempDir {
+    store_dir(&[
+        ("a.md", "---\ntype: note\nsummary: a\nassets:\n  - _files/x.bin\n---\nalpha\n"),
+        (
+            "assets.jsonl",
+            // dbmd's manifest line shape: path + sha256 + bytes.
+            "{\"path\":\"_files/x.bin\",\"sha256\":\"671a0d168d8e3d31819402ac7c3a3cc0abedebbf6a4cda26deacd89724bd6bdc\",\"bytes\":4}\n",
+        ),
+        ("_files/x.bin", "BLOB"),
+    ])
+}
+
+#[test]
+fn push_syncs_missing_assets_after_commit() {
+    let t = asset_store();
+    let missing = format!(
+        r#"{{"assets":[{{"path":"_files/x.bin","sha256":"{BLOB_SHA}","bytes":4,"required":true,"presentInR2":false}}],"truncated":false}}"#
+    );
+    let presigned =
+        r#"{"url":"{BASE}/blob-put","method":"PUT","reservationId":"01hzy3v7q8r9s0t1v2w3x4y5z7"}"#;
+    let (base, log, handle) = mock_hub(vec![
+        (200, r#"{"indexed":{"documents":1,"assets":1}}"#.to_string()),
+        (200, missing),
+        (200, presigned.to_string()),
+        (200, "{}".to_string()), // the presigned PUT itself
+        (200, r#"{"present":true}"#.to_string()),
+    ]);
+    let out = sevra()
+        .args(["push", t.path().to_str().unwrap(), "--brain", "b"])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "push failed: {}", all_output(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("assets: 1 uploaded"),
+        "upload tally shown: {stdout}"
+    );
+    handle.join().unwrap();
+    let reqs = log.lock().unwrap();
+    assert_eq!(reqs.len(), 5, "push, list, presign, PUT, confirm: {reqs:?}");
+    assert_eq!(reqs[1].path, "/api/hub/brains/b/assets?status=missing");
+    assert_eq!(
+        reqs[2].path,
+        format!("/api/hub/brains/b/assets/presign?sha256={BLOB_SHA}&action=put")
+    );
+    assert_eq!(reqs[3].method, "PUT");
+    assert_eq!(reqs[3].path, "/blob-put");
+    assert_eq!(reqs[3].body, "BLOB", "the exact blob bytes ride the PUT");
+    assert_eq!(reqs[4].path, "/api/hub/brains/b/assets/confirm");
+    assert!(
+        reqs[4].body.contains(BLOB_SHA) && reqs[4].body.contains("01hzy3v7q8r9s0t1v2w3x4y5z7"),
+        "confirm carries hash + reservation: {}",
+        reqs[4].body
+    );
+}
+
+#[test]
+fn push_skip_assets_makes_no_asset_requests() {
+    let t = asset_store();
+    let (base, log, handle) = mock_hub(vec![(
+        200,
+        r#"{"indexed":{"documents":1,"assets":1}}"#.to_string(),
+    )]);
+    sevra()
+        .args([
+            "push",
+            t.path().to_str().unwrap(),
+            "--brain",
+            "b",
+            "--skip-assets",
+        ])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .assert()
+        .success();
+    handle.join().unwrap();
+    let reqs = log.lock().unwrap();
+    assert_eq!(reqs.len(), 1, "push only, no asset traffic: {reqs:?}");
+}
+
+#[test]
+fn export_restores_missing_assets_sha_verified() {
+    let manifest_line =
+        "{\\\"path\\\":\\\"_files/x.bin\\\",\\\"sha256\\\":\\\"671a0d168d8e3d31819402ac7c3a3cc0abedebbf6a4cda26deacd89724bd6bdc\\\",\\\"bytes\\\":4}\\n";
+    let export_body = format!(
+        r#"{{"slug":"b","files":[{{"path":"a.md","content":"alpha"}},{{"path":"assets.jsonl","content":"{manifest_line}"}}]}}"#
+    );
+    let presigned = r#"{"url":"{BASE}/blob-get"}"#;
+    let (base, log, handle) = mock_hub(vec![
+        (200, export_body),
+        (200, presigned.to_string()),
+        (200, "BLOB".to_string()), // the presigned GET body
+    ]);
+    let work = tempfile::tempdir().unwrap();
+    let out = sevra()
+        .args(["export", "b", "out"])
+        .current_dir(work.path())
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "export failed: {}", all_output(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("assets: 1 restored"),
+        "restore tally shown: {stdout}"
+    );
+    handle.join().unwrap();
+    let reqs = log.lock().unwrap();
+    assert_eq!(reqs.len(), 3, "export, presign, GET: {reqs:?}");
+    assert_eq!(
+        reqs[1].path,
+        format!("/api/hub/brains/b/assets/presign?sha256={BLOB_SHA}&action=get")
+    );
+    let restored = std::fs::read(work.path().join("out/_files/x.bin")).unwrap();
+    assert_eq!(restored, b"BLOB", "restored bytes match the manifest hash");
+}

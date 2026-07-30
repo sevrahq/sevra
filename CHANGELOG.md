@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.2.7 — 2026-07-30
+
+Your brain is more than markdown — the bytes ride too. 0.2.6 and every
+release before it pushed the manifest and left the blobs home; the hub's
+content-addressed asset transport had no client. Now it does.
+
+- New: **push syncs asset bytes.** After a committed snapshot, `sevra push`
+  asks the hub which `assets.jsonl`-declared hashes are still missing and
+  ships each one through the content-addressed flow — presign
+  (quota-reserved) → exact-length checksummed PUT → confirm. Blobs dedupe on
+  hash, re-pushes skip everything already present, `.sevralocal` kept-home
+  paths never leave the machine, and a locally missing or drifted file is
+  named and skipped, never a stranded push. `--skip-assets` opts a push out.
+- New: **export restores asset bytes.** `sevra export` reads the exported
+  manifest and downloads every absent (or drifted) blob beside the store —
+  each SHA-256-verified and containment-checked before it is written.
+  `--skip-assets` opts out. Export round-trips the whole brain: markdown,
+  manifest, and bytes.
+- Changed: presigned transfer URLs now honor the SAME loopback exemption as
+  every hub URL (`assert_safe_hub`): HTTPS everywhere, plain HTTP only to
+  the caller's own machine — which also lets the mock-hub suite cover the
+  real byte path end to end.
+- Note: the hub's single-push markdown ceiling returned to the 512 MiB
+  pack-format bound (streaming ingest landed hub-side), so the CLI's
+  existing 512 MiB store preflight is again the same number the hub
+  enforces — one limit, both sides.
+
 ## 0.2.6 — 2026-07-30
 
 - Security: push and secret scanning now refuse any file or directory symlink

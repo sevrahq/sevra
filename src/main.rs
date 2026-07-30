@@ -7,6 +7,7 @@
 //! surface (login / brains / push / query / grant / publish). `validate`
 //! shells the public `dbmd` binary and never links its library.
 
+mod assets;
 mod commands;
 mod config;
 mod hub;
@@ -102,6 +103,10 @@ enum Commands {
         /// Push even when the secret scan finds matches
         #[arg(long)]
         allow_secrets: bool,
+        /// Skip the post-commit asset byte sync (`assets.jsonl`-declared
+        /// blobs the hub reports missing upload by default)
+        #[arg(long)]
+        skip_assets: bool,
     },
     /// Query a brain by text + frontmatter filters
     Query {
@@ -172,7 +177,13 @@ enum Commands {
         brain: String,
     },
     /// Write your brain back to disk (you own it)
-    Export { brain: String, dir: Option<String> },
+    Export {
+        brain: String,
+        dir: Option<String>,
+        /// Skip restoring `assets.jsonl`-declared blobs beside the store
+        #[arg(long)]
+        skip_assets: bool,
+    },
     /// Validate a store (wraps `dbmd validate --all`)
     Validate { dir: Option<String> },
     /// Print this build's version
@@ -301,7 +312,8 @@ fn main() {
             brain,
             force,
             allow_secrets,
-        } => commands::push(&cfg, &dir, &brain, force, allow_secrets),
+            skip_assets,
+        } => commands::push(&cfg, &dir, &brain, force, allow_secrets, skip_assets),
         Commands::Query {
             brain,
             text,
@@ -356,7 +368,11 @@ fn main() {
             } => commands::secrets_quarantine(dir, dry_run, closure),
         },
         Commands::Inbox { action, brain } => commands::inbox(&cfg, &action, &brain),
-        Commands::Export { brain, dir } => commands::export(&cfg, &brain, dir),
+        Commands::Export {
+            brain,
+            dir,
+            skip_assets,
+        } => commands::export(&cfg, &brain, dir, skip_assets),
         Commands::Update => update::cmd_update(&cfg),
         // handled above
         Commands::Login { .. }

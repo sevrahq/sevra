@@ -43,16 +43,30 @@ pub fn assert_safe_hub(hub: &str) {
     }
 }
 
+/// Presigned-transfer URL guard: HTTPS only — with the SAME loopback
+/// exemption every hub URL gets (`assert_safe_hub`): plain HTTP to the
+/// caller's own machine steers nothing to an attacker, and it is what lets
+/// the mock-hub tests cover the REAL byte path instead of stopping at the
+/// presign response. Userinfo and fragments stay refused everywhere.
+fn assert_safe_presigned(parsed: &url::Url, what: &str) {
+    if !parsed.username().is_empty() || parsed.password().is_some() || parsed.fragment().is_some() {
+        fail(&format!("the hub returned an unsafe {what} URL"), None);
+    }
+    let loopback = match parsed.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    if parsed.scheme() != "https" && !loopback {
+        fail(&format!("the hub returned an unsafe {what} URL"), None);
+    }
+}
+
 pub fn put_presigned(url: &str, headers: &Value, bytes: &[u8]) {
     let parsed = url::Url::parse(url)
         .unwrap_or_else(|_| fail("the hub returned an invalid upload URL", None));
-    if parsed.scheme() != "https"
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.fragment().is_some()
-    {
-        fail("the hub returned an unsafe upload URL", None);
-    }
+    assert_safe_presigned(&parsed, "upload");
     let http = agent();
     let result = with_connect_retries(|| {
         let mut req = http.put(url);
@@ -107,13 +121,7 @@ fn response_snippet_suffix(resp: ureq::Response) -> String {
 pub fn get_presigned(url: &str, max_bytes: u64) -> Vec<u8> {
     let parsed = url::Url::parse(url)
         .unwrap_or_else(|_| fail("the hub returned an invalid download URL", None));
-    if parsed.scheme() != "https"
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.fragment().is_some()
-    {
-        fail("the hub returned an unsafe download URL", None);
-    }
+    assert_safe_presigned(&parsed, "download");
     let http = agent();
     let resp = match with_connect_retries(|| http.get(url).call().map_err(Box::new)) {
         Ok(resp) => resp,
