@@ -2212,12 +2212,21 @@ fn rollback_held_export(
                     .expect("existing backup retains permissions");
                 root.atomic_write(&backup.path, bytes, true, export_mode(permissions))
                     .and_then(|()| {
+                        // Unix mode restoration is descriptor-based and
+                        // meaningful. Windows' `Permissions` only carries the
+                        // readonly attribute; the file was necessarily
+                        // writable for the atomic replacement to succeed, and
+                        // a GENERIC_READ handle cannot call
+                        // `SetFileInformationByHandle`. Sync the securely
+                        // reopened file there without requesting a permission
+                        // mutation that Windows correctly rejects.
                         let file = root.open_relative(&backup.path)?.ok_or_else(|| {
                             std::io::Error::new(
                                 std::io::ErrorKind::NotFound,
                                 "restored file disappeared",
                             )
                         })?;
+                        #[cfg(unix)]
                         file.set_permissions(permissions.clone())?;
                         file.sync_all()
                     })

@@ -424,8 +424,9 @@ while [ "$poll" -lt 180 ]; do
   poll=$((poll + 1))
   sleep 2
 done
-[ -n "$release_run_id" ] && [ -n "$attempt" ] ||
+if [ -z "$release_run_id" ] || [ -z "$attempt" ]; then
   die "could not resolve one unique release workflow run for exact tag $tag and SHA $release_sha"
+fi
 
 if [ "$original_signer" -eq 1 ]; then
   pending_environment_id=""
@@ -668,8 +669,9 @@ if [ "$original_signer" -eq 0 ]; then
   [ "$(find "$unsigned_dir" -type f | wc -l | tr -d ' ')" = 5 ] ||
     die "downloaded unsigned artifact set does not contain exactly five files"
   for asset in $binary_assets; do
-    [ -f "$unsigned_dir/$asset" ] && [ ! -L "$unsigned_dir/$asset" ] ||
+    if [ ! -f "$unsigned_dir/$asset" ] || [ -L "$unsigned_dir/$asset" ]; then
       die "unsigned artifact is missing or unsafe: $asset"
+    fi
     gh attestation verify "$unsigned_dir/$asset" \
       --repo "$repo" \
       --signer-workflow "$repo/.github/workflows/release.yml" \

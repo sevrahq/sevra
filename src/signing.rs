@@ -84,7 +84,9 @@ mod tests {
 
     #[test]
     fn release_workflow_isolates_successor_signing_from_actions() {
-        let workflow = include_str!("../.github/workflows/release.yml");
+        // Git checkouts on Windows may materialize CRLF. Security assertions
+        // inspect the workflow's tokens, not its platform line endings.
+        let workflow = include_str!("../.github/workflows/release.yml").replace("\r\n", "\n");
         assert!(workflow.contains(
             "SEVRA_ORIGINAL_SIGNER_SPKI: MCowBQYDK2VwAyEA+v5mafEPcIwKAU/DO/z8MM/cT9ndgE1saSUfvcrzLKA="
         ));

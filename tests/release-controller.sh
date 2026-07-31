@@ -312,12 +312,12 @@ delete_line="$(
   grep -nFx "gh secret delete SEVRA_CLI_SIGNING_KEY --repo sevrahq/sevra" \
     "$SEVRA_TEST_LOG" | sed -n '1s/:.*//p'
 )"
-[ -n "$checkpoint_line" ] && [ -n "$delete_line" ] &&
-  [ "$checkpoint_line" -lt "$delete_line" ] || {
+if [ -z "$checkpoint_line" ] || [ -z "$delete_line" ] ||
+  [ "$checkpoint_line" -ge "$delete_line" ]; then
     printf '%s\n' "signer deletion did not follow checkpoint verification" >&2
     cat "$SEVRA_TEST_LOG" >&2
     exit 1
-  }
+fi
 grep -Fq "verified durable signed checkpoint; deleted the transitional repository signer" \
   "$fixture/checkpoint.out"
 
