@@ -245,7 +245,19 @@ function Invoke-Main {
     # ── Verify checksum against the independently deployed manifest ────────
     # A custom binary mirror never silently becomes its own trust root. Tests
     # and private mirrors must separately set SEVRA_TRUSTED_MANIFEST_BASE.
-    try { $expected = "$(Invoke-RestMethod -Uri "$ManifestBase/$version/$assetName" -UseBasicParsing)".Trim().ToLowerInvariant() } catch {
+    # WinHTTP/WinINet can reuse a cached manifest response inside one process.
+    # Integrity metadata must be fetched for this install attempt, not inherited
+    # from an earlier request that may predate a revocation or manifest change.
+    $manifestNonce = [Guid]::NewGuid().ToString('N')
+    $manifestResource = "$ManifestBase/$version/$assetName"
+    $manifestSeparator = if ($manifestResource -match '\?') { '&' } else { '?' }
+    $manifestUrl = "${manifestResource}${manifestSeparator}nonce=$manifestNonce"
+    try {
+      $expected = "$(Invoke-RestMethod -Uri $manifestUrl -UseBasicParsing -Headers @{
+        'Cache-Control' = 'no-cache, no-store'
+        'Pragma' = 'no-cache'
+      })".Trim().ToLowerInvariant()
+    } catch {
       Fail "no trusted checksum for sevra $version $assetName"
     }
     if ($expected -notmatch '^[0-9a-f]{64}$') { Fail "no trusted checksum for sevra $version $assetName" }
