@@ -2213,22 +2213,27 @@ fn rollback_held_export(
                 root.atomic_write(&backup.path, bytes, true, export_mode(permissions))
                     .and_then(|()| {
                         // Unix mode restoration is descriptor-based and
-                        // meaningful. Windows' `Permissions` only carries the
-                        // readonly attribute; the file was necessarily
-                        // writable for the atomic replacement to succeed, and
-                        // a GENERIC_READ handle cannot call
-                        // `SetFileInformationByHandle`. Sync the securely
-                        // reopened file there without requesting a permission
-                        // mutation that Windows correctly rejects.
-                        let file = root.open_relative(&backup.path)?.ok_or_else(|| {
-                            std::io::Error::new(
-                                std::io::ErrorKind::NotFound,
-                                "restored file disappeared",
-                            )
-                        })?;
+                        // meaningful. The atomic writer already fsyncs on
+                        // every platform. Reopening with GENERIC_READ on
+                        // Windows cannot call either SetFileInformation or
+                        // FlushFileBuffers, so a redundant post-commit sync
+                        // would turn a successful durable restore into
+                        // ERROR_ACCESS_DENIED.
                         #[cfg(unix)]
-                        file.set_permissions(permissions.clone())?;
-                        file.sync_all()
+                        {
+                            let file = root.open_relative(&backup.path)?.ok_or_else(|| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::NotFound,
+                                    "restored file disappeared",
+                                )
+                            })?;
+                            file.set_permissions(permissions.clone())?;
+                            file.sync_all()
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            Ok(())
+                        }
                     })
             }
             None => root.remove_regular(&backup.path).map(|_| ()),
