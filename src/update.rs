@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde_json::{json, Value};
 
 use crate::config::Config;
-use crate::output::{fail, json_mode, note, out};
+use crate::output::{fail, json_mode, note, out, out_layout, terminal_safe};
 use crate::signing;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -36,15 +36,29 @@ pub fn hex_sha256(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// The digest the origin vouches for, or None when it does not serve one
-/// (unreachable, unknown version, non-digest body). None means "no second
-/// opinion available", never "approved".
-fn trusted_digest(version: &str, asset: &str) -> Option<String> {
-    let url = format!("{}/{version}/{asset}", trusted_manifest_base());
-    let body = download(&url).ok()?;
-    let text = String::from_utf8(body).ok()?.trim().to_lowercase();
+fn parse_trusted_digest(body: Vec<u8>) -> Result<String, String> {
+    let text = String::from_utf8(body)
+        .map_err(|_| "trusted release digest was not UTF-8".to_string())?
+        .trim()
+        .to_lowercase();
     let ok = text.len() == 64 && text.chars().all(|c| c.is_ascii_hexdigit());
     ok.then_some(text)
+        .ok_or_else(|| "trusted release digest was not a bare SHA-256".to_string())
+}
+
+/// The digest the independent Sevra origin vouches for. This is a required
+/// second root: a missing, unreachable, or malformed answer refuses the
+/// update just like a mismatch. Availability may delay an update; it must
+/// never silently collapse two required approvals into the signing key alone.
+fn trusted_digest(version: &str, asset: &str) -> Result<String, String> {
+    trusted_digest_from(&trusted_manifest_base(), version, asset)
+}
+
+fn trusted_digest_from(base: &str, version: &str, asset: &str) -> Result<String, String> {
+    let url = format!("{base}/{version}/{asset}");
+    let body = download(&url)
+        .map_err(|e| format!("trusted release digest unavailable ({e}) — refusing update"))?;
+    parse_trusted_digest(body).map_err(|e| format!("{e} — refusing update"))
 }
 
 static CHECKED: AtomicBool = AtomicBool::new(false);
@@ -264,16 +278,12 @@ fn download_verify_replace(version: &str) -> Result<(), String> {
     // deployed manifest, so a signing-key compromise alone is no longer enough
     // to push a binary onto every installed CLI unattended.
     //
-    // Deliberately fail-OPEN on a missing/unreachable digest and fail-CLOSED on
-    // a mismatch: a manifest outage must not brick self-update fleet-wide (the
-    // signature still gates it), but a served digest that disagrees is a stop.
-    if let Some(expected) = trusted_digest(version, &format!("sevra-{target}{}", asset_suffix())) {
-        let actual = hex_sha256(&binary);
-        if actual != expected {
-            return Err(format!(
-                "digest mismatch for {base}: the Sevra manifest expects {expected}, got {actual} — refusing to replace the CLI (report: https://www.sevrahq.com/security)"
-            ));
-        }
+    let expected = trusted_digest(version, &format!("sevra-{target}{}", asset_suffix()))?;
+    let actual = hex_sha256(&binary);
+    if actual != expected {
+        return Err(format!(
+            "digest mismatch for {base}: the Sevra manifest expects {expected}, got {actual} — refusing to replace the CLI (report: https://www.sevrahq.com/security)"
+        ));
     }
     let self_path = std::env::current_exe().map_err(|e| format!("cannot locate self: {e}"))?;
     let self_path = fs::canonicalize(&self_path).unwrap_or(self_path);
@@ -323,21 +333,28 @@ fn download_verify_replace(version: &str) -> Result<(), String> {
 /// runner stamps only when it actually checks. Best-effort: an unreadable/
 /// unwritable stamp file just means "check now".
 fn update_check_due(stamp: bool) -> bool {
-    let path = crate::config::config_dir().join("update-check");
+    let dir = crate::config::config_dir();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    if let Ok(prev) = fs::read_to_string(&path) {
-        if let Ok(prev) = prev.trim().parse::<u64>() {
-            if now.saturating_sub(prev) < 24 * 60 * 60 {
-                return false;
+    if let Ok(Some(bytes)) = crate::safe_path::read_regular(&dir, "update-check") {
+        if let Ok(prev) = std::str::from_utf8(&bytes) {
+            if let Ok(prev) = prev.trim().parse::<u64>() {
+                if now.saturating_sub(prev) < 24 * 60 * 60 {
+                    return false;
+                }
             }
         }
     }
-    if stamp {
-        let _ = fs::create_dir_all(crate::config::config_dir());
-        let _ = fs::write(&path, now.to_string());
+    if stamp && crate::safe_path::ensure_dir(&dir, 0o700).is_ok() {
+        let _ = crate::safe_path::atomic_write(
+            &dir,
+            "update-check",
+            now.to_string().as_bytes(),
+            false,
+            0o600,
+        );
     }
     true
 }
@@ -390,7 +407,13 @@ pub fn run_deferred_auto_update() {
         Ok(()) => note(&format!(
             "auto-updated {VERSION} → {latest} (applies next run; SEVRA_NO_AUTO_UPDATE=1 disables)"
         )),
-        Err(e) if e.contains("FAILED") => note(&format!("SECURITY: {e}")),
+        Err(e)
+            if e.contains("FAILED")
+                || e.contains("trusted release digest")
+                || e.contains("digest mismatch") =>
+        {
+            note(&format!("SECURITY: {e}"))
+        }
         Err(_) => note(&format!(
             "sevra {VERSION} is out of date ({latest} is available) — run `sevra update`"
         )),
@@ -434,8 +457,10 @@ pub fn cmd_update(cfg: &Config) {
     if is_older(VERSION, &latest) {
         match download_verify_replace(&latest) {
             Ok(()) => {
-                line =
-                    format!("updated {VERSION} → {latest} (signature verified; applies next run)");
+                line = format!(
+                    "updated {VERSION} → {} (signature + independent digest verified; applies next run)",
+                    terminal_safe(&latest)
+                );
                 data.insert("from".into(), json!(VERSION));
                 data.insert("to".into(), json!(latest));
                 data.insert("updated".into(), json!(true));
@@ -463,7 +488,7 @@ pub fn cmd_update(cfg: &Config) {
                 None => {
                     line.push_str(&format!(
                         "\ndbmd: not installed — get it: curl -fsSL {}/install/dbmd.sh | sh",
-                        cfg.hub
+                        terminal_safe(&cfg.hub)
                     ));
                     data.insert(
                         "dbmd".into(),
@@ -472,8 +497,10 @@ pub fn cmd_update(cfg: &Config) {
                 }
                 Some(v) if is_older(v, dbmd_latest) => {
                     line.push_str(&format!(
-                        "\ndbmd {v} is behind {dbmd_latest} — update: curl -fsSL {}/install/dbmd.sh | sh",
-                        cfg.hub
+                        "\ndbmd {} is behind {} — update: curl -fsSL {}/install/dbmd.sh | sh",
+                        terminal_safe(v),
+                        terminal_safe(dbmd_latest),
+                        terminal_safe(&cfg.hub)
                     ));
                     data.insert(
                         "dbmd".into(),
@@ -481,7 +508,7 @@ pub fn cmd_update(cfg: &Config) {
                     );
                 }
                 Some(v) => {
-                    line.push_str(&format!("\ndbmd {v} — current"));
+                    line.push_str(&format!("\ndbmd {} — current", terminal_safe(v)));
                     data.insert(
                         "dbmd".into(),
                         json!({ "installed": v, "latest": dbmd_latest, "current": true }),
@@ -494,7 +521,7 @@ pub fn cmd_update(cfg: &Config) {
     if json_mode() {
         out("", Some(Value::Object(data)));
     } else {
-        out(&line, None);
+        out_layout(&line, None);
     }
 }
 
@@ -514,6 +541,8 @@ fn dbmd_installed_version() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
+    use std::thread;
 
     #[test]
     fn semver_ordering() {
@@ -573,21 +602,45 @@ mod tests {
 
     #[test]
     fn trusted_digest_rejects_anything_that_is_not_a_bare_digest() {
-        // A 404 page, an HTML error, or a truncated value must read as "no
-        // second opinion", never as an approval. Exercised through the same
-        // shape-check the fetch path applies.
-        let looks_like_digest = |t: &str| {
-            let t = t.trim().to_lowercase();
-            t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit())
-        };
-        assert!(looks_like_digest(
+        let good = b"E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855\n".to_vec();
+        assert_eq!(
+            parse_trusted_digest(good).unwrap(),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        ));
-        assert!(!looks_like_digest("<!doctype html><title>404</title>"));
-        assert!(!looks_like_digest("release asset is not trusted"));
-        assert!(!looks_like_digest(""));
-        assert!(!looks_like_digest("e3b0c442"));
-        assert!(!looks_like_digest(&"z".repeat(64)));
+        );
+        for bad in [
+            "<!doctype html><title>404</title>",
+            "release asset is not trusted",
+            "",
+            "e3b0c442",
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        ] {
+            assert!(
+                parse_trusted_digest(bad.as_bytes().to_vec()).is_err(),
+                "{bad:?} must not approve an update"
+            );
+        }
+        assert!(parse_trusted_digest(vec![0xff, 0xfe]).is_err());
+    }
+
+    #[test]
+    fn unavailable_independent_digest_refuses_instead_of_falling_back() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request_bytes = [0_u8; 1024];
+            let _ = stream.read(&mut request_bytes).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let error = trusted_digest_from(&format!("http://{address}"), "9.9.9", "sevra-test-target")
+            .unwrap_err();
+        assert!(error.contains("trusted release digest unavailable"));
+        assert!(error.contains("refusing update"));
+        server.join().unwrap();
     }
 
     #[cfg(unix)]

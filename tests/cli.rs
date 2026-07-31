@@ -12,6 +12,7 @@ fn sevra() -> Command {
     // `home::home_dir()` reads HOME on unix and USERPROFILE on Windows —
     // set both so the isolation holds on every CI OS.
     let home = std::env::temp_dir().join(format!("sevra-test-{}", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
     c.env("HOME", &home);
     c.env("USERPROFILE", &home);
     c.env_remove("SEVRA_API_KEY");
@@ -41,11 +42,14 @@ fn version_json_is_machine_readable() {
 
 #[test]
 fn help_lists_commands() {
-    sevra()
-        .arg("--help")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("login").and(predicate::str::contains("update")));
+    let out = sevra().arg("--help").output().unwrap();
+    assert!(out.status.success(), "{}", all_output(&out));
+    let help = String::from_utf8(out.stdout).unwrap();
+    assert!(help.contains("login") && help.contains("update"));
+    assert!(
+        help.lines().count() > 5,
+        "trusted clap layout must retain its real line breaks"
+    );
 }
 
 #[test]
@@ -200,6 +204,28 @@ fn logout_without_credential_is_honest() {
         .assert()
         .success()
         .stdout(predicate::str::contains("no stored credential"));
+}
+
+#[cfg(unix)]
+#[test]
+fn logout_never_deletes_through_a_symlinked_config_directory() {
+    let home = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("config.json"), b"UNRELATED").unwrap();
+    std::os::unix::fs::symlink(outside.path(), home.path().join(".sevra")).unwrap();
+
+    let out = sevra_at_home(home.path()).arg("logout").output().unwrap();
+    assert!(!out.status.success(), "{}", all_output(&out));
+    assert_eq!(
+        std::fs::read(outside.path().join("config.json")).unwrap(),
+        b"UNRELATED",
+        "logout must not follow ~/.sevra onto an unrelated config.json"
+    );
+    assert!(
+        all_output(&out).contains("could not remove"),
+        "{}",
+        all_output(&out)
+    );
 }
 
 #[test]
@@ -1119,7 +1145,7 @@ fn push_refuses_an_external_symlink_before_any_request_or_read() {
     let all = all_output(&out);
     assert!(all.contains("shared.md"), "names the hostile link: {all}");
     assert!(
-        all.contains("resolves outside the store"),
+        all.contains("symlink in the store"),
         "explains the boundary: {all}"
     );
     assert!(
@@ -1258,10 +1284,74 @@ fn non_json_error_bodies_surface_their_start() {
     handle.join().unwrap();
 }
 
+#[test]
+fn human_output_neutralizes_terminal_control_sequences_from_the_hub() {
+    let hostile = "name\n\t\u{1b}[31mred\u{1b}[0m\u{1b}]52;c;Y2xpcA==\u{7}\rforged";
+    let body = serde_json::json!({
+        "brains": [{
+            "slug": "safe",
+            "id": "01safe",
+            "visibility": "private",
+            "name": hostile,
+        }]
+    })
+    .to_string();
+    let (base, _log, handle) = mock_hub(vec![(200, body)]);
+    let out = sevra()
+        .arg("brains")
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", all_output(&out));
+    assert!(!out.stdout.contains(&0x1b), "ESC reached the terminal");
+    assert!(!out.stdout.contains(&0x07), "BEL reached the terminal");
+    assert!(!out.stdout.contains(&b'\r'), "CR reached the terminal");
+    assert_eq!(
+        out.stdout.iter().filter(|byte| **byte == b'\n').count(),
+        1,
+        "only println's trusted final line break may reach the terminal"
+    );
+    assert_eq!(
+        out.stdout.iter().filter(|byte| **byte == b'\t').count(),
+        3,
+        "the program-authored tabular layout remains readable"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(r"\n\t\u{001b}"),
+        "controls are visibly escaped"
+    );
+    handle.join().unwrap();
+}
+
 // --- .sevralocal + secrets scan/quarantine (the 0.2.5 surface) ----------------
 // Secrets get a place that is not the hub: a kept-home list the push walk
 // honors, a read-only scan, and a quarantine that appends hit files to the
 // list. Everything here is offline except the push wiring against mock hubs.
+
+#[test]
+fn oversized_sevralocal_refuses_before_network_and_is_not_mutated() {
+    let t = store_dir(&[("a.md", "rides")]);
+    let scope_path = t.path().join(".sevralocal");
+    let original = vec![b'#'; 1024 * 1024 + 1];
+    std::fs::write(&scope_path, &original).unwrap();
+    let (base, log, handle) = mock_hub(vec![]);
+    let out = sevra()
+        .args(["push", t.path().to_str().unwrap(), "--brain", "b"])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{}", all_output(&out));
+    assert!(all_output(&out).contains("exceeds 1048576 bytes"));
+    handle.join().unwrap();
+    assert!(log.lock().unwrap().is_empty(), "no request was attempted");
+    assert_eq!(
+        std::fs::read(scope_path).unwrap(),
+        original,
+        "rejection must not rewrite local scope"
+    );
+}
 
 #[test]
 fn push_keeps_sevralocal_files_home_and_reports_it() {
@@ -1523,6 +1613,68 @@ fn secrets_quarantine_marks_hits_and_reruns_append_nothing() {
         .args(["secrets", "scan", t.path().to_str().unwrap()])
         .assert()
         .success();
+}
+
+#[cfg(unix)]
+#[test]
+fn secrets_quarantine_refuses_a_scope_symlink_without_creating_its_target() {
+    let key = format!("AKIA{}", "N".repeat(16));
+    let t = store_dir(&[("creds.md", &format!("k: {key}"))]);
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("future-shell-rc");
+    std::os::unix::fs::symlink(&target, t.path().join(".sevralocal")).unwrap();
+
+    sevra()
+        .args(["secrets", "quarantine", t.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("must not be a symlink"));
+    assert!(
+        !target.exists(),
+        "a dangling external target must never be created"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn secrets_quarantine_refuses_newline_filenames_before_writing_scope() {
+    let key = format!("AKIA{}", "P".repeat(16));
+    let hostile_name = "#\ntouch SEVRA_PWNED\n#.md";
+    let t = store_dir(&[(hostile_name, &format!("k: {key}"))]);
+
+    sevra()
+        .args(["secrets", "quarantine", t.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "matched file path contains control characters",
+        ));
+    assert!(
+        !t.path().join(".sevralocal").exists(),
+        "the line-oriented scope file must not be created"
+    );
+}
+
+#[test]
+fn secrets_quarantine_escapes_a_comment_shaped_filename() {
+    let key = format!("AKIA{}", "Q".repeat(16));
+    let t = store_dir(&[("#creds.md", &format!("k: {key}"))]);
+
+    sevra()
+        .args(["secrets", "quarantine", t.path().to_str().unwrap()])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(t.path().join(".sevralocal")).unwrap(),
+        "[#]creds.md\n"
+    );
+    sevra()
+        .args(["secrets", "scan", t.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "no matches for known secret formats",
+        ));
 }
 
 #[test]
@@ -1861,6 +2013,42 @@ fn push_skip_assets_makes_no_asset_requests() {
 }
 
 #[test]
+fn push_refuses_sparse_oversize_asset_before_read_or_presign() {
+    let t = asset_store();
+    let sparse = std::fs::OpenOptions::new()
+        .write(true)
+        .open(t.path().join("_files/x.bin"))
+        .unwrap();
+    sparse.set_len(2 * 1024 * 1024 * 1024 + 1).unwrap();
+    drop(sparse);
+    let missing = format!(
+        r#"{{"assets":[{{"path":"_files/x.bin","sha256":"{BLOB_SHA}","bytes":4,"required":true,"presentInR2":false}}],"truncated":false}}"#
+    );
+    let (base, log, handle) = mock_hub(vec![
+        (200, r#"{"indexed":{"documents":1,"assets":1}}"#.to_string()),
+        (200, missing),
+    ]);
+    let out = sevra()
+        .args(["push", t.path().to_str().unwrap(), "--brain", "b"])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "push failed: {}", all_output(&out));
+    assert!(
+        all_output(&out).contains("local file exceeds the 2 GiB client asset limit"),
+        "{}",
+        all_output(&out)
+    );
+    handle.join().unwrap();
+    assert_eq!(
+        log.lock().unwrap().len(),
+        2,
+        "oversize metadata is rejected before presign or body read"
+    );
+}
+
+#[test]
 fn export_restores_missing_assets_sha_verified() {
     let manifest_line =
         "{\\\"path\\\":\\\"_files/x.bin\\\",\\\"sha256\\\":\\\"671a0d168d8e3d31819402ac7c3a3cc0abedebbf6a4cda26deacd89724bd6bdc\\\",\\\"bytes\\\":4}\\n";
@@ -1896,4 +2084,392 @@ fn export_restores_missing_assets_sha_verified() {
     );
     let restored = std::fs::read(work.path().join("out/_files/x.bin")).unwrap();
     assert_eq!(restored, b"BLOB", "restored bytes match the manifest hash");
+}
+
+#[test]
+fn export_refuses_huge_manifest_asset_before_presign() {
+    let manifest_line = format!(
+        "{{\\\"path\\\":\\\"_files/x.bin\\\",\\\"sha256\\\":\\\"{BLOB_SHA}\\\",\\\"bytes\\\":2147483649}}\\n"
+    );
+    let export_body = format!(
+        r#"{{"slug":"b","files":[{{"path":"a.md","content":"alpha"}},{{"path":"assets.jsonl","content":"{manifest_line}"}}]}}"#
+    );
+    let (base, log, handle) = mock_hub(vec![(200, export_body)]);
+    let work = tempfile::tempdir().unwrap();
+    let out = sevra()
+        .args(["export", "b", "out"])
+        .current_dir(work.path())
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{}", all_output(&out));
+    assert!(
+        all_output(&out).contains("exceeds the 2 GiB client asset limit"),
+        "{}",
+        all_output(&out)
+    );
+    assert!(!work.path().join("out/_files/x.bin").exists());
+    handle.join().unwrap();
+    assert_eq!(
+        log.lock().unwrap().len(),
+        1,
+        "huge declaration is rejected before a presign request"
+    );
+}
+
+#[test]
+fn export_rejects_unicode_aliases_before_creating_the_root() {
+    let (base, log, handle) = mock_hub(vec![(
+        200,
+        r#"{"slug":"b","files":[{"path":"é.md","content":"NFC"},{"path":"é.md","content":"NFD"}]}"#
+            .to_string(),
+    )]);
+    let work = tempfile::tempdir().unwrap();
+    let out = sevra()
+        .args(["export", "b", "out", "--skip-assets"])
+        .current_dir(work.path())
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{}", all_output(&out));
+    assert!(all_output(&out).contains("alias collision"));
+    assert!(!work.path().join("out").exists());
+    handle.join().unwrap();
+    assert_eq!(log.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn export_rejects_a_single_noncanonical_core_control_before_mutation() {
+    let (base, log, handle) = mock_hub(vec![(
+        200,
+        r#"{"slug":"b","files":[{"path":"Assets.jsonl","content":"ATTACK"}]}"#.to_string(),
+    )]);
+    let work = tempfile::tempdir().unwrap();
+    let out = sevra()
+        .args(["export", "b", "out", "--skip-assets"])
+        .current_dir(work.path())
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{}", all_output(&out));
+    assert!(
+        all_output(&out).contains("non-canonical assets.jsonl"),
+        "{}",
+        all_output(&out)
+    );
+    assert!(!work.path().join("out").exists());
+    handle.join().unwrap();
+    assert_eq!(log.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn export_rejects_hidden_components_before_root_or_presign() {
+    for path in [".git/config", "records/.ssh/key", ".sevralocal/owned.md"] {
+        let export_body =
+            format!(r#"{{"slug":"b","files":[{{"path":"{path}","content":"ATTACK"}}]}}"#);
+        let (base, log, handle) = mock_hub(vec![(200, export_body)]);
+        let work = tempfile::tempdir().unwrap();
+        let out = sevra()
+            .args(["export", "b", "out"])
+            .current_dir(work.path())
+            .env("SEVRA_HUB_URL", &base)
+            .env("SEVRA_API_KEY", "x")
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{}", all_output(&out));
+        assert!(all_output(&out).contains("hidden control component"));
+        assert!(!work.path().join("out").exists());
+        handle.join().unwrap();
+        assert_eq!(log.lock().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn export_rejects_existing_case_and_unicode_aliases_without_replacement() {
+    for (remote, existing) in [("assets.jsonl", "Assets.jsonl"), ("é.md", "é.md")] {
+        let content = if remote == "assets.jsonl" {
+            ""
+        } else {
+            "ATTACK"
+        };
+        let export_body =
+            format!(r#"{{"slug":"b","files":[{{"path":"{remote}","content":"{content}"}}]}}"#);
+        let (base, log, handle) = mock_hub(vec![(200, export_body)]);
+        let work = tempfile::tempdir().unwrap();
+        std::fs::create_dir(work.path().join("out")).unwrap();
+        std::fs::write(work.path().join("out").join(existing), b"SAFE").unwrap();
+        let out = sevra()
+            .args(["export", "b", "out", "--skip-assets"])
+            .current_dir(work.path())
+            .env("SEVRA_HUB_URL", &base)
+            .env("SEVRA_API_KEY", "x")
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{}", all_output(&out));
+        assert!(
+            all_output(&out).contains("destination already exists"),
+            "{}",
+            all_output(&out)
+        );
+        assert_eq!(
+            std::fs::read(work.path().join("out").join(existing)).unwrap(),
+            b"SAFE"
+        );
+        handle.join().unwrap();
+        assert_eq!(log.lock().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn export_rejects_asset_store_alias_before_presign_or_mutation() {
+    let manifest_line = format!(
+        "{{\\\"path\\\":\\\"Assets.jsonl\\\",\\\"sha256\\\":\\\"{BLOB_SHA}\\\",\\\"bytes\\\":4}}\\n"
+    );
+    let export_body = format!(
+        r#"{{"slug":"b","files":[{{"path":"a.md","content":"alpha"}},{{"path":"assets.jsonl","content":"{manifest_line}"}}]}}"#
+    );
+    let (base, log, handle) = mock_hub(vec![(200, export_body)]);
+    let work = tempfile::tempdir().unwrap();
+    let out = sevra()
+        .args(["export", "b", "out"])
+        .current_dir(work.path())
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{}", all_output(&out));
+    assert!(all_output(&out).contains("reserved asset path"));
+    assert!(!work.path().join("out").exists());
+    handle.join().unwrap();
+    assert_eq!(
+        log.lock().unwrap().len(),
+        1,
+        "portable manifest refusal happens before presign"
+    );
+}
+
+#[test]
+fn export_stream_refuses_first_byte_past_declared_length_without_installing() {
+    let manifest_line =
+        "{\\\"path\\\":\\\"_files/x.bin\\\",\\\"sha256\\\":\\\"671a0d168d8e3d31819402ac7c3a3cc0abedebbf6a4cda26deacd89724bd6bdc\\\",\\\"bytes\\\":4}\\n";
+    let export_body = format!(
+        r#"{{"slug":"b","files":[{{"path":"a.md","content":"alpha"}},{{"path":"assets.jsonl","content":"{manifest_line}"}}]}}"#
+    );
+    let presigned = r#"{"url":"{BASE}/blob-get"}"#;
+    let (base, log, handle) = mock_hub(vec![
+        (200, export_body),
+        (200, presigned.to_string()),
+        (200, "BLOBS".to_string()),
+    ]);
+    let work = tempfile::tempdir().unwrap();
+    let out = sevra()
+        .args(["export", "b", "out"])
+        .current_dir(work.path())
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{}", all_output(&out));
+    assert!(
+        all_output(&out).contains("presigned download exceeded the supported size"),
+        "{}",
+        all_output(&out)
+    );
+    assert!(
+        !work.path().join("out/_files/x.bin").exists(),
+        "an oversize stream must never be installed"
+    );
+    handle.join().unwrap();
+    assert_eq!(log.lock().unwrap().len(), 3);
+}
+
+#[cfg(unix)]
+#[test]
+fn export_refuses_a_symlinked_root_without_touching_its_target() {
+    let (base, log, handle) = mock_hub(vec![(
+        200,
+        r#"{"slug":"b","files":[{"path":"victim","content":"ATTACK"}]}"#.to_string(),
+    )]);
+    let work = tempfile::tempdir().unwrap();
+    let outside = work.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("victim"), b"SAFE").unwrap();
+    std::os::unix::fs::symlink(&outside, work.path().join("out")).unwrap();
+
+    let out = sevra()
+        .args(["export", "b", "out"])
+        .current_dir(work.path())
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{}", all_output(&out));
+    assert_eq!(std::fs::read(outside.join("victim")).unwrap(), b"SAFE");
+    assert!(
+        all_output(&out).contains("without following links"),
+        "{}",
+        all_output(&out)
+    );
+    handle.join().unwrap();
+    assert_eq!(log.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn export_prefix_collision_is_rejected_before_replacing_an_existing_file() {
+    let (base, log, handle) = mock_hub(vec![(
+        200,
+        r#"{"slug":"b","files":[{"path":"a","content":"NEW"},{"path":"a/b","content":"COLLISION"}]}"#
+            .to_string(),
+    )]);
+    let work = tempfile::tempdir().unwrap();
+    std::fs::create_dir(work.path().join("out")).unwrap();
+    std::fs::write(work.path().join("out/a"), b"OLD").unwrap();
+
+    let out = sevra()
+        .args(["export", "b", "out"])
+        .current_dir(work.path())
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{}", all_output(&out));
+    assert!(
+        all_output(&out).contains("prefix collision"),
+        "{}",
+        all_output(&out)
+    );
+    assert_eq!(std::fs::read(work.path().join("out/a")).unwrap(), b"OLD");
+    handle.join().unwrap();
+    assert_eq!(log.lock().unwrap().len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn export_refuses_a_core_file_leaf_symlink_without_touching_its_target() {
+    let (base, log, handle) = mock_hub(vec![(
+        200,
+        r#"{"slug":"b","files":[{"path":"victim","content":"ATTACK"}]}"#.to_string(),
+    )]);
+    let work = tempfile::tempdir().unwrap();
+    let outside = work.path().join("outside");
+    std::fs::write(&outside, b"SAFE").unwrap();
+    std::fs::create_dir(work.path().join("out")).unwrap();
+    std::os::unix::fs::symlink(&outside, work.path().join("out/victim")).unwrap();
+
+    let out = sevra()
+        .args(["export", "b", "out"])
+        .current_dir(work.path())
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{}", all_output(&out));
+    assert_eq!(std::fs::read(&outside).unwrap(), b"SAFE");
+    assert!(
+        all_output(&out).contains("destination leaf is a symlink"),
+        "{}",
+        all_output(&out)
+    );
+    handle.join().unwrap();
+    assert_eq!(log.lock().unwrap().len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn export_asset_restore_refuses_a_planted_leaf_symlink() {
+    let manifest_line =
+        "{\\\"path\\\":\\\"_files/x.bin\\\",\\\"sha256\\\":\\\"671a0d168d8e3d31819402ac7c3a3cc0abedebbf6a4cda26deacd89724bd6bdc\\\",\\\"bytes\\\":4}\\n";
+    let export_body = format!(
+        r#"{{"slug":"b","files":[{{"path":"a.md","content":"alpha"}},{{"path":"assets.jsonl","content":"{manifest_line}"}}]}}"#
+    );
+    // A hardened client refuses before asking for a presigned asset URL, so
+    // the mock needs only the export answer.
+    let (base, log, handle) = mock_hub(vec![(200, export_body)]);
+    let work = tempfile::tempdir().unwrap();
+    let victim = work.path().join("victim");
+    std::fs::write(&victim, b"SAFE").unwrap();
+    std::fs::create_dir_all(work.path().join("out/_files")).unwrap();
+    std::os::unix::fs::symlink(&victim, work.path().join("out/_files/x.bin")).unwrap();
+
+    let out = sevra()
+        .args(["export", "b", "out"])
+        .current_dir(work.path())
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{}", all_output(&out));
+    assert_eq!(std::fs::read(&victim).unwrap(), b"SAFE");
+    assert!(
+        all_output(&out).contains("destination leaf is a symlink"),
+        "{}",
+        all_output(&out)
+    );
+    handle.join().unwrap();
+    assert_eq!(
+        log.lock().unwrap().len(),
+        1,
+        "no asset presign/download after filesystem refusal"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn export_asset_restore_refuses_an_ancestor_swapped_during_presign() {
+    for (remote, planted) in [("é.md", "é.md"), ("A.md", "a.md")] {
+        let manifest_line =
+            "{\\\"path\\\":\\\"_files/x.bin\\\",\\\"sha256\\\":\\\"671a0d168d8e3d31819402ac7c3a3cc0abedebbf6a4cda26deacd89724bd6bdc\\\",\\\"bytes\\\":4}\\n";
+        let export_body = format!(
+            r#"{{"slug":"b","files":[{{"path":"{remote}","content":"REMOTE"}},{{"path":"assets.jsonl","content":"{manifest_line}"}}]}}"#
+        );
+        let work = tempfile::tempdir().unwrap();
+        let export_root = work.path().join("out");
+        let planted_path = export_root.join(planted);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let base_for_server = base.clone();
+        let handle = std::thread::spawn(move || {
+            for turn in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_mock_request(&mut stream).unwrap();
+                match turn {
+                    0 => respond_json(&mut stream, 200, &export_body),
+                    1 => {
+                        assert!(request.path.contains("/assets/presign"));
+                        std::fs::create_dir(&export_root).unwrap();
+                        std::fs::write(&planted_path, b"SAFE").unwrap();
+                        respond_json(
+                            &mut stream,
+                            200,
+                            &format!(r#"{{"url":"{base_for_server}/blob"}}"#),
+                        );
+                    }
+                    2 => respond_json(&mut stream, 200, "BLOB"),
+                    _ => unreachable!(),
+                }
+            }
+        });
+        let out = sevra()
+            .args(["export", "b", "out"])
+            .current_dir(work.path())
+            .env("SEVRA_HUB_URL", &base)
+            .env("SEVRA_API_KEY", "x")
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{}", all_output(&out));
+        assert!(
+            all_output(&out).contains("appeared before atomic publish"),
+            "{}",
+            all_output(&out)
+        );
+        assert_eq!(
+            std::fs::read(work.path().join("out").join(planted)).unwrap(),
+            b"SAFE"
+        );
+        assert!(!work.path().join("out/_files/x.bin").exists());
+        handle.join().unwrap();
+    }
 }

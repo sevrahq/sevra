@@ -29,9 +29,11 @@ pub struct Config {
 }
 
 pub fn config_dir() -> PathBuf {
-    home::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".sevra")
+    let home = home::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    // Resolve the trusted home itself (macOS exposes /var as a compatibility
+    // symlink to /private/var), then keep `.sevra` as the untrusted component
+    // that the no-follow capability layer must inspect/create.
+    fs::canonicalize(&home).unwrap_or(home).join(".sevra")
 }
 
 pub fn config_path() -> PathBuf {
@@ -45,9 +47,12 @@ fn strip_trailing_slash(s: &str) -> String {
 /// The raw file config (env-blind) — `login` uses this so a one-off
 /// SEVRA_HUB_URL never becomes the stored default.
 pub fn load_file() -> FileConfig {
-    match fs::read_to_string(config_path()) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_default(), // a corrupt file reads as empty
-        Err(_) => FileConfig::default(),
+    let dir = config_dir();
+    match crate::safe_path::read_regular(&dir, "config.json") {
+        Ok(Some(bytes)) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        // A missing, linked, malformed, or unreadable credential file reads
+        // as empty. It is never followed through a reparse point.
+        Ok(None) | Err(_) => FileConfig::default(),
     }
 }
 
@@ -71,12 +76,12 @@ pub fn load() -> Config {
 }
 
 /// Persist hub + key, 0600 FROM CREATION — the credential must never be
-/// world-readable, not even for the write-then-chmod window. Written to a
-/// 0600 temp file in the same dir, then renamed over the target (atomic on
-/// POSIX). Non-Unix platforms get default perms under the user profile.
+/// world-readable, not even for the write-then-chmod window. Every platform
+/// traverses through held, no-follow directory handles and atomically replaces
+/// the leaf from an unpredictable same-directory temporary file.
 pub fn save(hub: &str, key: &str, key_id: Option<&str>) -> std::io::Result<()> {
     let dir = config_dir();
-    fs::create_dir_all(&dir)?;
+    crate::safe_path::ensure_dir(&dir, 0o700)?;
     // The directory holds a credential; the umask default (often 0755) lets
     // anyone list it. Tighten it best-effort — a pre-existing dir owned by the
     // user is the normal case, and failing here must not block a login.
@@ -85,46 +90,24 @@ pub fn save(hub: &str, key: &str, key_id: Option<&str>) -> std::io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
     }
-    let path = config_path();
     let body = serde_json::to_string_pretty(&FileConfig {
         hub: Some(strip_trailing_slash(hub)),
         key: Some(key.to_string()),
         key_id: key_id.map(String::from),
     })
     .unwrap();
-    let tmp = dir.join(format!("config.json.new.{}", std::process::id()));
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        // create_new, not create: the temp name is predictable (pid), and with
-        // `create` an existing path is FOLLOWED — including a symlink someone
-        // pre-planted — and `.mode()` is ignored because it only applies on
-        // creation. That would write the session key through the link, at the
-        // target's permissions. create_new refuses to follow anything.
-        let _ = fs::remove_file(&tmp);
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(format!("{body}\n").as_bytes())?;
-    }
-    #[cfg(not(unix))]
-    fs::write(&tmp, format!("{body}\n"))?;
-    fs::rename(&tmp, &path).inspect_err(|_| {
-        let _ = fs::remove_file(&tmp);
-    })?;
-    Ok(())
+    crate::safe_path::atomic_write(
+        &dir,
+        "config.json",
+        format!("{body}\n").as_bytes(),
+        false,
+        0o600,
+    )
 }
 
 /// Remove the credential file. Ok(true) = removed, Ok(false) = nothing to
 /// remove; a file that exists but cannot be deleted is an Err (the caller
 /// must NOT report a clean logout).
 pub fn remove() -> std::io::Result<bool> {
-    match fs::remove_file(config_path()) {
-        Ok(()) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e),
-    }
+    crate::safe_path::remove_regular(&config_dir(), "config.json")
 }

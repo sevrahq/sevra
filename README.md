@@ -20,7 +20,7 @@ Windows (native x64; ARM64 runs the same binary under the built-in emulation):
 irm https://www.sevrahq.com/install/sevra.ps1 | iex
 ```
 
-Both installers verify the download's SHA-256 against Sevra's independently deployed release manifest. When Node or OpenSSL 3 is present, they also require a valid Ed25519 publisher signature before placing the binary on your PATH. The binary itself requires the signature on every self-update.
+Both installers verify the download's SHA-256 against Sevra's independently deployed release manifest. When Node or OpenSSL 3 is present, they also require a valid Ed25519 publisher signature before placing the binary on your PATH. Set `SEVRA_REQUIRE_SIGNATURE=1` to refuse installation when neither verifier is available. The binary itself requires both the signature and the independent Sevra digest on every self-update.
 
 ## Commands
 
@@ -77,9 +77,9 @@ sevra is a machine interface. Add `--json` to any command for machine-readable o
 
 ## Updates and signing
 
-Every release binary is signed (Ed25519) and published to GitHub Releases with a `SHA256SUMS` manifest. `sevra` checks the hub for a newer release at most once a day and updates itself: it downloads the platform asset, verifies the signature against the key pinned in the binary, and atomically replaces its own file. The running command finishes on its loaded code; the new version applies next run. `SEVRA_NO_AUTO_UPDATE=1` disables the check entirely (no request, no notice); run `sevra update` explicitly instead (it also reports when your local `dbmd` is behind).
+Every release binary is signed (Ed25519), covered by keyless GitHub/Sigstore provenance, and published to an immutable GitHub Release with a `SHA256SUMS` manifest. Verify a downloaded binary with `gh attestation verify <binary> --repo sevrahq/sevra`. `sevra` checks the hub for a newer release at most once a day and updates itself: it downloads the platform asset, verifies the signature against the publisher keys pinned in the binary, requires the independently deployed Sevra digest to match, and atomically replaces its own file. The running command finishes on its loaded code; the new version applies next run. `SEVRA_NO_AUTO_UPDATE=1` disables the check entirely (no request, no notice); run `sevra update` explicitly instead (it also reports when your local `dbmd` is behind).
 
-The publisher public key is in [`sevra.pub`](sevra.pub) and served at [`/install/sevra.pub`](https://www.sevrahq.com/install/sevra.pub) for out-of-band verification.
+The active publisher trust set is in [`sevra.pub`](sevra.pub) and served at [`/install/sevra.pub`](https://www.sevrahq.com/install/sevra.pub) for out-of-band verification.
 
 ## Build from source
 

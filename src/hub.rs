@@ -3,7 +3,9 @@
 //! matching the TS CLI — a 2xx without JSON is refused as "not a Sevra hub
 //! answer", and every >=400 fails with the hub's own error string.
 
-use std::io::Read;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 
 use serde_json::Value;
 
@@ -43,31 +45,114 @@ pub fn assert_safe_hub(hub: &str) {
     }
 }
 
-/// Presigned-transfer URL guard: HTTPS only — with the SAME loopback
-/// exemption every hub URL gets (`assert_safe_hub`): plain HTTP to the
-/// caller's own machine steers nothing to an attacker, and it is what lets
-/// the mock-hub tests cover the REAL byte path instead of stopping at the
-/// presign response. Userinfo and fragments stay refused everywhere.
-fn assert_safe_presigned(parsed: &url::Url, what: &str) {
-    if !parsed.username().is_empty() || parsed.password().is_some() || parsed.fragment().is_some() {
-        fail(&format!("the hub returned an unsafe {what} URL"), None);
-    }
-    let loopback = match parsed.host() {
+/// Presigned-transfer URL guard. Production transfers require HTTPS and a
+/// public resolved address. A loopback transfer is accepted only when the
+/// configured hub is itself loopback (local development/tests); a remote hub
+/// can never use a presign answer as SSRF into the caller's machine, LAN, or
+/// cloud metadata service.
+fn host_is_loopback(parsed: &url::Url) -> bool {
+    match parsed.host() {
         Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
         Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
         None => false,
-    };
-    if parsed.scheme() != "https" && !loopback {
-        fail(&format!("the hub returned an unsafe {what} URL"), None);
     }
 }
 
-pub fn put_presigned(url: &str, headers: &Value, bytes: &[u8]) {
+fn public_transfer_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            !(ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_broadcast()
+                || ip.is_multicast()
+                || ip.is_unspecified()
+                // Carrier-grade NAT and benchmark networks are not public
+                // object-storage destinations.
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                || (octets[0] == 198 && (18..=19).contains(&octets[1]))
+                || octets[0] >= 240)
+        }
+        IpAddr::V6(ip) => {
+            let first = ip.segments()[0];
+            !(ip.is_loopback()
+                || ip.is_multicast()
+                || ip.is_unspecified()
+                || first & 0xfe00 == 0xfc00 // unique-local fc00::/7
+                || first & 0xffc0 == 0xfe80 // link-local fe80::/10
+                || first & 0xffc0 == 0xfec0 // deprecated site-local fec0::/10
+                || ip
+                    .to_ipv4_mapped()
+                    .is_some_and(|mapped| !public_transfer_ip(IpAddr::V4(mapped))))
+        }
+    }
+}
+
+fn presigned_network_policy(cfg: &Config, parsed: &url::Url) -> Result<bool, &'static str> {
+    if !parsed.username().is_empty() || parsed.password().is_some() || parsed.fragment().is_some() {
+        return Err("userinfo and fragments are forbidden");
+    }
+    let hub = url::Url::parse(&cfg.hub).map_err(|_| "the configured hub URL is invalid")?;
+    let local_dev = host_is_loopback(&hub) && host_is_loopback(parsed);
+    if parsed.scheme() != "https" && !local_dev {
+        return Err("non-HTTPS transfer URLs are forbidden");
+    }
+    if !local_dev {
+        match parsed.host() {
+            Some(url::Host::Ipv4(ip)) if !public_transfer_ip(IpAddr::V4(ip)) => {
+                return Err("private or local transfer addresses are forbidden")
+            }
+            Some(url::Host::Ipv6(ip)) if !public_transfer_ip(IpAddr::V6(ip)) => {
+                return Err("private or local transfer addresses are forbidden")
+            }
+            None => return Err("the transfer URL has no host"),
+            _ => {}
+        }
+    }
+    Ok(local_dev)
+}
+
+fn transfer_agent(allow_local: bool) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .user_agent(concat!("sevra/", env!("CARGO_PKG_VERSION")))
+        .redirects(0)
+        .timeout_connect(std::time::Duration::from_secs(10))
+        .timeout_read(std::time::Duration::from_secs(120))
+        // Resolve exactly once for the connection and reject the complete DNS
+        // answer if any address is private/local. The HTTP client consumes
+        // this vetted vector directly, closing the resolve-check-resolve DNS
+        // rebinding window.
+        .resolver(move |netloc: &str| {
+            let addresses: Vec<SocketAddr> = netloc.to_socket_addrs()?.collect();
+            if addresses.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "transfer host resolved to no addresses",
+                ));
+            }
+            if !allow_local
+                && addresses
+                    .iter()
+                    .any(|address| !public_transfer_ip(address.ip()))
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "transfer host resolved to a private or local address",
+                ));
+            }
+            Ok(addresses)
+        })
+        .build()
+}
+
+pub fn put_presigned(cfg: &Config, url: &str, headers: &Value, bytes: &[u8]) {
     let parsed = url::Url::parse(url)
         .unwrap_or_else(|_| fail("the hub returned an invalid upload URL", None));
-    assert_safe_presigned(&parsed, "upload");
-    let http = agent();
+    let allow_local = presigned_network_policy(cfg, &parsed)
+        .unwrap_or_else(|_| fail("the hub returned an unsafe upload URL", None));
+    let http = transfer_agent(allow_local);
     let result = with_connect_retries(|| {
         let mut req = http.put(url);
         if let Some(map) = headers.as_object() {
@@ -104,6 +189,65 @@ pub fn put_presigned(url: &str, headers: &Value, bytes: &[u8]) {
     }
 }
 
+/// Upload from a held file descriptor without buffering the asset in memory.
+/// Each connect retry clones and rewinds the same descriptor; `take(length)`
+/// ensures a concurrently extended file can never send bytes beyond the
+/// already-validated object length.
+pub fn put_presigned_file(cfg: &Config, url: &str, headers: &Value, file: &File, length: u64) {
+    let parsed = url::Url::parse(url)
+        .unwrap_or_else(|_| fail("the hub returned an invalid upload URL", None));
+    let allow_local = presigned_network_policy(cfg, &parsed)
+        .unwrap_or_else(|_| fail("the hub returned an unsafe upload URL", None));
+    let http = transfer_agent(allow_local);
+    let result = with_connect_retries(|| {
+        let mut req = http.put(url);
+        if let Some(map) = headers.as_object() {
+            for (name, value) in map {
+                if let Some(value) = value.as_str() {
+                    req = req.set(name, value);
+                }
+            }
+        }
+        req = req.set("content-length", &length.to_string());
+        let mut upload = file.try_clone().unwrap_or_else(|error| {
+            fail(
+                &format!("asset upload could not clone its stage: {error}"),
+                None,
+            )
+        });
+        upload.seek(SeekFrom::Start(0)).unwrap_or_else(|error| {
+            fail(
+                &format!("asset upload could not rewind its stage: {error}"),
+                None,
+            )
+        });
+        req.send(upload.take(length)).map_err(Box::new)
+    });
+    match result {
+        Ok(resp) if resp.status() < 300 => {}
+        Ok(resp) => {
+            let status = resp.status();
+            fail(
+                &format!(
+                    "asset upload failed (HTTP {status}){}",
+                    response_snippet_suffix(resp)
+                ),
+                None,
+            )
+        }
+        Err(error) => match *error {
+            ureq::Error::Status(code, resp) => fail(
+                &format!(
+                    "asset upload failed (HTTP {code}){}",
+                    response_snippet_suffix(resp)
+                ),
+                None,
+            ),
+            ureq::Error::Transport(err) => fail(&format!("asset upload failed: {err}"), None),
+        },
+    }
+}
+
 /// `": <body start>"` of an error response, or "" when there is nothing to
 /// show. Presigned-storage errors are XML/HTML, and the status code alone
 /// ("HTTP 403") hides the actual reason (expiry, signature, clock skew).
@@ -118,33 +262,71 @@ fn response_snippet_suffix(resp: ureq::Response) -> String {
     }
 }
 
-pub fn get_presigned(url: &str, max_bytes: u64) -> Vec<u8> {
-    let parsed = url::Url::parse(url)
-        .unwrap_or_else(|_| fail("the hub returned an invalid download URL", None));
-    assert_safe_presigned(&parsed, "download");
-    let http = agent();
+pub fn get_presigned(cfg: &Config, url: &str, max_bytes: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    get_presigned_to_writer(cfg, url, &mut out, max_bytes)
+        .unwrap_or_else(|error| fail(&error, None));
+    out
+}
+
+/// Stream one presigned response into a caller-owned staged writer. The
+/// Content-Length header is rejected before reading when it exceeds the cap,
+/// and the body loop refuses the first byte past the cap without writing it.
+pub fn get_presigned_to_writer<W: Write>(
+    cfg: &Config,
+    url: &str,
+    writer: &mut W,
+    max_bytes: u64,
+) -> Result<u64, String> {
+    let parsed =
+        url::Url::parse(url).map_err(|_| "the hub returned an invalid download URL".to_string())?;
+    let allow_local = presigned_network_policy(cfg, &parsed)
+        .map_err(|_| "the hub returned an unsafe download URL".to_string())?;
+    let http = transfer_agent(allow_local);
     let resp = match with_connect_retries(|| http.get(url).call().map_err(Box::new)) {
         Ok(resp) => resp,
-        Err(error) => match *error {
-            ureq::Error::Status(code, resp) => fail(
-                &format!(
-                    "pack download failed (HTTP {code}){}",
+        Err(error) => {
+            return Err(match *error {
+                ureq::Error::Status(code, resp) => format!(
+                    "presigned download failed (HTTP {code}){}",
                     response_snippet_suffix(resp)
                 ),
-                None,
-            ),
-            ureq::Error::Transport(err) => fail(&format!("pack download failed: {err}"), None),
-        },
+                ureq::Error::Transport(err) => format!("presigned download failed: {err}"),
+            })
+        }
     };
-    let mut out = Vec::new();
-    resp.into_reader()
-        .take(max_bytes + 1)
-        .read_to_end(&mut out)
-        .unwrap_or_else(|err| fail(&format!("pack download failed: {err}"), None));
-    if out.len() as u64 > max_bytes {
-        fail("pack download exceeded the supported size", None);
+    if let Some(length) = resp.header("content-length") {
+        let length = length
+            .parse::<u64>()
+            .map_err(|_| "presigned download returned an invalid Content-Length".to_string())?;
+        if length > max_bytes {
+            return Err("presigned download exceeded the supported size".into());
+        }
     }
-    out
+    let mut reader = resp.into_reader();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let remaining_with_probe = max_bytes.saturating_sub(total).saturating_add(1);
+        let read_cap = usize::try_from(remaining_with_probe)
+            .unwrap_or(usize::MAX)
+            .min(buffer.len());
+        let count = reader
+            .read(&mut buffer[..read_cap])
+            .map_err(|error| format!("presigned download failed mid-body: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        let next = total.saturating_add(count as u64);
+        if next > max_bytes {
+            return Err("presigned download exceeded the supported size".into());
+        }
+        writer
+            .write_all(&buffer[..count])
+            .map_err(|error| format!("writing the staged download failed: {error}"))?;
+        total = next;
+    }
+    Ok(total)
 }
 
 /// The one not-logged-in message (also used by `secrets set` to refuse BEFORE
@@ -479,5 +661,131 @@ mod tests {
             "the request-level deadline must be honored"
         );
         server.join().unwrap();
+    }
+
+    #[test]
+    fn presigned_download_accepts_u64_max_without_overflow() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request_bytes = [0_u8; 1024];
+            let _ = stream.read(&mut request_bytes).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+
+        let cfg = Config {
+            hub: format!("http://{address}"),
+            key: None,
+        };
+        assert_eq!(
+            get_presigned(&cfg, &format!("http://{address}/blob"), u64::MAX),
+            b"ok"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn presigned_download_rejects_oversize_content_length_before_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request_bytes = [0_u8; 1024];
+            let _ = stream.read(&mut request_bytes).unwrap();
+            // No body is sent. A bounded client rejects from the header and
+            // cannot block waiting for or allocate the declared bytes.
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2147483649\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let cfg = Config {
+            hub: format!("http://{address}"),
+            key: None,
+        };
+        let mut staged = Vec::new();
+        let error = get_presigned_to_writer(
+            &cfg,
+            &format!("http://{address}/blob"),
+            &mut staged,
+            2 * 1024 * 1024 * 1024,
+        )
+        .unwrap_err();
+        assert!(error.contains("exceeded the supported size"));
+        assert!(staged.is_empty());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn remote_hub_cannot_steer_presigned_traffic_to_private_networks() {
+        let cfg = Config {
+            hub: "https://www.sevrahq.com".into(),
+            key: None,
+        };
+        for hostile in [
+            "http://127.0.0.1:3000/admin",
+            "https://127.0.0.1/admin",
+            "https://169.254.169.254/latest/meta-data",
+            "https://10.0.0.1/internal",
+            "https://[::1]/admin",
+            "https://[fe80::1]/internal",
+            "https://[fc00::1]/internal",
+        ] {
+            let parsed = url::Url::parse(hostile).unwrap();
+            assert!(
+                presigned_network_policy(&cfg, &parsed).is_err(),
+                "remote hub must not approve {hostile}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_loopback_hub_gets_the_loopback_transfer_exemption() {
+        let local_cfg = Config {
+            hub: "http://127.0.0.1:3000".into(),
+            key: None,
+        };
+        let local_blob = url::Url::parse("http://127.0.0.1:9000/blob").unwrap();
+        assert_eq!(presigned_network_policy(&local_cfg, &local_blob), Ok(true));
+
+        let public_blob = url::Url::parse("https://example.com/blob").unwrap();
+        assert_eq!(
+            presigned_network_policy(&local_cfg, &public_blob),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn transfer_ip_policy_rejects_metadata_private_and_mapped_addresses() {
+        for private in [
+            "0.0.0.0",
+            "10.0.0.1",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.169.254",
+            "172.16.0.1",
+            "192.168.0.1",
+            "198.18.0.1",
+            "::",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(
+                !public_transfer_ip(private.parse().unwrap()),
+                "{private} must not be reachable through a presigned URL"
+            );
+        }
+        for public in ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"] {
+            assert!(
+                public_transfer_ip(public.parse().unwrap()),
+                "{public} should remain a valid public transfer address"
+            );
+        }
     }
 }

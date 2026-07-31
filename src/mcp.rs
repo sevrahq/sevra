@@ -23,7 +23,7 @@ use serde_json::{json, Map, Value};
 use crate::commands::enc;
 use crate::config::Config;
 use crate::hub;
-use crate::output::set_json_mode;
+use crate::output::{set_json_mode, terminal_safe};
 
 /// Latest protocol rev we author against; we echo the client's requested
 /// version when it's one we recognize (standard MCP negotiation), else offer
@@ -55,7 +55,7 @@ trait McpHubClient {
 }
 
 fn log(msg: &str) {
-    eprintln!("sevra mcp: {msg}");
+    eprintln!("sevra mcp: {}", terminal_safe(msg));
 }
 
 // --- tool definitions (the tight surface) ------------------------------------

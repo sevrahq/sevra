@@ -1,14 +1,13 @@
 //! Local db.md store read for `push`: walk a directory, collect `.md` files
-//! (relative POSIX paths) + an optional `assets.jsonl`. Symlinks may point
-//! elsewhere inside the store, but any link that resolves outside is refused:
-//! a cloned brain must never smuggle ~/.ssh or another sibling tree into a
-//! push. Cycles are deduplicated and dotfiles are skipped. A `.sevralocal` at the
-//! store root (see `crate::local`) keeps matching files home: excluded from
-//! the collected store, counted separately in the stats.
+//! (relative POSIX paths) + an optional `assets.jsonl`. Every directory and
+//! file is opened from a held parent capability without following symlinks: a
+//! cloned brain and a concurrent helper must never smuggle ~/.ssh or another
+//! sibling tree into a push. Dotfiles are skipped. A `.sevralocal` at the store
+//! root (see `crate::local`) keeps matching files home: excluded from the
+//! collected store, counted separately in the stats.
 
-use std::collections::HashSet;
 use std::fs;
-use std::io::{Cursor, Write};
+use std::io::Read;
 use std::path::Path;
 
 use serde::Serialize;
@@ -28,9 +27,45 @@ pub struct Store {
     pub assets: Option<String>,
 }
 
+pub const MAX_PACK_FILES: usize = u16::MAX as usize;
+pub const MAX_PACK_PATH_BYTES: usize = 1024;
+pub const MAX_PACK_UNCOMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
+/// Worst-case exact size of the canonical ZIP32 profile: all permitted data,
+/// maximum file count, and two copies of every maximum-length filename.
+pub const MAX_CANONICAL_PACK_BYTES: u64 = MAX_PACK_UNCOMPRESSED_BYTES
+    + MAX_PACK_FILES as u64 * (76 + 2 * MAX_PACK_PATH_BYTES as u64)
+    + 22;
+
+fn pack_error(message: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
+}
+
+fn valid_pack_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= MAX_PACK_PATH_BYTES
+        && !path.starts_with('/')
+        && !path.contains(['\0', '\\', ':'])
+        && path
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
+fn put_u16(output: &mut Vec<u8>, value: u16) {
+    output.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_u32(output: &mut Vec<u8>, value: u32) {
+    output.extend_from_slice(&value.to_le_bytes());
+}
+
 /// Build the immutable whole-store ZIP used by the hub's large-brain path.
-/// Entries are path-sorted with fixed metadata so retrying an unchanged store
-/// produces the same bytes and therefore the same content address.
+///
+/// This is deliberately a tiny raw ZIP32 writer, not a library-default ZIP:
+/// STORED members, fixed metadata, and no descriptors/extras/comments make
+/// the bytes a cross-language protocol. The hub canonicalizes to this exact
+/// profile before signing `pack_sha256`, so self-custody clients must produce
+/// byte-identical bytes rather than merely an equivalent archive.
 pub fn build_pack(store: &Store) -> std::io::Result<Vec<u8>> {
     let mut entries: Vec<(&str, &[u8])> = store
         .files
@@ -40,23 +75,108 @@ pub fn build_pack(store: &Store) -> std::io::Result<Vec<u8>> {
     if let Some(assets) = store.assets.as_deref() {
         entries.push(("assets.jsonl", assets.as_bytes()));
     }
-    entries.sort_by(|a, b| a.0.cmp(b.0));
-
-    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
-    let options = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated)
-        .last_modified_time(zip::DateTime::default())
-        .unix_permissions(0o600);
-    for (path, bytes) in entries {
-        writer
-            .start_file(path, options)
-            .map_err(std::io::Error::other)?;
-        writer.write_all(bytes)?;
+    if entries.is_empty() {
+        return Err(pack_error("a store pack must contain at least one file"));
     }
-    writer
-        .finish()
-        .map(Cursor::into_inner)
-        .map_err(std::io::Error::other)
+    if entries.len() > MAX_PACK_FILES {
+        return Err(pack_error("store pack has too many files for ZIP32"));
+    }
+    entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+
+    let mut total_data = 0u64;
+    let mut previous: Option<&str> = None;
+    for (path, bytes) in &entries {
+        if !valid_pack_path(path) {
+            return Err(pack_error(
+                "store pack contains an unsafe or oversized path",
+            ));
+        }
+        if previous == Some(path) {
+            return Err(pack_error("store pack contains a duplicate path"));
+        }
+        previous = Some(path);
+        total_data = total_data
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| pack_error("store pack size overflow"))?;
+        if total_data > MAX_PACK_UNCOMPRESSED_BYTES || bytes.len() > u32::MAX as usize {
+            return Err(pack_error(
+                "store pack exceeds the uncompressed ZIP32 limit",
+            ));
+        }
+    }
+
+    let expected_len = total_data
+        + entries
+            .iter()
+            .map(|(path, _)| 76 + 2 * path.len() as u64)
+            .sum::<u64>()
+        + 22;
+    if expected_len > MAX_CANONICAL_PACK_BYTES || expected_len > u32::MAX as u64 {
+        return Err(pack_error("canonical store pack exceeds the ZIP32 limit"));
+    }
+    let mut output = Vec::with_capacity(expected_len as usize);
+    let mut records = Vec::with_capacity(entries.len());
+
+    for (path, bytes) in &entries {
+        let local_offset = u32::try_from(output.len())
+            .map_err(|_| pack_error("canonical store pack offset exceeds ZIP32"))?;
+        let size = u32::try_from(bytes.len())
+            .map_err(|_| pack_error("store pack member exceeds ZIP32"))?;
+        let crc32 = crc32fast::hash(bytes);
+        let name = path.as_bytes();
+
+        put_u32(&mut output, 0x0403_4b50);
+        put_u16(&mut output, 20);
+        put_u16(&mut output, 0x0800);
+        put_u16(&mut output, 0);
+        put_u16(&mut output, 0);
+        put_u16(&mut output, 0x0021);
+        put_u32(&mut output, crc32);
+        put_u32(&mut output, size);
+        put_u32(&mut output, size);
+        put_u16(&mut output, name.len() as u16);
+        put_u16(&mut output, 0);
+        output.extend_from_slice(name);
+        output.extend_from_slice(bytes);
+        records.push((path, size, crc32, local_offset));
+    }
+
+    let central_offset = u32::try_from(output.len())
+        .map_err(|_| pack_error("canonical central-directory offset exceeds ZIP32"))?;
+    for (path, size, crc32, local_offset) in &records {
+        let name = path.as_bytes();
+        put_u32(&mut output, 0x0201_4b50);
+        put_u16(&mut output, 0x0314);
+        put_u16(&mut output, 20);
+        put_u16(&mut output, 0x0800);
+        put_u16(&mut output, 0);
+        put_u16(&mut output, 0);
+        put_u16(&mut output, 0x0021);
+        put_u32(&mut output, *crc32);
+        put_u32(&mut output, *size);
+        put_u32(&mut output, *size);
+        put_u16(&mut output, name.len() as u16);
+        put_u16(&mut output, 0);
+        put_u16(&mut output, 0);
+        put_u16(&mut output, 0);
+        put_u16(&mut output, 0);
+        put_u32(&mut output, 0o100600u32 << 16);
+        put_u32(&mut output, *local_offset);
+        output.extend_from_slice(name);
+    }
+    let central_size = u32::try_from(output.len() - central_offset as usize)
+        .map_err(|_| pack_error("canonical central directory exceeds ZIP32"))?;
+    let count = entries.len() as u16;
+    put_u32(&mut output, 0x0605_4b50);
+    put_u16(&mut output, 0);
+    put_u16(&mut output, 0);
+    put_u16(&mut output, count);
+    put_u16(&mut output, count);
+    put_u32(&mut output, central_size);
+    put_u32(&mut output, central_offset);
+    put_u16(&mut output, 0);
+    debug_assert_eq!(output.len() as u64, expected_len);
+    Ok(output)
 }
 
 /// How many of the largest files the walk keeps for limit-refusal reporting.
@@ -104,21 +224,6 @@ pub(crate) fn note_largest(largest: &mut Vec<(String, u64)>, rel: &str, len: u64
     }
 }
 
-fn rel_posix(root: &Path, full: &Path) -> String {
-    full.strip_prefix(root)
-        .unwrap_or(full)
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
-/// Read a file, naming it in the error — "stream did not contain valid UTF-8"
-/// with no path is undebuggable in a 10k-file vault.
-fn read_named(full: &Path, rel: &str) -> std::io::Result<String> {
-    fs::read_to_string(full).map_err(|e| std::io::Error::other(format!("{rel}: {e}")))
-}
-
 struct WalkState {
     store: Store,
     stats: WalkStats,
@@ -128,17 +233,13 @@ struct WalkState {
 }
 
 fn walk(
-    root: &Path,
-    root_real: &Path,
-    dir: &Path,
-    visited: &mut HashSet<std::path::PathBuf>,
+    dir: &crate::safe_path::SafeDir,
+    prefix: &str,
     st: &mut WalkState,
     scope: Option<&LocalScope>,
 ) -> std::io::Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let entry_name = entry.file_name();
-        let name = entry_name.to_str().ok_or_else(|| {
+    for entry in dir.entries()? {
+        let name = entry.name.to_str().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "refusing a store entry whose name is not valid UTF-8",
@@ -147,77 +248,86 @@ fn walk(
         if name.starts_with('.') {
             continue;
         }
-        let full = entry.path();
-        // Resolve once and enforce the real-path boundary before metadata,
-        // sizing, or content reads. Reading the canonical file also avoids a
-        // leaf symlink swap between the containment check and fs::read.
-        let real = match fs::canonicalize(&full) {
-            Ok(path) => path,
-            Err(_) => continue, // dangling or unreadable links do not ride
+        let rel = if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{prefix}/{name}")
         };
-        if !real.starts_with(root_real) {
-            let rel = rel_posix(root, &full);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!("{rel}: refusing a symlink that resolves outside the store"),
-            ));
-        }
-        let meta = match fs::metadata(&real) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        if meta.is_dir() {
-            // Cycle guard on the real path.
-            if !visited.insert(real) {
-                continue;
+        match entry.kind {
+            crate::safe_path::EntryKind::Symlink => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("{rel}: refusing a symlink in the store"),
+                ));
             }
-            walk(root, root_real, &full, visited, st, scope)?;
-        } else if meta.is_file() {
-            if !visited.insert(real.clone()) {
-                continue;
+            crate::safe_path::EntryKind::Directory => {
+                let child = dir.open_dir(&entry.name).map_err(|error| {
+                    std::io::Error::new(error.kind(), format!("{rel}: {error}"))
+                })?;
+                walk(&child, &rel, st, scope)?;
             }
-            let rel = rel_posix(root, &full);
-            let counts = rel == "assets.jsonl" || rel.to_lowercase().ends_with(".md");
-            if !counts {
-                // (`index.jsonl` never reaches the collected store on any
-                // path: it is not `.md` and only the ROOT `assets.jsonl`
-                // counts, so it needs no kept-home handling below.)
-                continue;
-            }
-            if let Some(scope) = scope {
-                // Kept-home exclusions happen BEFORE any counting: a file
-                // that never rides must not count toward the hub's snapshot
-                // limits either. (`DB.md` and `assets.jsonl` can never land
-                // here — a scope covering them is refused at load.)
-                if scope.keeps_home(&rel) {
-                    st.stats.kept_home += 1;
+            crate::safe_path::EntryKind::File => {
+                let counts = rel == "assets.jsonl" || rel.to_lowercase().ends_with(".md");
+                if !counts {
+                    // (`index.jsonl` never reaches the collected store on any
+                    // path: it is not `.md` and only the ROOT `assets.jsonl`
+                    // counts.)
                     continue;
                 }
-                // An ACTIVE local scope also keeps every derived catalog
-                // home: catalogs list every file's name/title/summary —
-                // kept-home files included — and the hub rebuilds its own
-                // from what actually rides.
-                if scope.active() && rel.rsplit('/').next() == Some("index.md") {
-                    st.stats.catalogs_kept += 1;
+                if let Some(scope) = scope {
+                    // Kept-home exclusions happen BEFORE any counting or
+                    // opening: bytes that never ride are never touched.
+                    if scope.keeps_home(&rel) {
+                        st.stats.kept_home += 1;
+                        continue;
+                    }
+                    if scope.active() && rel.rsplit('/').next() == Some("index.md") {
+                        st.stats.catalogs_kept += 1;
+                        continue;
+                    }
+                }
+                let mut file = dir.open_file(&entry.name).map_err(|error| {
+                    std::io::Error::new(error.kind(), format!("{rel}: {error}"))
+                })?;
+                let metadata_len = file.metadata()?.len();
+                st.stats.files += 1;
+                if st.budget == 0 {
+                    st.stats.bytes = st.stats.bytes.saturating_add(metadata_len);
+                    note_largest(&mut st.stats.largest, &rel, metadata_len);
                     continue;
                 }
+
+                // Metadata and content come from the same held descriptor.
+                // Taking at most remaining+1 keeps a concurrently grown file
+                // from becoming an unbounded allocation.
+                let read_cap = st.budget;
+                let mut bytes = Vec::with_capacity(
+                    usize::try_from(metadata_len.min(read_cap).min(1024 * 1024)).unwrap_or(0),
+                );
+                Read::by_ref(&mut file)
+                    .take(read_cap)
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| std::io::Error::other(format!("{rel}: {e}")))?;
+                let actual_len = bytes.len() as u64;
+                if actual_len >= read_cap {
+                    st.budget = 0;
+                    let counted = metadata_len.max(actual_len);
+                    st.stats.bytes = st.stats.bytes.saturating_add(counted);
+                    note_largest(&mut st.stats.largest, &rel, counted);
+                    continue;
+                }
+                st.budget -= actual_len;
+                st.stats.bytes = st.stats.bytes.saturating_add(actual_len);
+                note_largest(&mut st.stats.largest, &rel, actual_len);
+                let content = String::from_utf8(bytes)
+                    .map_err(|e| std::io::Error::other(format!("{rel}: {e}")))?;
+                if rel == "assets.jsonl" {
+                    st.store.assets = Some(content);
+                } else {
+                    st.store.files.push(StoreFile { path: rel, content });
+                }
             }
-            st.stats.files += 1;
-            st.stats.bytes = st.stats.bytes.saturating_add(meta.len());
-            note_largest(&mut st.stats.largest, &rel, meta.len());
-            // Size-gate BEFORE reading: past the budget, stop touching file
-            // contents — the rest of the walk only counts and sizes, so the
-            // refusal can report what was actually found.
-            st.budget = st.budget.saturating_sub(meta.len());
-            if st.budget == 0 {
-                continue;
-            }
-            if rel == "assets.jsonl" {
-                st.store.assets = Some(read_named(&real, &rel)?);
-            } else {
-                let content = read_named(&real, &rel)?;
-                st.store.files.push(StoreFile { path: rel, content });
-            }
+            crate::safe_path::EntryKind::Other => {}
         }
     }
     Ok(())
@@ -227,7 +337,7 @@ fn walk(
 /// (kept-home files and, when the scope is active, derived catalogs are
 /// excluded and counted in the stats), refusing once raw riding bytes exceed
 /// `max_bytes` — a store whose raw file bytes exceed the cap cannot fit
-/// under it as JSON either (escaping only grows), so a symlinked multi-GB
+/// under it as JSON either (escaping only grows), so a multi-GB
 /// vault is never read into memory before a post-hoc check. On the cap
 /// refusal the walk continues without reading, so `StoreError::OverCap`
 /// carries the store's true totals and its largest files.
@@ -247,8 +357,8 @@ fn read_store_impl(
     max_bytes: u64,
     scope: Option<&LocalScope>,
 ) -> Result<(Store, WalkStats), StoreError> {
-    let root = Path::new(dir);
-    let root_real = fs::canonicalize(root).map_err(StoreError::Io)?;
+    let root_real = fs::canonicalize(Path::new(dir)).map_err(StoreError::Io)?;
+    let root = crate::safe_path::SafeDir::open(&root_real).map_err(StoreError::Io)?;
     let mut st = WalkState {
         store: Store {
             files: Vec::new(),
@@ -266,9 +376,7 @@ fn read_store_impl(
         // the exact JSON-size check in `push`.
         budget: max_bytes.saturating_add(1),
     };
-    let mut visited = HashSet::new();
-    visited.insert(root_real.clone());
-    match walk(root, &root_real, root, &mut visited, &mut st, scope) {
+    match walk(&root, "", &mut st, scope) {
         Ok(()) if st.budget == 0 => Err(StoreError::OverCap(st.stats)),
         Ok(()) => Ok((st.store, st.stats)),
         Err(e) => Err(StoreError::Io(e)),
@@ -278,7 +386,9 @@ fn read_store_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use std::fs;
+    use std::io::Cursor;
 
     fn write(dir: &std::path::Path, rel: &str, content: &[u8]) {
         let p = dir.join(rel);
@@ -456,12 +566,17 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn symlink_cycle_terminates_and_dedupes() {
+    fn an_internal_directory_symlink_is_refused_too() {
         let t = tempfile::tempdir().unwrap();
         write(t.path(), "a/note.md", b"hi");
         std::os::unix::fs::symlink(t.path(), t.path().join("a/loop")).unwrap();
-        let (s, _) = read_store(t.path().to_str().unwrap(), 4096).unwrap();
-        assert_eq!(s.files.len(), 1, "the cycled file must be collected once");
+        match read_store(t.path().to_str().unwrap(), 4096) {
+            Err(StoreError::Io(error)) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                assert!(error.to_string().contains("a/loop"));
+            }
+            other => panic!("expected symlink refusal, got {:?}", other.map(|_| "ok")),
+        }
     }
 
     #[cfg(unix)]
@@ -480,10 +595,59 @@ mod tests {
         match read_store(store.path().to_str().unwrap(), 4096) {
             Err(StoreError::Io(error)) => {
                 assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-                assert!(error.to_string().contains("outside the store"));
+                assert!(error.to_string().contains("symlink in the store"));
                 assert!(error.to_string().contains("leak.md"));
             }
             other => panic!("expected symlink refusal, got {:?}", other.map(|_| "ok")),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_leaf_swap_cannot_make_external_bytes_ride() {
+        use std::sync::{Arc, Barrier};
+
+        let store = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write(store.path(), "DB.md", b"# safe");
+        write(store.path(), "race-held-handle.md", b"inside");
+        write(
+            outside.path(),
+            "private.md",
+            b"EXTERNAL-CONTENT-MUST-NOT-RIDE",
+        );
+
+        let barrier = Arc::new(Barrier::new(2));
+        crate::safe_path::set_test_before_open(
+            std::ffi::OsString::from("race-held-handle.md"),
+            Arc::clone(&barrier),
+        );
+        let store_path = store.path().to_path_buf();
+        let reader = std::thread::spawn(move || read_store(store_path.to_str().unwrap(), 4096));
+
+        barrier.wait();
+        fs::rename(
+            store.path().join("race-held-handle.md"),
+            store.path().join("parked.md"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("private.md"),
+            store.path().join("race-held-handle.md"),
+        )
+        .unwrap();
+        barrier.wait();
+
+        match reader.join().unwrap() {
+            Err(StoreError::Io(error)) => {
+                let message = error.to_string();
+                assert!(message.contains("race-held-handle.md"));
+                assert!(!message.contains("EXTERNAL-CONTENT-MUST-NOT-RIDE"));
+            }
+            other => panic!(
+                "the raced symlink must be refused, got {:?}",
+                other.map(|_| "ok")
+            ),
         }
     }
 
@@ -548,8 +712,127 @@ mod tests {
         assert_eq!(one, two);
         let mut archive = zip::ZipArchive::new(Cursor::new(one)).unwrap();
         assert_eq!(archive.len(), 3);
-        assert_eq!(archive.by_index(0).unwrap().name(), "a.md");
+        let first = archive.by_index(0).unwrap();
+        assert_eq!(first.name(), "a.md");
+        assert_eq!(first.compression(), zip::CompressionMethod::Stored);
+        assert_eq!(first.unix_mode(), Some(0o100600));
+        drop(first);
         assert_eq!(archive.by_index(1).unwrap().name(), "assets.jsonl");
         assert_eq!(archive.by_index(2).unwrap().name(), "z.md");
+    }
+
+    #[test]
+    fn canonical_pack_matches_the_cross_language_golden_vector() {
+        let store = Store {
+            files: vec![
+                StoreFile {
+                    path: "records/a.md".to_string(),
+                    content: "alpha\n".to_string(),
+                },
+                StoreFile {
+                    path: "DB.md".to_string(),
+                    content: "# db\n".to_string(),
+                },
+            ],
+            assets: None,
+        };
+        let bytes = build_pack(&store).unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&bytes)),
+            "972fb2045becaa21588baaf4b349e62a430687fa2c21167b53f4ca0efa6c9408"
+        );
+        assert_eq!(bytes.len(), 219);
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        assert_eq!(archive.len(), 2);
+        let mut db = String::new();
+        archive
+            .by_name("DB.md")
+            .unwrap()
+            .read_to_string(&mut db)
+            .unwrap();
+        assert_eq!(db, "# db\n");
+    }
+
+    #[test]
+    fn canonical_pack_rejects_non_protocol_shapes_before_writing() {
+        assert!(build_pack(&Store {
+            files: Vec::new(),
+            assets: None,
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("at least one"));
+        assert!(build_pack(&Store {
+            files: vec![
+                StoreFile {
+                    path: "a.md".into(),
+                    content: "one".into(),
+                },
+                StoreFile {
+                    path: "a.md".into(),
+                    content: "two".into(),
+                },
+            ],
+            assets: None,
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("duplicate"));
+        let exact_path = format!("{}.md", "a".repeat(MAX_PACK_PATH_BYTES - 3));
+        assert_eq!(exact_path.len(), MAX_PACK_PATH_BYTES);
+        assert!(build_pack(&Store {
+            files: vec![StoreFile {
+                path: exact_path,
+                content: String::new(),
+            }],
+            assets: None,
+        })
+        .is_ok());
+        let long_path = format!("{}.md", "a".repeat(MAX_PACK_PATH_BYTES));
+        assert!(long_path.len() > MAX_PACK_PATH_BYTES);
+        assert!(build_pack(&Store {
+            files: vec![StoreFile {
+                path: long_path,
+                content: String::new(),
+            }],
+            assets: None,
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("oversized"));
+    }
+
+    #[test]
+    fn canonical_zip32_file_count_boundary_is_exact() {
+        let files = (0..MAX_PACK_FILES)
+            .map(|index| StoreFile {
+                path: format!("records/{index:05}.md"),
+                content: String::new(),
+            })
+            .collect();
+        let bytes = build_pack(&Store {
+            files,
+            assets: None,
+        })
+        .expect("65,535 file members fit the canonical ZIP32 profile");
+        assert_eq!(
+            &bytes[bytes.len() - 12..bytes.len() - 10],
+            &u16::MAX.to_le_bytes(),
+            "EOCD carries the exact maximum entry count without ZIP64"
+        );
+
+        let too_many = (0..=MAX_PACK_FILES)
+            .map(|index| StoreFile {
+                path: format!("records/{index:05}.md"),
+                content: String::new(),
+            })
+            .collect();
+        assert!(build_pack(&Store {
+            files: too_many,
+            assets: None,
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("too many files"));
     }
 }

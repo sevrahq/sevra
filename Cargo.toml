@@ -1,6 +1,6 @@
 [package]
 name = "sevra"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2021"
 # MSRV: enforced by the ci `msrv` job against the LOCKED tree. 1.88 is the
 # tree's true floor (home 0.5.12 requires it; base64ct needs edition2024/1.85).
@@ -34,6 +34,7 @@ serde_json = "1"
 ed25519-dalek = "2"
 base64 = "0.22"
 sha2 = "0.10"
+crc32fast = "1.5"
 # OS randomness for the browser sign-in's PKCE verifier (a credential, so it
 # must not come from a userspace PRNG). Already in the tree via rustls.
 getrandom = "0.2"
@@ -52,6 +53,23 @@ regex = "1"
 # compiles the whole list into one matcher. BurntSushi, same family as regex
 # (shares aho-corasick/regex-automata/-syntax; adds bstr). log feature off.
 globset = { version = "0.4", default-features = false }
+# Export names are checked against one cross-platform filesystem model. Unicode
+# canonical aliases must collapse before case comparison or macOS can silently
+# install two hosted paths onto one inode.
+unicode-normalization = "0.1"
+[target.'cfg(unix)'.dependencies]
+# Capability-style traversal for local scope and asset paths: checking
+# symlink_metadata and then opening has a race, so the kernel enforces each
+# component with openat(O_NOFOLLOW) and installs via renameat.
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Hold directory handles without FILE_SHARE_DELETE, reject reparse-point
+# components, and atomically install verified bytes with MoveFileExW.
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Storage_FileSystem",
+] }
 
 [dev-dependencies]
 assert_cmd = "2"

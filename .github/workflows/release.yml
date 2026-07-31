@@ -2,20 +2,27 @@
 #
 # Five targets: four BARE unix binaries `sevra-<target>` plus the Windows
 # `sevra-windows-x86_64.exe`, each with a detached Ed25519 signature
-# `<asset>.sig` (base64 of 64 raw bytes), signed with the
-# SEVRA_CLI_SIGNING_KEY secret — the same publisher key pinned in the binary
-# and the installers. A single SHA256SUMS covers every asset. install.sh /
-# install.ps1 and `sevra update` download these directly (no tarball to
-# extract).
+# `<asset>.sig` (base64 of 64 raw bytes). v0.2.8 is the one compatibility
+# release signed on a protected GitHub runner with the original key; its
+# authorization is bound to one exact attempt. The repository key is deleted
+# only after the signed bytes are durable as an immutable Actions artifact and
+# every byte has exact-tag/SHA provenance, so a failed draft can be resumed
+# without restoring the signer. Every successor release ends this
+# runner-key exposure: Actions produces and attests exactly five unsigned
+# binaries, then scripts/release.sh verifies them, reproducibly rebuilds the
+# Linux pair, signs locally from 1Password, uploads the complete draft, and
+# publishes it immutable. A single SHA256SUMS covers every binary. install.sh /
+# install.ps1 and `sevra update` download these directly (no tarball to extract).
 #
-# CI-gated: cross-platform builds/signing run only on GitHub runners; they are
-# authored + self-linted here, not executed on a dev host. Cut a release by
-# pushing a SemVer tag (`v0.1.0`); the tag must equal the Cargo.toml version.
+# CI-gated: cross-platform builds run on GitHub runners; they are authored +
+# self-linted here. Cut a release only through scripts/release.sh; it pushes a
+# SemVer tag whose version equals Cargo.toml after the exact main commit has
+# passed CI.
 #
-# Key-custody layout: the signing key is used ONLY in the publish job, whose
-# only pre-signing action is first-party (actions/download-artifact) — no
-# third-party action ever runs in the job before the key is in env. Build jobs
-# never see the secret.
+# Key custody after v0.2.8: no Actions secret, environment, runner, workflow,
+# artifact, or log ever receives the successor private key. The local
+# controller reads it into one Node process over stdin only after exact
+# provenance and independent Linux reproduction succeed.
 name: release
 
 on:
@@ -23,11 +30,6 @@ on:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
       - 'v[0-9]+.[0-9]+.[0-9]+-*'
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "SemVer to release (without leading v)"
-        required: false
 
 permissions:
   contents: read
@@ -35,31 +37,33 @@ permissions:
 jobs:
   version:
     name: resolve version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.resolve.outputs.version }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          fetch-depth: 0
+      - name: Require a release commit on main
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
+            echo "::error::release tags must point to a commit already on main"
+            exit 1
+          }
       - name: Resolve version
         id: resolve
         shell: bash
-        env:
-          # Bound to env, never interpolated into the script (the classic
-          # workflow_dispatch injection vector).
-          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "$INPUT_VERSION" ]; then
-            ver="$INPUT_VERSION"
-          elif [ "${{ github.ref_type }}" = "tag" ]; then
-            ver="${GITHUB_REF_NAME#v}"
-          else
-            ver="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
-          fi
+          ver="${GITHUB_REF_NAME#v}"
           echo "$ver" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-.+)?$' || {
             echo "::error::resolved version '$ver' is not SemVer" >&2; exit 1; }
           # The released version must ALWAYS equal the embedded (Cargo.toml)
-          # version — a mismatch (e.g. a workflow_dispatch typo) would ship
+          # version — a mismatch would ship
           # binaries that forever self-report older than "latest" and re-download
           # on every daily check.
           cargo_ver="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
@@ -69,11 +73,12 @@ jobs:
   preflight:
     needs: version
     name: preflight
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
+          toolchain: 1.96.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
       - run: cargo fmt --all --check
@@ -94,48 +99,82 @@ jobs:
         include:
           - target_name: darwin-x86_64
             rust_target: x86_64-apple-darwin
-            os: macos-15-intel
+            os: macos-26-intel
             use_cross: false
+            use_xwin: false
           - target_name: darwin-aarch64
             rust_target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-26
             use_cross: false
+            use_xwin: false
           - target_name: linux-x86_64-musl
             rust_target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            use_cross: false
+            os: ubuntu-24.04
+            use_cross: true
+            use_xwin: false
           - target_name: linux-aarch64-musl
             rust_target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
             use_cross: true
+            use_xwin: false
           - target_name: windows-x86_64
             rust_target: x86_64-pc-windows-msvc
-            os: windows-latest
+            # Use the same digest-verified cargo-xwin executable, SDK, CRT,
+            # compiler, and host family as the local reproduction gate.
+            os: macos-26
             use_cross: false
+            use_xwin: true
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
+          toolchain: 1.96.0
           targets: ${{ matrix.rust_target }}
       # No build cache here on purpose: the bytes produced by this job get
       # SIGNED — a restored mutable cache is a poisoning vector. Cold builds
       # cost minutes; a poisoned signed binary costs the product.
-      - name: Install musl tools (linux x86_64)
-        if: matrix.target_name == 'linux-x86_64-musl'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - name: Install cross (linux aarch64)
+      - name: Install pinned cross (Linux)
         if: matrix.use_cross
         uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853
         with:
           tool: cross@0.2.5
+      - name: Install digest-verified cargo-xwin (Windows)
+        if: matrix.use_xwin
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/cargo-xwin.tar.gz"
+          tool_dir="$RUNNER_TEMP/cargo-xwin"
+          curl -fsSL \
+            https://github.com/rust-cross/cargo-xwin/releases/download/v0.23.0/cargo-xwin-v0.23.0.universal2-apple-darwin.tar.gz \
+            -o "$archive"
+          echo "d78a88f43247a6298d8888dc4c44a8af92801fdf4e5374cc5a359a1e53770993  $archive" |
+            shasum -a 256 -c -
+          mkdir -p "$tool_dir"
+          tar -xzf "$archive" -C "$tool_dir"
       - name: Build
         shell: bash
         run: |
           set -euo pipefail
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/workspace --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=/project=/workspace"
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          export RUSTFLAGS SOURCE_DATE_EPOCH
+          target_dir="target/reproduce-${{ matrix.target_name }}"
           if [ "${{ matrix.use_cross }}" = "true" ]; then
-            cross build --release --locked --target ${{ matrix.rust_target }}
+            cross build --release --locked \
+              --target ${{ matrix.rust_target }} --target-dir "$target_dir"
+          elif [ "${{ matrix.use_xwin }}" = "true" ]; then
+            RUSTFLAGS="$RUSTFLAGS -C link-arg=/Brepro -C link-arg=/debug:none" \
+              XWIN_CACHE_DIR="$RUNNER_TEMP/xwin-cache" \
+              "$RUNNER_TEMP/cargo-xwin/cargo-xwin" xwin build \
+              --release --locked --target ${{ matrix.rust_target }} --target-dir "$target_dir" \
+              --xwin-version 17 \
+              --xwin-sdk-version 10.0.26100 \
+              --xwin-crt-version 14.44.17.14
           else
-            cargo build --release --locked --target ${{ matrix.rust_target }}
+            cargo build --release --locked \
+              --target ${{ matrix.rust_target }} --target-dir "$target_dir"
           fi
       - name: Stage asset
         shell: bash
@@ -146,7 +185,9 @@ jobs:
           ext=""
           case "${{ matrix.target_name }}" in windows-*) ext=".exe" ;; esac
           mkdir -p dist
-          cp "target/${{ matrix.rust_target }}/release/sevra${ext}" "dist/sevra-${{ matrix.target_name }}${ext}"
+          cp \
+            "target/reproduce-${{ matrix.target_name }}/${{ matrix.rust_target }}/release/sevra${ext}" \
+            "dist/sevra-${{ matrix.target_name }}${ext}"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: ${{ matrix.target_name }}
@@ -155,9 +196,16 @@ jobs:
   publish:
     needs: [version, build]
     name: sign + publish release
-    runs-on: ubuntu-latest
+    if: needs.version.outputs.version == '0.2.8'
+    runs-on: ubuntu-24.04
+    # Protected approval boundary for the ephemeral publisher key and
+    # per-attempt authorization. Repo write access and a release tag are
+    # deliberately insufficient to start the signer.
+    environment: release-signing
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
@@ -166,16 +214,70 @@ jobs:
         shell: bash
         env:
           SEVRA_CLI_SIGNING_KEY: ${{ secrets.SEVRA_CLI_SIGNING_KEY }}
+          SEVRA_RELEASE_AUTHORIZATION: ${{ secrets.SEVRA_RELEASE_AUTHORIZATION }}
+          VERSION: ${{ needs.version.outputs.version }}
+          # This runner-signing path exists for v0.2.8 only.
+          SEVRA_ORIGINAL_SIGNER_SPKI: MCowBQYDK2VwAyEA+v5mafEPcIwKAU/DO/z8MM/cT9ndgE1saSUfvcrzLKA=
         run: |
           set -euo pipefail
           [ -n "$SEVRA_CLI_SIGNING_KEY" ] || { echo "::error::SEVRA_CLI_SIGNING_KEY secret is empty"; exit 1; }
+          [ -n "$SEVRA_RELEASE_AUTHORIZATION" ] || { echo "::error::SEVRA_RELEASE_AUTHORIZATION secret is empty"; exit 1; }
+          node -e '
+            const { createPrivateKey, createPublicKey } = require("node:crypto");
+            const expectedRequest = process.env.GITHUB_RUN_ID + "." + process.env.GITHUB_RUN_ATTEMPT;
+            const fields = process.env.SEVRA_RELEASE_AUTHORIZATION.split(":");
+            if (
+              fields.length !== 4 ||
+              fields[0] !== process.env.GITHUB_REF_NAME ||
+              !/^[0-9a-f]{40}$/.test(fields[1]) ||
+              fields[1] !== process.env.GITHUB_SHA ||
+              fields[2] !== expectedRequest ||
+              !/^[0-9a-f]{64}$/.test(fields[3])
+            ) {
+              throw new Error("release authorization is not bound to this exact tag, commit, and workflow attempt");
+            }
+            const key = createPrivateKey(Buffer.from(process.env.SEVRA_CLI_SIGNING_KEY, "base64"));
+            const actual = createPublicKey(key).export({ type: "spki", format: "der" }).toString("base64");
+            if (actual !== process.env.SEVRA_ORIGINAL_SIGNER_SPKI) {
+              throw new Error("v0.2.8 is configured with the wrong release signer");
+            }
+          '
           mkdir -p dist
-          find staged -type f -exec cp {} dist/ \;
+          # Artifacts are untrusted inputs to the signer. Accept exactly the
+          # five build-matrix outputs, once each: no extra file may get an
+          # Ed25519 signature merely by naming itself `sevra-*`, and two
+          # artifacts may not silently flatten onto the same release name.
+          expected_assets='
+          sevra-darwin-x86_64
+          sevra-darwin-aarch64
+          sevra-linux-x86_64-musl
+          sevra-linux-aarch64-musl
+          sevra-windows-x86_64.exe'
+          if [ "$(find staged -type f | wc -l | tr -d ' ')" != 5 ]; then
+            echo "::error::release artifact set does not contain exactly five files"
+            find staged -type f -print
+            exit 1
+          fi
+          printf '%s\n' "$expected_assets" | while IFS= read -r asset; do
+            [ -n "$asset" ] || continue
+            matches="$(find staged -type f -name "$asset" -print)"
+            [ "$(printf '%s\n' "$matches" | grep -c .)" = 1 ] || {
+              echo "::error::release artifact '$asset' is missing or duplicated"
+              exit 1
+            }
+            cp -- "$matches" "dist/$asset"
+          done
           cd dist
           # Detached Ed25519 signature per binary (base64 of 64 raw bytes),
           # verified by the installer and `sevra update` against the pinned
           # publisher key.
-          for asset in sevra-*; do
+          for asset in \
+            sevra-darwin-x86_64 \
+            sevra-darwin-aarch64 \
+            sevra-linux-x86_64-musl \
+            sevra-linux-aarch64-musl \
+            sevra-windows-x86_64.exe
+          do
             node -e '
               const { createPrivateKey, sign } = require("node:crypto");
               const { readFileSync, writeFileSync } = require("node:fs");
@@ -186,10 +288,145 @@ jobs:
           done
           sha256sum sevra-* | grep -v '\.sig$' > SHA256SUMS
           ls -l
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+      # upload-artifact v4 artifacts are immutable after creation. This is the
+      # signer-retirement checkpoint: the local controller verifies its exact
+      # 11-file shape, Ed25519 signatures, checksums, and provenance before it
+      # deletes the one-time repository signer.
+      - name: Persist immutable signed checkpoint
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          tag_name: v${{ needs.version.outputs.version }}
-          name: sevra v${{ needs.version.outputs.version }}
-          generate_release_notes: true
-          files: dist/*
+          name: transitional-signed-v0.2.8
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+      # Keyless GitHub/Sigstore provenance is independent of the long-lived
+      # Ed25519 publisher key. Attest the checkpoint before release assembly:
+      # if draft creation or upload fails later, the exact signed bytes remain
+      # independently bound to this tag and SHA and can be resumed locally.
+      - name: Attest signed checkpoint (attempt 1)
+        id: attest1
+        continue-on-error: true
+        uses: actions/attest-build-provenance@78e6cbd37d0ac1a40113c04f2037dacf1ea3f12e
+        with:
+          subject-path: 'dist/*'
+      - name: Attest signed checkpoint (attempt 2)
+        id: attest2
+        if: steps.attest1.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/attest-build-provenance@78e6cbd37d0ac1a40113c04f2037dacf1ea3f12e
+        with:
+          subject-path: 'dist/*'
+      - name: Attest signed checkpoint (attempt 3, final)
+        if: steps.attest1.outcome == 'failure' && steps.attest2.outcome == 'failure'
+        uses: actions/attest-build-provenance@78e6cbd37d0ac1a40113c04f2037dacf1ea3f12e
+        with:
+          subject-path: 'dist/*'
+      # Immutable releases cannot accept another asset after publication.
+      # The checkpoint is already attested. Assemble its exact bytes as a
+      # draft, upload all of them, and only then flip the one-way publish
+      # switch.
+      - name: Create draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          if gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            draft="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/v${VERSION}" --jq '.draft')"
+            [ "$draft" = true ] || {
+              echo "::error::refusing to replace an existing published release"
+              exit 1
+            }
+            gh release delete "v${VERSION}" --repo "$GITHUB_REPOSITORY" --yes
+          fi
+          gh release create "v${VERSION}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
+            --title "sevra v${VERSION}" \
+            --generate-notes
+      - name: Upload complete release asset set
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release upload "v${VERSION}" dist/* \
+            --repo "$GITHUB_REPOSITORY"
+      - name: Publish immutable release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release edit "v${VERSION}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false
+
+  prepare-successor:
+    needs: [version, build]
+    name: attest unsigned successor assets
+    if: needs.version.outputs.version != '0.2.8'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: staged
+      - name: Collect exact unsigned asset set
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_assets='
+          sevra-darwin-x86_64
+          sevra-darwin-aarch64
+          sevra-linux-x86_64-musl
+          sevra-linux-aarch64-musl
+          sevra-windows-x86_64.exe'
+          [ "$(find staged -type f | wc -l | tr -d ' ')" = 5 ] || {
+            echo "::error::unsigned release artifact set does not contain exactly five files"
+            find staged -type f -print
+            exit 1
+          }
+          mkdir -p dist
+          printf '%s\n' "$expected_assets" | while IFS= read -r asset; do
+            [ -n "$asset" ] || continue
+            matches="$(find staged -type f -name "$asset" -print)"
+            [ "$(printf '%s\n' "$matches" | grep -c .)" = 1 ] || {
+              echo "::error::unsigned release artifact '$asset' is missing or duplicated"
+              exit 1
+            }
+            cp -- "$matches" "dist/$asset"
+          done
+      # These attestations bind the exact downloaded binaries to this tag and
+      # source commit. The local controller enforces those fields before the
+      # successor key is read.
+      - name: Attest unsigned provenance (attempt 1)
+        id: successor_attest1
+        continue-on-error: true
+        uses: actions/attest-build-provenance@78e6cbd37d0ac1a40113c04f2037dacf1ea3f12e
+        with:
+          subject-path: 'dist/*'
+      - name: Attest unsigned provenance (attempt 2)
+        id: successor_attest2
+        if: steps.successor_attest1.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/attest-build-provenance@78e6cbd37d0ac1a40113c04f2037dacf1ea3f12e
+        with:
+          subject-path: 'dist/*'
+      - name: Attest unsigned provenance (attempt 3, final)
+        if: steps.successor_attest1.outcome == 'failure' && steps.successor_attest2.outcome == 'failure'
+        uses: actions/attest-build-provenance@78e6cbd37d0ac1a40113c04f2037dacf1ea3f12e
+        with:
+          subject-path: 'dist/*'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: successor-unsigned
+          path: dist/*
+          if-no-files-found: error

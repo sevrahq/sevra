@@ -14,12 +14,16 @@ mod hub;
 mod local;
 mod mcp;
 mod output;
+mod safe_path;
 mod scan;
 mod signing;
 mod store;
 mod update;
 
 use clap::{Parser, Subcommand};
+use sha2::{Digest, Sha256};
+use std::io::{Read, Write};
+use std::path::Path;
 
 use output::{set_json_mode, usage_fail};
 
@@ -41,6 +45,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Internal installer boundary. Copies the already-verified executable
+    /// bytes from stdin through a held, no-follow install-directory handle.
+    #[command(name = "__install-verified", hide = true)]
+    InstallVerified {
+        #[arg(long)]
+        dir: String,
+        #[arg(long)]
+        sha256: String,
+    },
     /// Sign in: approve in the browser (default), or --key to store a key.
     /// Stored at ~/.sevra/config.json. With --json, sign-in first emits one
     /// compact awaiting_approval line (relay its URL, and its code when there
@@ -192,6 +205,59 @@ enum Commands {
     Update,
 }
 
+fn install_verified(dir: &str, expected_sha256: &str) -> Result<(), String> {
+    const MAX_INSTALL_BYTES: u64 = 128 * 1024 * 1024;
+
+    if expected_sha256.len() != 64
+        || expected_sha256
+            .bytes()
+            .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+    {
+        return Err("expected SHA-256 is not canonical lowercase hex".to_string());
+    }
+    let dir = Path::new(dir);
+    if !dir.is_absolute() {
+        return Err("install directory must be absolute".to_string());
+    }
+
+    safe_path::ensure_dir(dir, 0o755)
+        .map_err(|error| format!("could not securely create install directory: {error}"))?;
+    let held = safe_path::SafeDir::open(dir)
+        .map_err(|error| format!("could not securely hold install directory: {error}"))?;
+    let stdin = std::io::stdin();
+    let mut source = stdin.lock();
+    held.atomic_write_with("sevra", false, 0o755, |staged| {
+        let mut hasher = Sha256::new();
+        let mut total = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = source.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            total = total
+                .checked_add(read as u64)
+                .ok_or_else(|| std::io::Error::other("installer input length overflow"))?;
+            if total > MAX_INSTALL_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "verified installer input exceeds the size limit",
+                ));
+            }
+            hasher.update(&buffer[..read]);
+            staged.write_all(&buffer[..read])?;
+        }
+        if format!("{:x}", hasher.finalize()) != expected_sha256 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "verified installer input changed after verification",
+            ));
+        }
+        Ok(())
+    })
+    .map_err(|error| format!("could not atomically install verified executable: {error}"))
+}
+
 #[derive(Subcommand)]
 enum SecretsAction {
     /// List secret names + the functions they bind to
@@ -279,12 +345,33 @@ fn main() {
                 _ => {}
             }
         }
-        e.exit();
+        let raw = e.render().to_string();
+        let rendered = if matches!(
+            e.kind(),
+            clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+        ) {
+            crate::output::terminal_layout_safe(&raw)
+        } else {
+            crate::output::terminal_safe(&raw)
+        };
+        if e.use_stderr() {
+            eprint!("{rendered}");
+        } else {
+            print!("{rendered}");
+        }
+        std::process::exit(e.exit_code());
     });
     set_json_mode(cli.json);
 
     // Commands that don't need a loaded credential first.
     match &cli.command {
+        Commands::InstallVerified { dir, sha256 } => {
+            if let Err(error) = install_verified(dir, sha256) {
+                eprintln!("sevra install helper: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
         Commands::Login {
             key,
             hub,
@@ -376,6 +463,7 @@ fn main() {
         Commands::Update => update::cmd_update(&cfg),
         // handled above
         Commands::Login { .. }
+        | Commands::InstallVerified { .. }
         | Commands::Logout
         | Commands::Validate { .. }
         | Commands::Version => unreachable!(),

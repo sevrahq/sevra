@@ -12,6 +12,7 @@ use std::process::Command;
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use unicode_normalization::UnicodeNormalization;
 
 use crate::config::{self, Config, DEFAULT_HUB};
 use crate::hub::{
@@ -19,17 +20,20 @@ use crate::hub::{
     NOT_LOGGED_IN,
 };
 use crate::local;
-use crate::output::{fail, json_mode, note, out, usage_fail};
+use crate::output::{fail, json_mode, note, out, out_layout, terminal_safe, usage_fail};
 use crate::scan::{redact_path, scan_store, SecretHit};
-use crate::store::{build_pack, read_store, read_store_unscoped, Store, StoreError, WalkStats};
+use crate::store::{
+    build_pack, read_store, read_store_unscoped, Store, StoreError, WalkStats,
+    MAX_CANONICAL_PACK_BYTES, MAX_PACK_FILES,
+};
 
 /// The hub's poll cadence when it does not say otherwise (it always does).
 const POLL_INTERVAL_SECS: u64 = 5;
 
 const MAX_JSON_PUSH_BYTES: usize = 4 * 1024 * 1024;
-const MAX_STORE_FILES: usize = 100_000;
+const MAX_STORE_FILES: usize = MAX_PACK_FILES;
 const MAX_STORE_BYTES: u64 = 512 * 1024 * 1024;
-const MAX_PACK_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_PACK_BYTES: u64 = MAX_CANONICAL_PACK_BYTES;
 const PACK_COMMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(330);
 /// The hub's cap on one secret value (mirrored client-side so an oversized
 /// paste fails fast, before any request).
@@ -322,7 +326,7 @@ fn browser_flow(hub: &str) -> Option<DeviceLogin> {
         );
     } else {
         println!("Approve this sign-in in your browser:");
-        println!("  {approve_url}");
+        println!("  {}", terminal_safe(&approve_url));
         println!("Waiting…");
     }
 
@@ -526,8 +530,11 @@ fn device_flow_key(hub: &str) -> DeviceLogin {
             })
         );
     } else {
-        println!("First, confirm this code in your browser: {user_code}");
-        println!("Open: {verify_at}");
+        println!(
+            "First, confirm this code in your browser: {}",
+            terminal_safe(&user_code)
+        );
+        println!("Open: {}", terminal_safe(&verify_at));
         println!("Waiting for approval…");
     }
 
@@ -747,13 +754,13 @@ pub fn brains(cfg: &Config) {
         return;
     }
     for b in list {
-        out(
+        out_layout(
             &format!(
                 "{}\t{}\t{}\t{}",
-                str_field(&b, "slug"),
-                str_field(&b, "id"),
-                str_field(&b, "visibility"),
-                str_field(&b, "name")
+                terminal_safe(str_field(&b, "slug")),
+                terminal_safe(str_field(&b, "id")),
+                terminal_safe(str_field(&b, "visibility")),
+                terminal_safe(str_field(&b, "name"))
             ),
             None,
         );
@@ -817,7 +824,8 @@ fn prompt_delete_confirmation(cfg: &Config, brain: &str) -> String {
         format!("'{slug}' ({name})")
     };
     eprintln!(
-        "This permanently deletes {label} from the hub — every hosted file, its index, published pages, and grants. There is no undo."
+        "This permanently deletes {} from the hub — every hosted file, its index, published pages, and grants. There is no undo.",
+        terminal_safe(&label)
     );
     eprint!("type the brain's slug to confirm: ");
     let mut typed = String::new();
@@ -1089,15 +1097,15 @@ pub fn push(
         }
         fail(&format!("no .md files under {dir}"), None);
     }
-    if store.files.len() > MAX_STORE_FILES {
+    if stats.files > MAX_STORE_FILES {
         fail_snapshot_limit(
             &format!(
                 "store has {} files — the hub caps one snapshot at {} files",
-                commas(store.files.len() as u64),
+                commas(stats.files as u64),
                 commas(MAX_STORE_FILES as u64)
             ),
             &stats.largest,
-            json!({ "limitFiles": MAX_STORE_FILES, "files": store.files.len() }),
+            json!({ "limitFiles": MAX_STORE_FILES, "files": stats.files }),
         );
     }
     // The last gate before bytes leave the machine: refuse secret-shaped
@@ -1136,7 +1144,7 @@ pub fn push(
         if pack.len() as u64 > MAX_PACK_BYTES {
             fail_snapshot_limit(
                 &format!(
-                    "compressed store pack is {} — the hub caps one pack at {} compressed",
+                    "canonical store pack is {} — the hub caps one pack at {}",
                     human_size(pack.len() as u64),
                     human_size(MAX_PACK_BYTES)
                 ),
@@ -1160,7 +1168,12 @@ pub fn push(
             .get("url")
             .and_then(Value::as_str)
             .unwrap_or_else(|| fail("hub returned no pack upload URL", None));
-        put_presigned(url, presigned.get("headers").unwrap_or(&Value::Null), &pack);
+        put_presigned(
+            cfg,
+            url,
+            presigned.get("headers").unwrap_or(&Value::Null),
+            &pack,
+        );
         let mut commit = meta;
         if force {
             commit["allow_shrink"] = json!(true);
@@ -1230,7 +1243,7 @@ pub fn push(
             obj.insert("assetSync".into(), sync.to_json());
         }
     }
-    out(&human, Some(data));
+    out_layout(&human, Some(data));
 }
 
 // --- query / get / graph -----------------------------------------------------
@@ -1334,12 +1347,12 @@ pub fn query(
             .and_then(|s| s.as_str())
             .or_else(|| d.get("title").and_then(|t| t.as_str()))
             .unwrap_or("");
-        out(
+        out_layout(
             &format!(
                 "  {}\t{}\t{}",
-                str_field(&d, "path"),
-                str_field(&d, "type"),
-                sum
+                terminal_safe(str_field(&d, "path")),
+                terminal_safe(str_field(&d, "type")),
+                terminal_safe(sum)
             ),
             None,
         );
@@ -1375,14 +1388,15 @@ pub fn get(cfg: &Config, brain: &str, reference: &str) {
         .get("title")
         .and_then(|t| t.as_str())
         .unwrap_or_else(|| str_field(&d, "path"));
-    out(
+    out_layout(
         &format!(
-            "# {title}\npath: {}\ntype: {}  meta-type: {}\nid: {}\n\n{}",
-            str_field(&d, "path"),
-            str_field(&d, "type"),
-            str_field(&d, "metaType"),
-            str_field(&d, "dbmdId"),
-            str_field(&d, "body")
+            "# {}\npath: {}\ntype: {}  meta-type: {}\nid: {}\n\n{}",
+            terminal_safe(title),
+            terminal_safe(str_field(&d, "path")),
+            terminal_safe(str_field(&d, "type")),
+            terminal_safe(str_field(&d, "metaType")),
+            terminal_safe(str_field(&d, "dbmdId")),
+            terminal_safe(str_field(&d, "body"))
         ),
         None,
     );
@@ -1488,12 +1502,12 @@ pub fn grants(cfg: &Config, brain: &str) {
         return;
     }
     for g in list {
-        out(
+        out_layout(
             &format!(
                 "  {}\t{}\t{}",
-                str_field(&g, "email"),
-                str_field(&g, "capability"),
-                str_field(&g, "id")
+                terminal_safe(str_field(&g, "email")),
+                terminal_safe(str_field(&g, "capability")),
+                terminal_safe(str_field(&g, "id"))
             ),
             None,
         );
@@ -1533,13 +1547,13 @@ pub fn shared(cfg: &Config) {
         return;
     }
     for b in list {
-        out(
+        out_layout(
             &format!(
                 "  {}\t{}\t{}\t{}",
-                str_field(&b, "slug"),
-                str_field(&b, "id"),
-                str_field(&b, "capability"),
-                str_field(&b, "name")
+                terminal_safe(str_field(&b, "slug")),
+                terminal_safe(str_field(&b, "id")),
+                terminal_safe(str_field(&b, "capability")),
+                terminal_safe(str_field(&b, "name"))
             ),
             None,
         );
@@ -1580,6 +1594,7 @@ pub fn publish(cfg: &Config, brain: &str) {
         return;
     }
     let url = str_field(&r, "url");
+    let safe_url = terminal_safe(url);
     out(&format!("published {count} page(s) → {url}"), None);
     for p in r
         .get("published")
@@ -1587,11 +1602,11 @@ pub fn publish(cfg: &Config, brain: &str) {
         .cloned()
         .unwrap_or_default()
     {
-        out(
+        out_layout(
             &format!(
-                "  {url}/{}\t{}",
-                str_field(&p, "pageSlug"),
-                str_field(&p, "title")
+                "  {safe_url}/{}\t{}",
+                terminal_safe(str_field(&p, "pageSlug")),
+                terminal_safe(str_field(&p, "title"))
             ),
             None,
         );
@@ -1692,10 +1707,756 @@ pub(crate) fn contained(root: &Path, rel: &str) -> Option<PathBuf> {
     Some(full)
 }
 
+#[derive(Default)]
+struct ExportManifestNode {
+    file: bool,
+    children: BTreeMap<String, (String, ExportManifestNode)>,
+}
+
+fn windows_device_name(component: &str) -> bool {
+    let stem = component.split('.').next().unwrap_or(component);
+    let upper = stem.to_ascii_uppercase();
+    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || upper.strip_prefix("COM").is_some_and(|n| {
+            matches!(
+                n,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+        || upper.strip_prefix("LPT").is_some_and(|n| {
+            matches!(
+                n,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+}
+
+/// One deterministic cross-platform filename key. APFS/HFS+ canonicalize
+/// Unicode before comparing case; doing the same on every host turns an alias
+/// into a preflight refusal instead of silent last-writer-wins data loss.
+pub(crate) fn portable_component_key(component: &str) -> String {
+    component.nfd().flat_map(char::to_lowercase).nfd().collect()
+}
+
+pub(crate) fn validate_portable_asset_path(path: &str) -> Result<(), String> {
+    let components = portable_export_components(path)?;
+    let keys: Vec<String> = components
+        .iter()
+        .map(|component| portable_component_key(component))
+        .collect();
+    let leaf = keys.last().expect("portable path has one component");
+    let whole = keys.join("/");
+    if matches!(whole.as_str(), "db.md" | "assets.jsonl" | ".sevralocal")
+        || leaf.ends_with(".md")
+        || matches!(
+            keys.first().map(String::as_str),
+            Some("feed" | "blobs" | "packs" | "pub" | "meta")
+        )
+    {
+        return Err(format!(
+            "refusing reserved asset path in export manifest: {}",
+            terminal_safe(path)
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn portable_export_components(path: &str) -> Result<Vec<&str>, String> {
+    if path.is_empty()
+        || path.len() > 1024
+        || path.starts_with('/')
+        || path.ends_with('/')
+        || path.contains('\0')
+    {
+        return Err(format!(
+            "refusing unsafe export path: {}",
+            terminal_safe(path)
+        ));
+    }
+    let mut components = Vec::new();
+    for component in path.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            return Err(format!(
+                "refusing non-normalized export path: {}",
+                terminal_safe(path)
+            ));
+        }
+        if component.len() > 255 || portable_component_key(component).len() > 255 {
+            return Err(format!(
+                "refusing non-portable oversized export component: {}",
+                terminal_safe(path)
+            ));
+        }
+        if component.starts_with('.') {
+            return Err(format!(
+                "refusing hidden control component in export path: {}",
+                terminal_safe(path)
+            ));
+        }
+        if component.ends_with(['.', ' ']) {
+            return Err(format!(
+                "refusing non-portable export path with a trailing dot or space: {}",
+                terminal_safe(path)
+            ));
+        }
+        if component
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '\\' | '|' | '?' | '*'))
+        {
+            return Err(format!(
+                "refusing non-portable export path: {}",
+                terminal_safe(path)
+            ));
+        }
+        if windows_device_name(component) {
+            return Err(format!(
+                "refusing reserved device name in export path: {}",
+                terminal_safe(path)
+            ));
+        }
+        components.push(component);
+    }
+    let normalized_len = components
+        .iter()
+        .map(|component| portable_component_key(component).len())
+        .sum::<usize>()
+        .saturating_add(components.len().saturating_sub(1));
+    if normalized_len > 1024 {
+        return Err(format!(
+            "refusing non-portable oversized export path: {}",
+            terminal_safe(path)
+        ));
+    }
+    Ok(components)
+}
+
+/// Validate the complete remote name set against one portable filesystem
+/// model. This runs on every host, not just Windows: a hosted brain must be
+/// exportable without aliases or data loss on every supported client.
+fn validate_export_paths<'a>(paths: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
+    let mut root = ExportManifestNode::default();
+    for path in paths {
+        let components = portable_export_components(path)?;
+        let mut node = &mut root;
+        for (index, component) in components.iter().enumerate() {
+            if node.file {
+                return Err(format!(
+                    "refusing file/directory prefix collision in export manifest: {}",
+                    terminal_safe(path)
+                ));
+            }
+            let portable_key = portable_component_key(component);
+            let child = node
+                .children
+                .entry(portable_key)
+                .or_insert_with(|| ((*component).to_string(), ExportManifestNode::default()));
+            if child.0 != *component {
+                return Err(format!(
+                    "refusing case-alias collision in export manifest: {}",
+                    terminal_safe(path)
+                ));
+            }
+            node = &mut child.1;
+            if index + 1 == components.len() {
+                if node.file {
+                    return Err(format!(
+                        "refusing duplicate export path: {}",
+                        terminal_safe(path)
+                    ));
+                }
+                if !node.children.is_empty() {
+                    return Err(format!(
+                        "refusing file/directory prefix collision in export manifest: {}",
+                        terminal_safe(path)
+                    ));
+                }
+                node.file = true;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_portable_core_path(path: &str) -> Result<(), String> {
+    let components = portable_export_components(path)?;
+    let keys: Vec<String> = components
+        .iter()
+        .map(|component| portable_component_key(component))
+        .collect();
+    let whole = keys.join("/");
+    if whole == "db.md" && path != "DB.md" {
+        return Err(format!(
+            "refusing non-canonical DB.md control path: {}",
+            terminal_safe(path)
+        ));
+    }
+    if whole == "assets.jsonl" && path != "assets.jsonl" {
+        return Err(format!(
+            "refusing non-canonical assets.jsonl control path: {}",
+            terminal_safe(path)
+        ));
+    }
+    if whole == ".sevralocal" {
+        return Err(format!(
+            "refusing hosted .sevralocal control path: {}",
+            terminal_safe(path)
+        ));
+    }
+    if matches!(
+        keys.first().map(String::as_str),
+        Some("feed" | "blobs" | "packs" | "pub" | "meta")
+    ) {
+        return Err(format!(
+            "refusing hosted internal namespace: {}",
+            terminal_safe(path)
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn validate_export_manifest(entries: &[(String, Vec<u8>)]) -> Result<(), String> {
+    validate_export_paths(entries.iter().map(|(path, _)| path.as_str()))
+}
+
+/// Resolve every currently-existing destination component before content
+/// installation. The capability-safe writer repeats these checks at commit
+/// time; this pass guarantees all static symlink/type failures are reported
+/// before any earlier file can be replaced.
+fn preflight_export_paths<'a>(
+    root: &Path,
+    paths: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
+    match std::fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(
+                "cannot securely use export root without following links: destination root is a symlink"
+                    .to_string(),
+            );
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(
+                "cannot securely use export root: destination is not a directory".to_string(),
+            );
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("cannot inspect export root: {e}")),
+    }
+
+    for path in paths {
+        let components = portable_export_components(path)?;
+        let mut current = root.to_path_buf();
+        for (index, component) in components.iter().enumerate() {
+            current.push(component);
+            let is_leaf = index + 1 == components.len();
+            match std::fs::symlink_metadata(&current) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    let kind = if is_leaf { "leaf" } else { "ancestor" };
+                    return Err(format!(
+                        "destination {kind} is a symlink: {}",
+                        terminal_safe(path)
+                    ));
+                }
+                Ok(metadata) if is_leaf && !metadata.is_file() => {
+                    return Err(format!(
+                        "destination leaf is not a regular file: {}",
+                        terminal_safe(path)
+                    ));
+                }
+                Ok(metadata) if !is_leaf && !metadata.is_dir() => {
+                    return Err(format!(
+                        "destination ancestor is not a directory: {}",
+                        terminal_safe(path)
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(e) => {
+                    return Err(format!(
+                        "cannot inspect export destination {}: {e}",
+                        terminal_safe(path)
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn preflight_export_destinations(root: &Path, entries: &[(String, Vec<u8>)]) -> Result<(), String> {
+    preflight_export_paths(root, entries.iter().map(|(path, _)| path.as_str()))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExportFingerprint {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    readonly: bool,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    mode: u32,
+}
+
+#[derive(Clone)]
+struct InstalledState {
+    fingerprint: ExportFingerprint,
+    sha256: [u8; 32],
+}
+
+struct ExportBackup {
+    path: String,
+    bytes: Option<Vec<u8>>,
+    permissions: Option<std::fs::Permissions>,
+    fingerprint: Option<ExportFingerprint>,
+    installed: Option<InstalledState>,
+}
+
+fn export_fingerprint(metadata: &std::fs::Metadata) -> ExportFingerprint {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+
+    ExportFingerprint {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+        readonly: metadata.permissions().readonly(),
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+        #[cfg(unix)]
+        mode: metadata.mode(),
+    }
+}
+
+fn export_mode(permissions: &std::fs::Permissions) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.mode() & 0o7777
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = permissions;
+        0o600
+    }
+}
+
+fn held_file_state(
+    root: &crate::safe_path::SafeDir,
+    path: &str,
+) -> Result<Option<(Vec<u8>, std::fs::Permissions, ExportFingerprint)>, String> {
+    let Some(mut file) = root.open_relative(path).map_err(|error| {
+        format!(
+            "could not securely inspect export destination {}: {error}",
+            terminal_safe(path)
+        )
+    })?
+    else {
+        return Ok(None);
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("could not inspect existing export file: {error}"))?;
+    if metadata.len() > MAX_STORE_BYTES {
+        return Err("existing export file exceeds the 512 MB transaction limit".to_string());
+    }
+    let bytes = read_bounded(&mut file, MAX_STORE_BYTES)
+        .map_err(|error| format!("could not read existing export file: {error}"))?;
+    Ok(Some((
+        bytes,
+        metadata.permissions(),
+        export_fingerprint(&metadata),
+    )))
+}
+
+fn parent_directories(paths: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut directories = BTreeSet::new();
+    for path in paths {
+        let mut parts: Vec<&str> = path.split('/').collect();
+        parts.pop();
+        while !parts.is_empty() {
+            directories.insert(parts.join("/"));
+            parts.pop();
+        }
+    }
+    let mut directories: Vec<String> = directories.into_iter().collect();
+    directories.sort_by_key(|path| path.matches('/').count());
+    directories
+}
+
+#[cfg(test)]
+fn snapshot_held_destinations(
+    root: &crate::safe_path::SafeDir,
+    paths: &[String],
+) -> Result<Vec<ExportBackup>, String> {
+    let mut backups = Vec::with_capacity(paths.len());
+    let mut total = 0u64;
+    for path in paths {
+        let (bytes, permissions, fingerprint) = match held_file_state(root, path)? {
+            Some((bytes, permissions, fingerprint)) => {
+                if bytes.len() as u64 > MAX_STORE_BYTES.saturating_sub(total) {
+                    return Err(
+                        "existing export files exceed the 512 MB transaction backup limit"
+                            .to_string(),
+                    );
+                }
+                total += bytes.len() as u64;
+                (Some(bytes), Some(permissions), Some(fingerprint))
+            }
+            None => (None, None, None),
+        };
+        backups.push(ExportBackup {
+            path: path.clone(),
+            bytes,
+            permissions,
+            fingerprint,
+            installed: None,
+        });
+    }
+    Ok(backups)
+}
+
+fn snapshot_missing_destinations(paths: &[String]) -> Vec<ExportBackup> {
+    paths
+        .iter()
+        .map(|path| ExportBackup {
+            path: path.clone(),
+            bytes: None,
+            permissions: None,
+            fingerprint: None,
+            installed: None,
+        })
+        .collect()
+}
+
+fn verify_export_snapshot(
+    root: &crate::safe_path::SafeDir,
+    backups: &[ExportBackup],
+) -> Result<(), String> {
+    for backup in backups {
+        let current = held_file_state(root, &backup.path)?;
+        match (backup.bytes.as_ref(), backup.fingerprint.as_ref(), current) {
+            (None, None, None) => {}
+            (Some(expected_bytes), Some(expected_fingerprint), Some((bytes, _, fingerprint)))
+                if expected_bytes == &bytes && expected_fingerprint == &fingerprint => {}
+            _ => {
+                return Err(format!(
+                    "export destination changed after transaction preflight: {}",
+                    terminal_safe(&backup.path)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn capture_installed_state(
+    root: &crate::safe_path::SafeDir,
+    path: &str,
+    expected_sha256: [u8; 32],
+) -> Result<InstalledState, String> {
+    let Some((bytes, _, fingerprint)) = held_file_state(root, path)? else {
+        return Err(format!(
+            "export destination disappeared immediately after installation: {}",
+            terminal_safe(path)
+        ));
+    };
+    let actual: [u8; 32] = Sha256::digest(&bytes).into();
+    if actual != expected_sha256 {
+        return Err(format!(
+            "export destination changed during installation: {}",
+            terminal_safe(path)
+        ));
+    }
+    Ok(InstalledState {
+        fingerprint,
+        sha256: actual,
+    })
+}
+
+fn rollback_held_export(
+    root: &crate::safe_path::SafeDir,
+    backups: &[ExportBackup],
+    created_directories: &[String],
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for backup in backups.iter().rev() {
+        let Some(installed) = &backup.installed else {
+            continue;
+        };
+        let current = held_file_state(root, &backup.path);
+        let unchanged = match current {
+            Ok(Some((bytes, _, fingerprint))) => {
+                let sha256: [u8; 32] = Sha256::digest(&bytes).into();
+                fingerprint == installed.fingerprint && sha256 == installed.sha256
+            }
+            _ => false,
+        };
+        if !unchanged {
+            errors.push(format!(
+                "{}: refusing to clobber a concurrent edit during rollback",
+                terminal_safe(&backup.path)
+            ));
+            continue;
+        }
+        let result = match &backup.bytes {
+            Some(bytes) => {
+                let permissions = backup
+                    .permissions
+                    .as_ref()
+                    .expect("existing backup retains permissions");
+                root.atomic_write(&backup.path, bytes, true, export_mode(permissions))
+                    .and_then(|()| {
+                        let file = root.open_relative(&backup.path)?.ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                "restored file disappeared",
+                            )
+                        })?;
+                        file.set_permissions(permissions.clone())?;
+                        file.sync_all()
+                    })
+            }
+            None => root.remove_regular(&backup.path).map(|_| ()),
+        };
+        if let Err(error) = result {
+            errors.push(format!("{}: {error}", terminal_safe(&backup.path)));
+        }
+    }
+    for directory in created_directories.iter().rev() {
+        if let Err(error) = root.remove_empty_dir(directory) {
+            errors.push(format!("{}: {error}", terminal_safe(directory)));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn install_complete_export(
+    root: &crate::safe_path::SafeDir,
+    entries: &[(String, Vec<u8>)],
+    prepared: &mut crate::assets::PreparedRestore,
+    mut backups: Vec<ExportBackup>,
+    created_directories: Vec<String>,
+) -> Result<Vec<ExportBackup>, String> {
+    verify_export_snapshot(root, &backups)?;
+    let mut completed = 0usize;
+    for (path, content) in entries {
+        let expected_missing = backups[completed].bytes.is_none();
+        let write = if expected_missing {
+            root.atomic_create(path, content, true, 0o600)
+        } else {
+            root.atomic_write(path, content, true, 0o600)
+        };
+        if let Err(error) = write {
+            let rollback = rollback_held_export(root, &backups[..completed], &created_directories);
+            return match rollback {
+                Ok(()) => Err(format!(
+                    "secure export write failed for {}: {error}; all writes were rolled back",
+                    terminal_safe(path)
+                )),
+                Err(rollback_error) => Err(format!(
+                    "secure export write failed for {}: {error}; rollback also failed: {rollback_error}",
+                    terminal_safe(path)
+                )),
+            };
+        }
+        let sha256: [u8; 32] = Sha256::digest(content).into();
+        match capture_installed_state(root, path, sha256) {
+            Ok(installed) => backups[completed].installed = Some(installed),
+            Err(error) => {
+                let rollback =
+                    rollback_held_export(root, &backups[..completed], &created_directories);
+                return match rollback {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => {
+                        Err(format!("{error}; rollback also failed: {rollback_error}"))
+                    }
+                };
+            }
+        }
+        completed += 1;
+    }
+    for asset in prepared.assets_mut() {
+        let path = asset.path().to_string();
+        let expected_missing = backups[completed].bytes.is_none();
+        let write = if expected_missing {
+            root.atomic_create_with(&path, true, 0o644, |destination| {
+                asset.write_to(destination)
+            })
+        } else {
+            root.atomic_write_with(&path, true, 0o644, |destination| {
+                asset.write_to(destination)
+            })
+        };
+        if let Err(error) = write {
+            let rollback = rollback_held_export(root, &backups[..completed], &created_directories);
+            return match rollback {
+                Ok(()) => Err(format!(
+                    "secure asset write failed for {}: {error}; all writes were rolled back",
+                    terminal_safe(&path)
+                )),
+                Err(rollback_error) => Err(format!(
+                    "secure asset write failed for {}: {error}; rollback also failed: {rollback_error}",
+                    terminal_safe(&path)
+                )),
+            };
+        }
+        let installed = match held_file_state(root, &path) {
+            Ok(Some(installed)) => installed,
+            Ok(None) => {
+                let error = format!("installed asset disappeared: {}", terminal_safe(&path));
+                let rollback =
+                    rollback_held_export(root, &backups[..completed], &created_directories);
+                return match rollback {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => {
+                        Err(format!("{error}; rollback also failed: {rollback_error}"))
+                    }
+                };
+            }
+            Err(error) => {
+                let rollback =
+                    rollback_held_export(root, &backups[..completed], &created_directories);
+                return match rollback {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => {
+                        Err(format!("{error}; rollback also failed: {rollback_error}"))
+                    }
+                };
+            }
+        };
+        let digest = Sha256::digest(&installed.0);
+        let actual_sha256 = format!("{digest:x}");
+        let sha256: [u8; 32] = digest.into();
+        backups[completed].installed = Some(InstalledState {
+            fingerprint: installed.2,
+            sha256,
+        });
+        if actual_sha256 != asset.sha256() {
+            let error = format!(
+                "installed asset changed during commit: {}",
+                terminal_safe(&path)
+            );
+            let rollback = rollback_held_export(root, &backups[..=completed], &created_directories);
+            return match rollback {
+                Ok(()) => Err(error),
+                Err(rollback_error) => {
+                    Err(format!("{error}; rollback also failed: {rollback_error}"))
+                }
+            };
+        }
+        completed += 1;
+    }
+    Ok(backups)
+}
+
+#[cfg(test)]
+fn snapshot_export_destinations(
+    root: &Path,
+    entries: &[(String, Vec<u8>)],
+) -> Result<Vec<ExportBackup>, String> {
+    let mut backups = Vec::with_capacity(entries.len());
+    let mut total = 0u64;
+    for (path, _) in entries {
+        let bytes = match crate::safe_path::open_regular(root, path) {
+            Ok(Some(mut file)) => {
+                let remaining = MAX_STORE_BYTES.saturating_sub(total);
+                let held_len = file
+                    .metadata()
+                    .map_err(|e| format!("could not inspect existing export file: {e}"))?
+                    .len();
+                if held_len > remaining {
+                    return Err(
+                        "existing export files exceed the 512 MB transaction backup limit"
+                            .to_string(),
+                    );
+                }
+                let bytes = read_bounded(&mut file, remaining)
+                    .map_err(|e| format!("could not snapshot existing export file: {e}"))?;
+                total += bytes.len() as u64;
+                Some(bytes)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                return Err(format!(
+                    "could not securely snapshot export destination {}: {e}",
+                    terminal_safe(path)
+                ));
+            }
+        };
+        backups.push(ExportBackup {
+            path: path.clone(),
+            bytes,
+            permissions: None,
+            fingerprint: None,
+            installed: None,
+        });
+    }
+    Ok(backups)
+}
+
+#[cfg(test)]
+fn rollback_export(root: &Path, backups: &[ExportBackup]) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for backup in backups.iter().rev() {
+        let result = match &backup.bytes {
+            Some(bytes) => {
+                crate::safe_path::atomic_write(root, &backup.path, bytes, true, 0o600).map(|_| ())
+            }
+            None => crate::safe_path::remove_regular(root, &backup.path).map(|_| ()),
+        };
+        if let Err(error) = result {
+            errors.push(format!("{}: {error}", terminal_safe(&backup.path)));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+#[cfg(test)]
+fn install_export_entries_with<F>(
+    root: &Path,
+    entries: &[(String, Vec<u8>)],
+    mut write: F,
+) -> Result<(), String>
+where
+    F: FnMut(&Path, &str, &[u8]) -> std::io::Result<()>,
+{
+    let backups = snapshot_export_destinations(root, entries)?;
+    for (index, (path, content)) in entries.iter().enumerate() {
+        if let Err(error) = write(root, path, content) {
+            let rollback = rollback_export(root, &backups[..=index]);
+            return match rollback {
+                Ok(()) => Err(format!(
+                    "secure export write failed for {}: {error}; prior writes were rolled back",
+                    terminal_safe(path)
+                )),
+                Err(rollback_error) => Err(format!(
+                    "secure export write failed for {}: {error}; rollback also failed: {rollback_error}",
+                    terminal_safe(path)
+                )),
+            };
+        }
+    }
+    Ok(())
+}
+
 fn entries_from_pack(bytes: Vec<u8>) -> Vec<(String, Vec<u8>)> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .unwrap_or_else(|e| fail(&format!("hub returned an invalid store pack: {e}"), None));
-    if archive.is_empty() || archive.len() > 100_000 {
+    if archive.is_empty() || archive.len() > MAX_PACK_FILES {
         fail("hub returned a store pack with an invalid file count", None);
     }
     let mut entries = Vec::with_capacity(archive.len());
@@ -1721,22 +2482,40 @@ fn entries_from_pack(bytes: Vec<u8>) -> Vec<(String, Vec<u8>)> {
         if !seen.insert(path.clone()) {
             fail(&format!("refusing duplicate export path: {path}"), None);
         }
-        total = total.saturating_add(file.size());
-        if total > MAX_STORE_BYTES {
+        let remaining = MAX_STORE_BYTES.saturating_sub(total);
+        if file.size() > remaining {
             fail("store pack expands beyond the 512 MB limit", None);
         }
-        let mut content = Vec::new();
-        file.read_to_end(&mut content)
+        // ZIP size fields are attacker-controlled. A forged-small central
+        // directory entry must not turn `read_to_end` into an unbounded
+        // decompression allocation before the post-read length check. The
+        // stream itself is capped at the remaining whole-store budget.
+        let content = read_bounded(&mut file, remaining)
             .unwrap_or_else(|e| fail(&format!("could not decompress {path}: {e}"), None));
         if content.len() as u64 != file.size() {
             fail(&format!("store pack entry length mismatch: {path}"), None);
         }
+        total += content.len() as u64;
         entries.push((path, content));
     }
     if entries.is_empty() {
         fail("hub returned an empty store pack", None);
     }
     entries
+}
+
+fn read_bounded(reader: &mut impl Read, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    let mut content = Vec::new();
+    reader
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut content)?;
+    if content.len() as u64 > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "entry expands beyond the remaining store limit",
+        ));
+    }
+    Ok(content)
 }
 
 pub fn export(cfg: &Config, brain: &str, dir: Option<String>, skip_assets: bool) {
@@ -1793,7 +2572,7 @@ pub fn export(cfg: &Config, brain: &str, dir: Option<String>, skip_assets: bool)
             .and_then(Value::as_str)
             .filter(|sha| sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()))
             .unwrap_or_else(|| fail("hub returned an invalid pack hash", None));
-        let pack = get_presigned(url, MAX_PACK_BYTES);
+        let pack = get_presigned(cfg, url, MAX_PACK_BYTES);
         let actual = format!("{:x}", Sha256::digest(&pack));
         if actual != expected {
             fail("downloaded store pack failed SHA-256 verification", None);
@@ -1820,87 +2599,161 @@ pub fn export(cfg: &Config, brain: &str, dir: Option<String>, skip_assets: bool)
             .collect()
     };
 
-    // Gate the entire remote manifest before the first filesystem mutation.
-    let mut seen = std::collections::HashSet::new();
+    let asset_manifest = entries
+        .iter()
+        .find(|(path, _)| path == "assets.jsonl")
+        .map(|(_, bytes)| bytes.as_slice());
+    for (path, _) in &entries {
+        validate_portable_core_path(path).unwrap_or_else(|error| fail(&error, None));
+    }
+    let asset_declarations = crate::assets::parse_restore_manifest(asset_manifest)
+        .unwrap_or_else(|error| fail(&error, None));
+
+    // Gate the complete namespace, including declared binary paths, before the
+    // first filesystem mutation. Store files and assets share one portable
+    // trie: neither half can alias or overwrite the other.
     for (path, _) in &entries {
         if contained(&root, path).is_none() {
-            fail(&format!("refusing unsafe export path: {path}"), None);
-        }
-        if !seen.insert(path) {
-            fail(&format!("refusing duplicate export path: {path}"), None);
+            fail(
+                &format!("refusing unsafe export path: {}", terminal_safe(path)),
+                None,
+            );
         }
     }
-    std::fs::create_dir_all(&root)
-        .unwrap_or_else(|e| fail(&format!("cannot create {}: {e}", root.display()), None));
-    let real_root = std::fs::canonicalize(&root)
-        .unwrap_or_else(|e| fail(&format!("cannot resolve {}: {e}", root.display()), None));
-    for (path, content) in &entries {
-        let full = contained(&root, path)
-            .unwrap_or_else(|| fail(&format!("refusing unsafe export path: {path}"), None));
-        if let Some(parent) = full.parent() {
-            std::fs::create_dir_all(parent).unwrap_or_else(|e| {
-                fail(&format!("cannot create {}: {e}", parent.display()), None)
-            });
-            // The lexical containment above can be defeated by a symlinked
-            // subdir INSIDE an existing target dir — re-check the REAL parent
-            // after creation (exports into a fresh dir are unaffected).
-            let real_parent = std::fs::canonicalize(parent).unwrap_or_else(|e| {
-                fail(&format!("cannot resolve {}: {e}", parent.display()), None)
-            });
-            if !real_parent.starts_with(&real_root) {
-                fail(
-                    &format!(
-                        "refusing export through a symlink escaping {}: {path}",
-                        root.display()
-                    ),
-                    None,
-                );
-            }
-        }
-        // Never write THROUGH a pre-existing symlink at the leaf: a planted
-        // link inside the target dir would redirect the write outside it
-        // (the parent re-check above only covers directories).
-        if let Ok(m) = std::fs::symlink_metadata(&full) {
-            if m.file_type().is_symlink() {
-                fail(
-                    &format!("refusing to overwrite a symlink: {}", full.display()),
-                    None,
-                );
-            }
-        }
-        std::fs::write(&full, content)
-            .unwrap_or_else(|e| fail(&format!("write failed {}: {e}", full.display()), None));
+    let all_paths = || {
+        entries
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .chain(asset_declarations.iter().map(|asset| asset.path.as_str()))
+    };
+    validate_export_paths(all_paths()).unwrap_or_else(|error| fail(&error, None));
+    preflight_export_paths(&root, all_paths()).unwrap_or_else(|error| fail(&error, None));
+
+    match std::fs::symlink_metadata(&root) {
+        Ok(_) => fail(
+            "export destination already exists; choose a new directory so export can publish atomically without replacing local data",
+            None,
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => fail(&format!("cannot inspect export destination: {error}"), None),
     }
+    let mut prepared = if skip_assets {
+        crate::assets::prepare_restore(cfg, brain, None, &[])
+    } else {
+        crate::assets::prepare_restore(cfg, brain, None, &asset_declarations)
+    }
+    .unwrap_or_else(|error| fail(&error, None));
+
+    let parent_path = root
+        .parent()
+        .unwrap_or_else(|| fail("export destination has no parent directory", None));
+    let target_name = root
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or_else(|| fail("export destination name is not portable UTF-8", None));
+    crate::safe_path::ensure_dir(parent_path, 0o755).unwrap_or_else(|error| {
+        fail(
+            &format!("cannot securely create export parent without following links: {error}"),
+            None,
+        )
+    });
+    let parent = crate::safe_path::SafeDir::open(parent_path).unwrap_or_else(|error| {
+        fail(
+            &format!("cannot securely hold export parent: {error}"),
+            None,
+        )
+    });
+    let mut random = [0_u8; 16];
+    getrandom::getrandom(&mut random)
+        .unwrap_or_else(|_| fail("operating-system randomness unavailable", None));
+    let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+    let stage_name = format!(".sevra-export-{suffix}");
+    let stage = parent
+        .create_dir(&stage_name, 0o700)
+        .unwrap_or_else(|error| {
+            fail(
+                &format!("cannot create private export stage: {error}"),
+                None,
+            )
+        });
+    let paths: Vec<String> = all_paths().map(str::to_string).collect();
+    let backups = snapshot_missing_destinations(&paths);
+    let created_directories = parent_directories(paths.iter().cloned());
+    let completed = match install_complete_export(
+        &stage,
+        &entries,
+        &mut prepared,
+        backups,
+        created_directories.clone(),
+    ) {
+        Ok(completed) => completed,
+        Err(error) => {
+            drop(stage);
+            match parent.remove_empty_dir(&stage_name) {
+                Ok(_) => fail(&error, None),
+                Err(cleanup_error) => fail(
+                    &format!("{error}; private stage cleanup also failed: {cleanup_error}"),
+                    None,
+                ),
+            }
+        }
+    };
+    drop(stage);
+    if let Err(error) = parent.publish_dir_no_replace(&stage_name, target_name) {
+        let rollback = parent
+            .open_dir(std::ffi::OsStr::new(&stage_name))
+            .map_err(|open_error| open_error.to_string())
+            .and_then(|stage| {
+                rollback_held_export(&stage, &completed, &created_directories)
+                    .map_err(|rollback_error| rollback_error.to_string())
+            })
+            .and_then(|()| {
+                parent
+                    .remove_empty_dir(&stage_name)
+                    .map(|_| ())
+                    .map_err(|remove_error| remove_error.to_string())
+            });
+        match rollback {
+            Ok(()) => fail(
+                &format!(
+                    "export destination appeared before atomic publish: {error}; private stage was removed"
+                ),
+                None,
+            ),
+            Err(rollback_error) => fail(
+                &format!(
+                    "export destination appeared before atomic publish: {error}; stage cleanup also failed: {rollback_error}"
+                ),
+                None,
+            ),
+        }
+    }
+
     let mut data = r.as_object().cloned().unwrap_or_default();
     data.remove("files");
     data.remove("url");
     data.insert("dir".into(), json!(dir));
     data.insert("fileCount".into(), json!(entries.len()));
-    let mut human = format!("exported {} file(s) → {dir}", entries.len());
+    let mut human = format!(
+        "exported {} file(s) → {}",
+        entries.len(),
+        terminal_safe(&dir)
+    );
 
-    // The byte half of the export: the store's manifest names every declared
-    // blob — restore what is absent (or drifted) beside the markdown, each
-    // download SHA-verified and containment-checked. The export is complete
-    // files-on-disk either way; a failed asset names itself and the rest
-    // continue.
-    if !skip_assets {
-        if let Some(restore) = crate::assets::restore_assets(cfg, brain, &root) {
-            if restore.restored > 0 {
-                human.push_str(&format!(
-                    "\nassets: {} restored ({})",
-                    restore.restored,
-                    human_size(restore.restored_bytes)
-                ));
-            } else if restore.failed == 0 && restore.present > 0 {
-                human.push_str(&format!("\nassets: all {} present", restore.present));
-            }
-            if restore.failed > 0 {
-                human.push_str(&format!("\nassets: {} failed to restore", restore.failed));
-            }
-            data.insert("assetRestore".into(), restore.to_json());
+    if !skip_assets && asset_manifest.is_some() {
+        let restore = prepared.report();
+        if restore.restored > 0 {
+            human.push_str(&format!(
+                "\nassets: {} restored ({})",
+                restore.restored,
+                human_size(restore.restored_bytes)
+            ));
+        } else if restore.present > 0 {
+            human.push_str(&format!("\nassets: all {} present", restore.present));
         }
+        data.insert("assetRestore".into(), restore.to_json());
     }
-    out(&human, Some(Value::Object(data)));
+    out_layout(&human, Some(Value::Object(data)));
 }
 
 fn normalize(p: &Path) -> PathBuf {
@@ -2083,13 +2936,13 @@ pub fn secrets_list(cfg: &Config, brain: &str) {
         } else {
             "not live"
         };
-        out(
+        out_layout(
             &format!(
                 "  {}\t{}\tneeds: {}\tegress: {}",
-                str_field(f, "name"),
+                terminal_safe(str_field(f, "name")),
                 live,
-                join(f, "secrets"),
-                join(f, "egress")
+                terminal_safe(&join(f, "secrets")),
+                terminal_safe(&join(f, "egress"))
             ),
             None,
         );
@@ -2253,18 +3106,40 @@ pub fn secrets_quarantine(dir: Option<String>, dry_run: bool, closure: bool) {
     }
 
     // --closure: computed BEFORE any write — a missing dbmd fails up front.
+    // The dump is kept: the link blast-radius report below needs the same one,
+    // and a whole-store emit is a SWEEP (seconds on a 30k-file store).
+    let mut emit_dump: Option<Value> = None;
     let closure_marked: Vec<String> = if closure {
         let emit = run_dbmd_emit(&dir);
         let seeds: BTreeSet<String> = marked.iter().map(|(exact, _)| exact.clone()).collect();
-        closure_component(&emit, &seeds)
+        let component = closure_component(&emit, &seeds)
             .into_iter()
             .filter(|p| {
                 !seeds.contains(p) && !covered(p) && !local::MUST_RIDE.contains(&p.as_str())
             })
-            .collect() // BTreeSet iteration: already sorted
+            .collect(); // BTreeSet iteration: already sorted
+        emit_dump = Some(emit);
+        component
     } else {
         Vec::new()
     };
+
+    // The LINK blast radius of what is about to be kept home. Advisory: a
+    // missing dbmd simply means no report, never a refused quarantine.
+    let newly_marked: BTreeSet<String> = marked
+        .iter()
+        .map(|(exact, _)| exact.clone())
+        .chain(closure_marked.iter().cloned())
+        .collect();
+    let dangling: Vec<(String, usize)> = if newly_marked.is_empty() {
+        Vec::new()
+    } else {
+        match emit_dump.take().or_else(|| try_dbmd_emit(&dir)) {
+            Some(emit) => incoming_link_counts(&emit, &newly_marked),
+            None => Vec::new(),
+        }
+    };
+    let dangling_total: usize = dangling.iter().map(|(_, n)| n).sum();
 
     // Warning: the asset manifest rides every push and still names kept-home
     // files (existing entries and this run's marks alike). Read-only over
@@ -2297,13 +3172,15 @@ pub fn secrets_quarantine(dir: Option<String>, dry_run: bool, closure: bool) {
         .iter()
         .map(|(exact, _)| local::entry_for(exact))
         .chain(closure_marked.iter().map(|exact| local::entry_for(exact)))
-        .collect();
+        .collect::<Result<_, _>>()
+        .unwrap_or_else(|e| fail(&e, None));
     new_entries.sort();
     if !dry_run && !new_entries.is_empty() {
         let raw = scope.as_ref().map(|s| s.raw()).unwrap_or("");
         let body = local::append_entries(raw, &new_entries);
-        std::fs::write(Path::new(&dir).join(local::FILE_NAME), body)
-            .unwrap_or_else(|e| fail(&format!("could not write {}: {e}", local::FILE_NAME), None));
+        let root = std::fs::canonicalize(&dir)
+            .unwrap_or_else(|e| fail(&format!("could not resolve store directory: {e}"), None));
+        local::write(&root, &body).unwrap_or_else(|e| fail(&e, None));
     }
 
     // Report. Shown spellings only (redacted wherever a path matched).
@@ -2322,7 +3199,7 @@ pub fn secrets_quarantine(dir: Option<String>, dry_run: bool, closure: bool) {
         };
         let mut s = format!("{verb} (.sevralocal): {} file(s)", marked_shown.len());
         for shown in &marked_shown {
-            s.push_str(&format!("\n  {shown}"));
+            s.push_str(&format!("\n  {}", terminal_safe(shown)));
         }
         s
     };
@@ -2333,7 +3210,7 @@ pub fn secrets_quarantine(dir: Option<String>, dry_run: bool, closure: bool) {
             closure_shown.len()
         ));
         for shown in &closure_shown {
-            human.push_str(&format!("\n  {shown}"));
+            human.push_str(&format!("\n  {}", terminal_safe(shown)));
         }
     }
     if already_covered > 0 {
@@ -2341,7 +3218,30 @@ pub fn secrets_quarantine(dir: Option<String>, dry_run: bool, closure: bool) {
             "\n{already_covered} hit file(s) already covered by .sevralocal"
         ));
     }
+    // What keeping these home costs the HOSTED graph. Locally nothing changes
+    // (the files stay, dbmd resolves every link); on the hub each of these
+    // links dangles, and the push summary's broken-edge count is this number.
+    if dangling_total > 0 {
+        let verb = if dry_run {
+            "would dangle"
+        } else {
+            "now dangle"
+        };
+        human.push_str(&format!(
+            "\nlinks: {dangling_total} incoming link(s) {verb} in the HOSTED copy (locally nothing changes):"
+        ));
+        for (path, n) in dangling.iter().take(5) {
+            human.push_str(&format!("\n  {n} → {}", terminal_safe(&redact_path(path))));
+        }
+        if dangling.len() > 5 {
+            human.push_str(&format!("\n  … and {} more file(s)", dangling.len() - 5));
+        }
+        human.push_str(
+            "\nto keep the graph whole instead: rotate the credential at its issuer, redact the file, and un-mark it",
+        );
+    }
     for (kind, path) in &warnings {
+        let path = terminal_safe(path);
         let line = match *kind {
             "filename_secret" => format!(
                 "warning: {path} — the filename itself is the secret — consider renaming; a future feed removal would record the name"
@@ -2358,12 +3258,17 @@ pub fn secrets_quarantine(dir: Option<String>, dry_run: bool, closure: bool) {
     if !json_mode() {
         note(FORWARD_ONLY_NOTE);
     }
-    out(
+    out_layout(
         &human,
         Some(json!({
             "marked": marked_shown,
             "closureMarked": closure_shown,
             "alreadyCovered": already_covered,
+            "danglingLinks": dangling_total,
+            "danglingByPath": dangling
+                .iter()
+                .map(|(p, n)| json!({ "path": redact_path(p), "incoming": n }))
+                .collect::<Vec<_>>(),
             "warnings": warnings
                 .iter()
                 .map(|(kind, path)| json!({ "kind": kind, "path": path }))
@@ -2378,6 +3283,21 @@ pub fn secrets_quarantine(dir: Option<String>, dry_run: bool, closure: bool) {
 /// missing dbmd fails up front — before anything is written — with the
 /// install hint; so does a failed or unparseable emit. Third-party error
 /// text passes through the secret redactor before it is shown.
+/// The soft form: `None` whenever dbmd is absent, fails, or answers
+/// unparseably. Used by the link blast-radius report, which is ADVISORY —
+/// keeping a secret home must never depend on a second tool being installed.
+fn try_dbmd_emit(dir: &str) -> Option<Value> {
+    let output = Command::new("dbmd")
+        .args(["emit", "--json"])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&output.stdout).ok()
+}
+
 fn run_dbmd_emit(dir: &str) -> Value {
     let output = match Command::new("dbmd")
         .args(["emit", "--json"])
@@ -2425,6 +3345,57 @@ fn run_dbmd_emit(dir: &str) -> Value {
 /// already absent from emit, so over-marking through them cannot happen
 /// either). An edge exists only between two emitted files — a dangling
 /// target is nobody's bridge. Returns the component, seeds included.
+/// Incoming wiki-links to each kept-home path — the LINK blast radius, which
+/// is not the secret blast radius `--closure` computes. Keeping a file home is
+/// forward-safe for secrets and lossy for the graph: the file stays in the
+/// local brain, so `dbmd` still resolves every link, but the hosted copy never
+/// receives it and each incoming link dangles there.
+///
+/// Dogfooded into existence (2026-07-30): quarantining a raw Workflowy export
+/// that 11,587 records name as their `source:` dangled 11,590 edges in the
+/// hosted brain — 16% of its graph — reported only as a number in the push
+/// summary, with nothing connecting it to the quarantine that caused it.
+/// Counting is dbmd's own `links` projection (same normalization, one process),
+/// so this never becomes a second implementation of link resolution.
+///
+/// Returns (path, incoming-link count) for marked paths that ANYTHING links to,
+/// heaviest first.
+fn incoming_link_counts(emit: &Value, marked: &BTreeSet<String>) -> Vec<(String, usize)> {
+    let files = emit
+        .get("files")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for f in &files {
+        let Some(src) = f.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        for link in f
+            .get("links")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(t) = link.as_str() else { continue };
+            // A file's link to itself does not dangle when it leaves together
+            // with its own text.
+            if t == src {
+                continue;
+            }
+            if let Some(hit) = marked.get(t) {
+                *counts.entry(hit.as_str()).or_default() += 1;
+            }
+        }
+    }
+    let mut out: Vec<(String, usize)> = counts
+        .into_iter()
+        .map(|(p, n)| (p.to_string(), n))
+        .collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    out
+}
+
 fn closure_component(emit: &Value, seeds: &BTreeSet<String>) -> BTreeSet<String> {
     let files = emit
         .get("files")
@@ -2515,6 +3486,240 @@ mod tests {
         assert!(contained(root, "").is_none());
         assert!(contained(root, "a\0b").is_none());
         assert!(contained(root, "./a.md").is_none()); // hub paths are normalized; `./` is refused
+    }
+
+    fn manifest(paths: &[&str]) -> Vec<(String, Vec<u8>)> {
+        paths
+            .iter()
+            .map(|path| ((*path).to_string(), Vec::new()))
+            .collect()
+    }
+
+    #[test]
+    fn portable_export_manifest_rejects_every_alias_class() {
+        for paths in [
+            vec!["a", "a/b"],
+            vec!["a/b", "a"],
+            vec!["A.md", "a.md"],
+            vec!["Folder/a.md", "folder/b.md"],
+            vec!["é.md", "e\u{301}.md"],
+        ] {
+            assert!(
+                validate_export_manifest(&manifest(&paths)).is_err(),
+                "must reject {paths:?}"
+            );
+        }
+        for path in [
+            "name.",
+            "name ",
+            "CON",
+            "con.md",
+            "PRN.txt",
+            "COM1.log",
+            "COM¹.log",
+            "lpt³",
+            "lpt9",
+            "stream:secret",
+            "dir\\file",
+            "bad?.md",
+            "bad\u{1b}.md",
+        ] {
+            assert!(
+                validate_export_manifest(&manifest(&[path])).is_err(),
+                "must reject {path:?}"
+            );
+        }
+        let oversized_component = "a".repeat(256);
+        assert!(validate_export_manifest(&manifest(&[&oversized_component])).is_err());
+        let normalization_expansion = "é".repeat(100);
+        assert!(validate_export_manifest(&manifest(&[&normalization_expansion])).is_err());
+        let oversized_path = std::iter::repeat_n("segment", 130)
+            .collect::<Vec<_>>()
+            .join("/");
+        assert!(validate_export_manifest(&manifest(&[&oversized_path])).is_err());
+        validate_export_manifest(&manifest(&["DB.md", "records/a.md", "records/b.md"]))
+            .expect("ordinary portable manifest");
+    }
+
+    #[test]
+    fn portable_core_paths_require_canonical_controls_and_exclude_internal_state() {
+        for path in [
+            "Db.md",
+            "Assets.jsonl",
+            ".SevraLocal",
+            "feed/x",
+            "Blobs/x",
+            "packs/x",
+            "pub/x",
+            "meta/x",
+        ] {
+            assert!(
+                validate_portable_core_path(path).is_err(),
+                "{path} must not be hosted or exported"
+            );
+        }
+        validate_portable_core_path("DB.md").unwrap();
+        validate_portable_core_path("assets.jsonl").unwrap();
+        validate_portable_core_path("records/a.md").unwrap();
+    }
+
+    #[test]
+    fn destination_type_failure_is_preflighted_without_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("out");
+        std::fs::create_dir_all(root.join("later")).unwrap();
+        std::fs::write(root.join("first.md"), b"OLD").unwrap();
+        std::fs::create_dir(root.join("later/not-a-file.md")).unwrap();
+        let entries = vec![
+            ("first.md".to_string(), b"NEW".to_vec()),
+            ("later/not-a-file.md".to_string(), b"NEW".to_vec()),
+        ];
+        let error = preflight_export_destinations(&root, &entries).unwrap_err();
+        assert!(error.contains("not a regular file"), "{error}");
+        assert_eq!(std::fs::read(root.join("first.md")).unwrap(), b"OLD");
+    }
+
+    #[test]
+    fn runtime_export_failure_rolls_back_every_attempted_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        std::fs::write(root.join("first.md"), b"OLD").unwrap();
+        let entries = vec![
+            ("first.md".to_string(), b"NEW-ONE".to_vec()),
+            ("second.md".to_string(), b"NEW-TWO".to_vec()),
+        ];
+        let mut writes = 0usize;
+        let error = install_export_entries_with(&root, &entries, |root, path, content| {
+            writes += 1;
+            crate::safe_path::atomic_write(root, path, content, true, 0o600)?;
+            if writes == 2 {
+                return Err(std::io::Error::other("injected post-install failure"));
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.contains("rolled back"), "{error}");
+        assert_eq!(std::fs::read(root.join("first.md")).unwrap(), b"OLD");
+        assert!(
+            !root.join("second.md").exists(),
+            "the failing write was removed too"
+        );
+    }
+
+    #[test]
+    fn held_export_rollback_restores_original_identity_and_created_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = std::fs::canonicalize(temp.path()).unwrap().join("out");
+        std::fs::create_dir(&root_path).unwrap();
+        std::fs::write(root_path.join("existing.md"), b"OLD").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                root_path.join("existing.md"),
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+        }
+        let held = crate::safe_path::SafeDir::open(&root_path).unwrap();
+        let paths = vec!["existing.md".into(), "new/deep/file.md".into()];
+        let mut backups = snapshot_held_destinations(&held, &paths).unwrap();
+
+        held.atomic_write("existing.md", b"NEW", true, 0o600)
+            .unwrap();
+        backups[0].installed = Some(
+            capture_installed_state(&held, "existing.md", Sha256::digest(b"NEW").into()).unwrap(),
+        );
+        held.atomic_write("new/deep/file.md", b"NEW", true, 0o600)
+            .unwrap();
+        backups[1].installed = Some(
+            capture_installed_state(&held, "new/deep/file.md", Sha256::digest(b"NEW").into())
+                .unwrap(),
+        );
+        rollback_held_export(&held, &backups, &["new".into(), "new/deep".into()]).unwrap();
+        assert_eq!(
+            std::fs::read(root_path.join("existing.md")).unwrap(),
+            b"OLD"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(root_path.join("existing.md"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o644,
+                "rollback restores the original mode, not the writer default"
+            );
+        }
+        assert!(!root_path.join("new").exists());
+    }
+
+    #[test]
+    fn held_export_rollback_refuses_to_clobber_a_concurrent_edit() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = std::fs::canonicalize(temp.path()).unwrap();
+        std::fs::write(root_path.join("existing.md"), b"OLD").unwrap();
+        let held = crate::safe_path::SafeDir::open(&root_path).unwrap();
+        let mut backups = snapshot_held_destinations(&held, &["existing.md".to_string()]).unwrap();
+        held.atomic_write("existing.md", b"EXPORTED", true, 0o600)
+            .unwrap();
+        backups[0].installed = Some(
+            capture_installed_state(&held, "existing.md", Sha256::digest(b"EXPORTED").into())
+                .unwrap(),
+        );
+        held.atomic_write("existing.md", b"CONCURRENT", true, 0o600)
+            .unwrap();
+
+        let error = rollback_held_export(&held, &backups, &[]).unwrap_err();
+        assert!(error.contains("concurrent edit"), "{error}");
+        assert_eq!(
+            std::fs::read(root_path.join("existing.md")).unwrap(),
+            b"CONCURRENT"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn held_export_rollback_cannot_be_redirected_by_a_root_swap() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp = std::fs::canonicalize(temp.path()).unwrap();
+        let root_path = temp.join("out");
+        let parked = temp.join("parked");
+        std::fs::create_dir(&root_path).unwrap();
+        std::fs::write(root_path.join("existing.md"), b"OLD").unwrap();
+        let held = crate::safe_path::SafeDir::open(&root_path).unwrap();
+        let mut backups = snapshot_held_destinations(&held, &["existing.md".to_string()]).unwrap();
+        held.atomic_write("existing.md", b"NEW", true, 0o600)
+            .unwrap();
+        backups[0].installed = Some(
+            capture_installed_state(&held, "existing.md", Sha256::digest(b"NEW").into()).unwrap(),
+        );
+
+        std::fs::rename(&root_path, &parked).unwrap();
+        std::fs::create_dir(&root_path).unwrap();
+        std::fs::write(root_path.join("existing.md"), b"REPLACEMENT").unwrap();
+        rollback_held_export(&held, &backups, &[]).unwrap();
+        assert_eq!(std::fs::read(parked.join("existing.md")).unwrap(), b"OLD");
+        assert_eq!(
+            std::fs::read(root_path.join("existing.md")).unwrap(),
+            b"REPLACEMENT"
+        );
+    }
+
+    #[test]
+    fn bounded_export_decompression_does_not_trust_a_declared_size() {
+        let mut hostile = std::io::Cursor::new(vec![b'x'; 4096]);
+        let error = read_bounded(&mut hostile, 1024).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("remaining store limit"));
+        assert_eq!(
+            hostile.position(),
+            1025,
+            "read one sentinel byte and stop instead of buffering the stream"
+        );
     }
 
     #[test]
@@ -2624,6 +3829,35 @@ mod tests {
 
     fn sorted(set: BTreeSet<String>) -> Vec<String> {
         set.into_iter().collect()
+    }
+
+    #[test]
+    fn incoming_link_counts_reports_the_hosted_dangle_heaviest_first() {
+        // The dogfood shape: one high-fan-in source (`export.md`) named by
+        // three records, plus a second marked file nothing links to.
+        let emit = emit_of(&[
+            ("records/a.md", &["sources/export.md"]),
+            ("records/b.md", &["sources/export.md"]),
+            ("records/c.md", &["sources/export.md", "records/lonely.md"]),
+            ("sources/export.md", &["sources/export.md"]), // self-link: not a dangle
+            ("records/lonely.md", &[]),
+            ("records/unmarked.md", &["records/a.md"]),
+        ]);
+        let marked = seeds_of(&["sources/export.md", "records/lonely.md"]);
+        assert_eq!(
+            incoming_link_counts(&emit, &marked),
+            vec![
+                ("sources/export.md".to_string(), 3),
+                ("records/lonely.md".to_string(), 1),
+            ],
+            "heaviest first; a file's self-link leaves with its own text"
+        );
+    }
+
+    #[test]
+    fn incoming_link_counts_is_empty_when_nothing_points_at_the_marked_set() {
+        let emit = emit_of(&[("records/a.md", &["records/b.md"]), ("records/b.md", &[])]);
+        assert!(incoming_link_counts(&emit, &seeds_of(&["records/orphan.md"])).is_empty());
     }
 
     #[test]

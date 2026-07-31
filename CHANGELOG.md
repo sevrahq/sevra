@@ -1,5 +1,99 @@
 # Changelog
 
+## 0.2.8 — 2026-07-30
+
+- Security: publisher-key rotation starts with an additive compatibility
+  release. The updater and both installers trust the original and successor
+  Ed25519 keys, while v0.2.8 remains signed by the original key. The
+  independently deployed SHA-256 manifest is still mandatory, so accepting
+  either publisher key does not collapse the second trust root.
+- Security: `secrets quarantine` refuses a symlinked `.sevralocal`, opens an
+  existing scope file with the kernel's no-follow flag on Unix, rejects
+  control-bearing file names that cannot be represented by its line format,
+  escapes leading `#` names so they cannot become comments, and installs
+  updates through a synced same-directory atomic replacement.
+  A cloned store can no longer turn quarantine into a write through a
+  dangling shell-startup-file symlink or inject extra startup-file lines.
+- Security: `.sevralocal` is capped at 1 MiB, 4,096 bytes per line, and
+  10,000 effective entries. The reader checks the held file's size and reads
+  one bounded sentinel byte, so sparse files and concurrent growth fail before
+  allocation, network access, or scope mutation.
+- Security: asset push refuses every symlink component, and export restore
+  refuses symlink leaves or parents outside the export before downloading.
+  Unix reads and writes traverse from held directory descriptors with
+  `O_NOFOLLOW`; Windows holds every ancestor without delete sharing and rejects
+  every reparse point. Restored bytes are installed by atomic replacement
+  under the held parent. An ancestor planted during the presign round-trip
+  cannot redirect a verified blob onto an unrelated file.
+- Security: the same capability boundary now covers every markdown export,
+  the export root itself, the push walker, config credentials, and the
+  auto-update stamp. Logout also removes the credential through the held
+  config-directory handle rather than following a replaced `~/.sevra`.
+  Push opens directories and files from held parents and sends the exact bytes
+  read from those handles. Symlinks in a store are refused, including links
+  whose target is still inside the store.
+- Security: export validates the complete portable path manifest before its
+  first write. It rejects file/directory prefix collisions, case aliases,
+  Windows device names, alternate data streams, backslashes, and trailing
+  dots or spaces on every host. Existing destination types are fully
+  preflighted, and a later write failure restores every attempted file from a
+  bounded transaction snapshot.
+- Security: presigned asset/pack transfers resolve through a client-owned
+  network policy that rejects loopback, private, link-local, carrier-grade NAT,
+  and metadata destinations, including DNS rebinding. Loopback transfer is
+  available only when the configured hub is itself loopback. Export
+  decompression now caps the byte stream instead of trusting a ZIP entry's
+  declared uncompressed length. Asset upload and restore now stream through
+  bounded private stages instead of whole-blob RAM buffers, enforce the hub's
+  2 GiB per-object ceiling independently of manifest metadata, reject sparse
+  oversize inputs before reading, and require exact length plus SHA-256 before
+  upload or atomic installation.
+- Security: both installers stage through freshly created unpredictable
+  directories instead of PID-derived leaves. A custom binary mirror must name
+  a separate trusted-manifest endpoint; its colocated `SHA256SUMS` can no
+  longer become its own trust root on a machine without a signature verifier.
+  The Unix installer also rejects every symlink component and unsafe
+  destination type before a cwd-bound same-directory rename. The Windows
+  installer holds every directory component through no-follow handles without
+  delete sharing, rejects reparse points, and replaces only through
+  `MoveFileExW`.
+- Security: human stdout/stderr neutralizes ANSI, OSC, carriage return,
+  backspace, BEL, and other terminal controls from hub/store text. JSON output
+  retains the original data through JSON escaping.
+- Security: self-update now requires the independently deployed Sevra digest
+  in addition to the Ed25519 signature. An unavailable or malformed second
+  root refuses the update instead of silently falling back to one key.
+- Supply chain: release tags must point to `main`; a guarded wrapper requires
+  clean `main`, exact `origin/main`, and green CI before tagging. v0.2.8 alone
+  uses a protected runner authorization bound to its exact tag, commit,
+  workflow attempt, and nonce, then deletes the transitional signer.
+  Successor signing moves entirely off hosted runners: Actions emits five
+  unsigned, tag/SHA-attested binaries; the local controller independently
+  rebuilds and byte-compares every target before reading the 1Password signer
+  over stdin-only process memory, then uploads a complete draft and publishes
+  it immutable. It verifies checksums, exact assets, tag target, and binary
+  provenance after publication.
+- Supply chain: the release controller can resume only when the remote tag
+  still names the authorized commit and exactly one workflow run names that
+  tag and SHA. Completed immutable releases are verification-only. Interrupted
+  drafts are rebuilt as complete sets. Ephemeral-secret cleanup is armed before
+  injection starts and covered by a hermetic interruption regression.
+- Integrity: large pushes use one cross-language canonical ZIP32 profile:
+  path-byte sorting, STORED members, fixed metadata, and no extras, comments,
+  descriptors, or ZIP64. Sevra and the hub share a byte-level golden vector,
+  so the signed store hash identifies one exact archive rather than one of
+  several equivalent encodings.
+- Supply chain: release builds pin Ubuntu 24.04, macOS 26, Rust 1.96.0,
+  `cross` 0.2.5 with digest-pinned Linux images, and cargo-xwin 0.23.0 by
+  archive SHA-256 with fixed Windows SDK/CRT versions. Any hosted/local byte
+  mismatch, including platform nondeterminism, fails closed before signing.
+  Canonical path/time inputs plus Windows `/Brepro` without CodeView/PDB make
+  clean local double-builds byte-identical on all five targets.
+- Installers: `SEVRA_REQUIRE_SIGNATURE=1` once again fails closed when no
+  capable verifier is present, with executable negative tests on Unix and
+  Windows. Post-manifest smoke also proves the production installers remain
+  byte-identical to this repository.
+
 ## 0.2.7 — 2026-07-30
 
 Your brain is more than markdown — the bytes ride too. 0.2.6 and every

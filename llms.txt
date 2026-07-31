@@ -82,7 +82,8 @@ Commands:
     version | update                      # signed self-update; reports stale dbmd
 
 Updates: the binary checks /api/hub/versions at most once a day and
-signed-self-updates (Ed25519, pinned key). SEVRA_NO_AUTO_UPDATE=1 disables.
+self-updates only after both Ed25519 verification (pinned key) and the
+independently deployed Sevra digest pass. SEVRA_NO_AUTO_UPDATE=1 disables.
 
 Related: db.md, the open standard the hub hosts — https://github.com/carloslfu/db.md
 (its CLI `dbmd` is the neutral format tool; sevra wraps it, never reimplements it).

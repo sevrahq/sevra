@@ -8,54 +8,135 @@ the hub's `/api/hub/versions`.
 
 1. Bump `version` in `Cargo.toml` (SemVer) + add a `CHANGELOG.md` entry.
 2. `make check` (fmt + clippy -D warnings + tests) and `cargo deny check`.
-3. Commit, push, then tag and push the tag:
+3. Commit and push `main`. Wait for the exact commit's `ci.yml` run to pass.
+   Do not create or push the tag by hand.
+4. Run the guarded release wrapper from a clean `main` worktree:
 
    ```sh
-   git tag vX.Y.Z && git push origin main vX.Y.Z
+   scripts/release.sh \
+     --signing-key-ref 'op://RECOVERY_VAULT/SIGNING_ITEM/FIELD' \
+     vX.Y.Z
    ```
 
-4. CI (`release.yml`) runs preflight, cross-builds the 5 targets (darwin
-   x86_64/aarch64, linux x86_64/aarch64 musl, windows x86_64 msvc — the
-   Windows asset is `sevra-windows-x86_64.exe`), then signs every binary in
-   the publish job (the `SEVRA_CLI_SIGNING_KEY` secret is never exposed to
-   the build jobs or their third-party actions) and publishes the GitHub
-   Release with `SHA256SUMS`. The released version MUST equal the Cargo.toml
-   version (the version job enforces it for tags AND dispatches). After the
-   release is published, copy the asset digests into the platform repo's
-   static trusted manifest and deploy it. Ordinary installs do not trust the
-   checksum served beside the GitHub binary.
-5. After the trusted manifest deployment is live, manually dispatch
+   The wrapper refuses a dirty/non-main worktree, a non-canonical origin, a
+   commit other than the exact `origin/main`, or a commit without a successful
+   main-push `ci.yml` run. It creates the tag and waits for Actions to produce
+   exactly five unsigned, tag/SHA-attested binaries. Before reading the
+   successor key, the wrapper verifies every attestation and rebuilds all five
+   with the same Rust 1.96.0 compiler and locked dependencies: both Darwin
+   targets locally, both Linux targets through digest-pinned Cross images,
+   and Windows through a SHA-256-pinned cargo-xwin binary with fixed SDK/CRT
+   versions. The rebuild source is a private, read-only archive materialized
+   from the exact authorized Git object, never the operator checkout after the
+   workflow wait. Every downloaded byte must match its independent rebuild.
+   Canonical path remapping and `SOURCE_DATE_EPOCH` remove host-path/time
+   variance. The Windows link also uses `/Brepro` and omits the otherwise
+   random CodeView/PDB identifier.
+
+   Only after those five byte comparisons pass does the wrapper read the
+   successor key from 1Password Recovery over memory, pass it to one local
+   Node process over stdin, check its pinned SPKI, sign, create checksums,
+   upload the complete draft, and publish it immutable. The successor private
+   key is never a GitHub secret or exposed to a hosted runner. The wrapper then
+   verifies the exact 11-asset set, checksums, every Ed25519 signature,
+   immutability, tag target, and binary provenance, then byte-compares the
+   published set to the locally signed set. It refuses while the transitional
+   repository signer or legacy `SEVRA_CLI_SIGNING_KEY_NEXT` environment secret
+   still exists.
+
+   GitHub-hosted runner labels identify maintained images, not immutable image
+   digests. They therefore remain an availability/input source, not the
+   successor signing boundary: a malicious or nondeterministic build causes a
+   byte mismatch and leaves the tag unsigned and unpublished. Platform
+   toolchain nondeterminism is also fail-closed and must be investigated; the
+   release controller never substitutes a merely similar local binary.
+
+   v0.2.8 is the one compatibility exception: run
+   `scripts/release.sh v0.2.8`. It consumes the already-present original
+   repository signer. The protected job signs and persists an immutable
+   11-file Actions checkpoint, then attests every byte to the exact tag and
+   SHA. The controller verifies that checkpoint's shape, checksums, Ed25519
+   signatures, and provenance before deleting the signer. It still injects
+   and checks the one-run authorization.
+
+   If the controller stops after the tag is pushed, rerun the same command
+   with `--resume`. Resume proceeds only when the remote tag still names the
+   exact authorized SHA and one unique release workflow run names that tag and
+   SHA. A completed immutable release is mutation-free but still performs the
+   complete exact-source five-target reproduction, signature/checksum checks,
+   and final byte comparisons. An interrupted v0.2.8 draft is discarded and
+   rebuilt from its verified signed checkpoint; an interrupted successor draft
+   is discarded and rebuilt from the complete locally reproduced, signed asset
+   set.
+5. `release.yml` independently rejects a tag whose commit is not already on
+   `main`, runs preflight, and builds the 5 unsigned targets (darwin
+   x86_64/aarch64, linux x86_64/aarch64 musl, windows x86_64 msvc; the
+   Windows asset is `sevra-windows-x86_64.exe`). Successor builds receive
+   keyless GitHub/Sigstore provenance and an exact run artifact, but no signing
+   material or release-write permission. The local controller publishes only
+   after independent reproduction. The released version must equal the
+   Cargo.toml version.
+6. Copy the verified asset digests into the platform repo's static trusted
+   manifest and deploy it. Ordinary installs do not trust the checksum served
+   beside the GitHub binary. After that deployment is live, manually dispatch
    `smoke.yml` with the concrete version. It installs from the release on
-   macOS + Linux (install.sh) and Windows (install.ps1), then runs
-   `sevra version` + the not-logged-in contract. It intentionally does not
+   macOS + Linux (install.sh) and Windows (install.ps1). It first proves both
+   production installer scripts are byte-identical to this repository, then
+   runs `sevra version` + the not-logged-in contract under
+   `SEVRA_REQUIRE_SIGNATURE=1`. It intentionally does not
    auto-run at release publication: the independently controlled manifest is
    not approved yet, and the correct installer behavior at that point is to
    fail closed. Green post-manifest smoke = the release is live; installed
    CLIs pick it up on their next daily check (or `sevra update`).
-6. If `install.sh` or `install.ps1` changed: copy them to the platform repo's
+7. If `install.sh` or `install.ps1` changed: copy them to the platform repo's
    `install/sevra.sh` / `install/sevra.ps1` (the hub serves those snapshots
    at https://www.sevrahq.com/install/sevra.sh and .../install/sevra.ps1)
    and deploy. Each pair must stay byte-identical.
 
 ## Key custody
 
-The Ed25519 signing key is available to the release job only through this
-repo's Actions secret. A separately controlled recovery copy must exist
-offline; the platform runtime does not sign releases and must not hold this
-key. The secret's
-value is the **base64 of the PKCS#8 PEM** (release.yml decodes with
-`Buffer.from(..., "base64")` and hands the PEM to `createPrivateKey`; a raw
-PEM or base64-of-DER fails the sign step with ERR_OSSL_UNSUPPORTED). Set it
-by piping to stdin:
+The successor Ed25519 private key lives only in the separately controlled
+1Password Recovery vault and local release-process memory. It is not a
+repository, Actions environment, platform-runtime, filesystem, argv, or
+shell-profile secret. The referenced 1Password field contains the **base64 of
+the PKCS#8 PEM**. A raw PEM, base64-of-DER, or key with the wrong SPKI fails
+before any signature is written.
+
+The environment authorization exists only for the one-time v0.2.8 transition.
+Its exact shape is `tag:sha:run_id.run_attempt:nonce`, where the SHA is 40
+lowercase hex and the nonce is 64 lowercase hex. A different tag, commit, run,
+or rerun cannot consume it. If that compatibility wrapper is interrupted
+after injection, its exit trap deletes the environment authorization. If the
+process was forcibly killed, first inspect that no v0.2.8 job is
+waiting/running, then run the cleanup command before `--resume`:
 
 ```sh
-base64 < sevra-signing-key.pem | tr -d '\n' \
-  | gh secret set SEVRA_CLI_SIGNING_KEY -R sevrahq/sevra
+scripts/release.sh --cleanup-ephemeral-secrets
 ```
 
-Never `--body -`, which stores a literal dash. Rotation is
-additive and order-sensitive: pin the NEW public key in `src/signing.rs` +
-`install.sh` + `sevra.pub`, release while still signing with the old key, let
-installed binaries update onto the dual-pin build, then swap the Actions
-secret and drop the old pin a release later. Full notes: the platform repo's
-`infra/README.md`.
+Rotation is additive and order-sensitive:
+
+1. Pin the new public key alongside the old one in `src/signing.rs`,
+   `install.sh`, `install.ps1`, and `sevra.pub`.
+2. Confirm the successor private key is recoverable from 1Password Recovery.
+   Release v0.2.8 with `scripts/release.sh v0.2.8` while the original
+   repository secret still exists. The wrapper deletes that original secret
+   only after the durable signed checkpoint and all exact-tag/SHA attestations
+   verify locally.
+3. Deploy the v0.2.8 digest manifest and byte-identical installers. Run the
+   protected smoke workflow, then prove an installed v0.2.7 CLI can
+   self-update to v0.2.8. These are the authoritative checks that the original
+   key still crosses every installer/updater path.
+4. Delete the legacy `SEVRA_CLI_SIGNING_KEY_NEXT` environment secret:
+
+   ```sh
+   gh secret delete SEVRA_CLI_SIGNING_KEY_NEXT \
+     --repo sevrahq/sevra --env release-signing
+   ```
+
+   Release the successor-key build through the wrapper's local `op://` path.
+   The controller requires the successor SPKI for every release after v0.2.8;
+   no GitHub runner receives the key. Prove both fresh install and v0.2.8
+   self-update before retiring the original public-key pin in a later release.
+
+Full notes: the platform repo's `infra/README.md`.

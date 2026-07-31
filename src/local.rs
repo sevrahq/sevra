@@ -14,6 +14,7 @@
 //! those two files is an edit case the push scanner already flags.
 
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
@@ -23,6 +24,93 @@ pub const FILE_NAME: &str = ".sevralocal";
 
 /// The two files that ride every push and can never be kept home.
 pub const MUST_RIDE: [&str; 2] = ["DB.md", "assets.jsonl"];
+
+/// A local-scope list is configuration, not bulk data. Bound every dimension
+/// before glob compilation so a hostile or concurrently-growing file cannot
+/// turn any store operation into an unbounded allocation or CPU task.
+pub(crate) const MAX_SCOPE_BYTES: u64 = 1024 * 1024;
+pub(crate) const MAX_SCOPE_LINE_BYTES: usize = 4096;
+pub(crate) const MAX_SCOPE_ENTRIES: usize = 10_000;
+
+fn read_scope_bounded<R: Read>(reader: R, advertised_len: u64) -> Result<Vec<u8>, String> {
+    if advertised_len > MAX_SCOPE_BYTES {
+        return Err(format!(
+            "refusing {FILE_NAME}: the local-scope file exceeds {MAX_SCOPE_BYTES} bytes"
+        ));
+    }
+    let mut bytes = Vec::with_capacity(advertised_len as usize);
+    reader
+        .take(MAX_SCOPE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("could not read {FILE_NAME}: {e}"))?;
+    if bytes.len() as u64 > MAX_SCOPE_BYTES {
+        return Err(format!(
+            "refusing {FILE_NAME}: the local-scope file grew beyond {MAX_SCOPE_BYTES} bytes while reading"
+        ));
+    }
+    Ok(bytes)
+}
+
+fn validate_scope_shape(raw: &str) -> Result<usize, String> {
+    if raw.len() as u64 > MAX_SCOPE_BYTES {
+        return Err(format!(
+            "refusing {FILE_NAME}: the local-scope file exceeds {MAX_SCOPE_BYTES} bytes"
+        ));
+    }
+    let mut effective = 0usize;
+    for (idx, line) in raw.lines().enumerate() {
+        if line.len() > MAX_SCOPE_LINE_BYTES {
+            return Err(format!(
+                "refusing {FILE_NAME}: line {} exceeds {MAX_SCOPE_LINE_BYTES} bytes",
+                idx + 1
+            ));
+        }
+        let entry = line.strip_suffix('\r').unwrap_or(line);
+        if entry.trim().is_empty() || entry.starts_with('#') {
+            continue;
+        }
+        effective += 1;
+        if effective > MAX_SCOPE_ENTRIES {
+            return Err(format!(
+                "refusing {FILE_NAME}: it has more than {MAX_SCOPE_ENTRIES} effective entries"
+            ));
+        }
+    }
+    Ok(effective)
+}
+
+fn read_scope_file(root: &Path) -> Result<Option<String>, String> {
+    let path = root.join(FILE_NAME);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("could not inspect {FILE_NAME}: {e}")),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "refusing {FILE_NAME}: the local-scope file must not be a symlink"
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(format!(
+            "refusing {FILE_NAME}: the local-scope path is not a regular file"
+        ));
+    }
+
+    let secure_root =
+        fs::canonicalize(root).map_err(|e| format!("could not resolve store directory: {e}"))?;
+    let file = crate::safe_path::open_regular(&secure_root, FILE_NAME)
+        .map_err(|e| format!("could not open {FILE_NAME} without following links: {e}"))?
+        .ok_or_else(|| format!("{FILE_NAME} disappeared while opening it"))?;
+    let held_len = file
+        .metadata()
+        .map_err(|e| format!("could not inspect the opened {FILE_NAME}: {e}"))?
+        .len();
+    let bytes = read_scope_bounded(file, held_len)?;
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|e| format!("could not read {FILE_NAME} as UTF-8: {e}"))
+}
 
 #[derive(Debug)]
 pub struct LocalScope {
@@ -58,11 +146,11 @@ impl LocalScope {
 /// redactor before it can carry any entry spelling — an entry is often an
 /// exact path whose NAME is the very secret being kept home.
 pub fn load(root: &Path) -> Result<Option<LocalScope>, String> {
-    let raw = match fs::read_to_string(root.join(FILE_NAME)) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("could not read {FILE_NAME}: {e}")),
+    let raw = match read_scope_file(root)? {
+        Some(raw) => raw,
+        None => return Ok(None),
     };
+    let expected_effective = validate_scope_shape(&raw)?;
     let mut builder = GlobSetBuilder::new();
     let mut effective = 0usize;
     for (idx, line) in raw.lines().enumerate() {
@@ -88,6 +176,7 @@ pub fn load(root: &Path) -> Result<Option<LocalScope>, String> {
         builder.add(glob);
         effective += 1;
     }
+    debug_assert_eq!(effective, expected_effective);
     let set = builder
         .build()
         .map_err(|e| format!("{FILE_NAME}: {}", crate::scan::redact_path(&e.to_string())))?;
@@ -130,13 +219,22 @@ pub fn append_entries(raw: &str, new_entries: &[String]) -> String {
 /// metacharacter, else with each metacharacter wrapped in a one-character
 /// class (`[*]`) so the entry matches the literal file instead of
 /// misparsing — an unclosed `[` in a filename must never brick the list.
-pub fn entry_for(path: &str) -> String {
-    if !path.contains(['*', '?', '[', ']', '{', '}', '\\']) {
-        return path.to_string();
+pub fn entry_for(path: &str) -> Result<String, String> {
+    if path.chars().any(char::is_control) {
+        return Err(format!(
+            "refusing to write {FILE_NAME}: a matched file path contains control characters"
+        ));
+    }
+    if !path.starts_with('#') && !path.contains(['*', '?', '[', ']', '{', '}', '\\']) {
+        return Ok(path.to_string());
     }
     let mut out = String::with_capacity(path.len() + 8);
-    for c in path.chars() {
+    for (index, c) in path.chars().enumerate() {
         match c {
+            // A raw leading `#` is the line format's comment marker. Express
+            // it as a one-character class so quarantine really keeps a
+            // `#secret.md` file home instead of silently writing a comment.
+            '#' if index == 0 => out.push_str("[#]"),
             '*' | '?' | '[' | ']' | '{' | '}' => {
                 out.push('[');
                 out.push(c);
@@ -148,12 +246,43 @@ pub fn entry_for(path: &str) -> String {
             _ => out.push(c),
         }
     }
-    out
+    Ok(out)
+}
+
+/// Atomically replace `<root>/.sevralocal` without ever opening the
+/// destination for writing. A symlink present at inspection is refused for a
+/// clear operator signal; one planted after inspection is atomically replaced
+/// through a held parent directory handle, never followed. The temporary file
+/// is created 0600 in the same directory and synced before the rename.
+pub fn write(root: &Path, body: &str) -> Result<(), String> {
+    validate_scope_shape(body)?;
+    let path = root.join(FILE_NAME);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(format!(
+                "refusing to write {FILE_NAME}: the local-scope file is a symlink"
+            ));
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(format!(
+                "refusing to write {FILE_NAME}: the local-scope path is not a regular file"
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("could not inspect {FILE_NAME}: {e}")),
+    }
+
+    let secure_root =
+        fs::canonicalize(root).map_err(|e| format!("could not resolve store directory: {e}"))?;
+    crate::safe_path::atomic_write(&secure_root, FILE_NAME, body.as_bytes(), false, 0o600)
+        .map_err(|e| format!("could not atomically replace {FILE_NAME}: {e}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     fn scope_of(text: &str) -> LocalScope {
         let t = tempfile::tempdir().unwrap();
@@ -165,6 +294,60 @@ mod tests {
     fn absent_file_is_none() {
         let t = tempfile::tempdir().unwrap();
         assert!(load(t.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn exact_byte_limit_is_accepted() {
+        let t = tempfile::tempdir().unwrap();
+        let body = "#\n".repeat((MAX_SCOPE_BYTES / 2) as usize);
+        assert_eq!(body.len() as u64, MAX_SCOPE_BYTES);
+        fs::write(t.path().join(FILE_NAME), body).unwrap();
+        assert!(!load(t.path()).unwrap().unwrap().active());
+    }
+
+    #[test]
+    fn oversized_sparse_file_is_rejected_before_reading() {
+        let t = tempfile::tempdir().unwrap();
+        let file = fs::File::create(t.path().join(FILE_NAME)).unwrap();
+        file.set_len(MAX_SCOPE_BYTES + 1).unwrap();
+        let err = load(t.path()).unwrap_err();
+        assert!(err.contains("exceeds"), "{err}");
+    }
+
+    #[test]
+    fn concurrent_growth_past_limit_is_rejected() {
+        let bytes = vec![b'#'; (MAX_SCOPE_BYTES + 1) as usize];
+        let err = read_scope_bounded(Cursor::new(bytes), MAX_SCOPE_BYTES).unwrap_err();
+        assert!(err.contains("grew beyond"), "{err}");
+    }
+
+    #[test]
+    fn line_and_effective_entry_limits_are_exact() {
+        let t = tempfile::tempdir().unwrap();
+        let exact_line = format!("#{}\n", "a".repeat(MAX_SCOPE_LINE_BYTES - 1));
+        fs::write(t.path().join(FILE_NAME), exact_line).unwrap();
+        assert!(load(t.path()).unwrap().is_some());
+
+        let oversized_line = format!("#{}\n", "a".repeat(MAX_SCOPE_LINE_BYTES));
+        fs::write(t.path().join(FILE_NAME), oversized_line).unwrap();
+        assert!(load(t.path()).unwrap_err().contains("line 1 exceeds"));
+
+        let exact_entries = (0..MAX_SCOPE_ENTRIES)
+            .map(|idx| format!("private/{idx}\n"))
+            .collect::<String>();
+        fs::write(t.path().join(FILE_NAME), exact_entries).unwrap();
+        assert_eq!(
+            load(t.path()).unwrap().unwrap().effective,
+            MAX_SCOPE_ENTRIES
+        );
+
+        let too_many_entries = (0..=MAX_SCOPE_ENTRIES)
+            .map(|idx| format!("private/{idx}\n"))
+            .collect::<String>();
+        fs::write(t.path().join(FILE_NAME), too_many_entries).unwrap();
+        assert!(load(t.path())
+            .unwrap_err()
+            .contains("more than 10000 effective entries"));
     }
 
     #[test]
@@ -233,9 +416,9 @@ mod tests {
 
     #[test]
     fn entry_for_escapes_metacharacters_into_literal_matches() {
-        assert_eq!(entry_for("plain/path.md"), "plain/path.md");
+        assert_eq!(entry_for("plain/path.md").unwrap(), "plain/path.md");
         let weird = "notes/[draft] a*b?.md";
-        let entry = entry_for(weird);
+        let entry = entry_for(weird).unwrap();
         let glob = GlobBuilder::new(&entry)
             .backslash_escape(true)
             .build()
@@ -246,5 +429,58 @@ mod tests {
         // And the escaped entry round-trips through a whole scope.
         let s = scope_of(&format!("{entry}\n"));
         assert!(s.keeps_home(weird));
+        let comment_shaped = entry_for("#credential.md").unwrap();
+        assert_eq!(comment_shaped, "[#]credential.md");
+        let s = scope_of(&format!("{comment_shaped}\n"));
+        assert!(s.keeps_home("#credential.md"));
+    }
+
+    #[test]
+    fn entry_for_refuses_controls_that_would_create_new_scope_lines() {
+        for path in [
+            "notes/a\ncommand.md",
+            "notes/a\rb.md",
+            "notes/a\u{1b}[31m.md",
+        ] {
+            assert!(entry_for(path).unwrap_err().contains("control characters"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_and_write_never_follow_a_scope_symlink() {
+        let t = tempfile::tempdir().unwrap();
+        let target = t.path().join("outside");
+        let store = t.path().join("store");
+        fs::create_dir(&store).unwrap();
+        std::os::unix::fs::symlink(&target, store.join(FILE_NAME)).unwrap();
+
+        assert!(load(&store).unwrap_err().contains("must not be a symlink"));
+        assert!(write(&store, "notes/a.md\n")
+            .unwrap_err()
+            .contains("is a symlink"));
+        assert!(!target.exists(), "the dangling target was never created");
+    }
+
+    #[test]
+    fn write_atomically_replaces_a_regular_scope_file() {
+        let t = tempfile::tempdir().unwrap();
+        fs::write(t.path().join(FILE_NAME), "old.md\n").unwrap();
+        write(t.path(), "new.md\n").unwrap();
+        assert_eq!(
+            fs::read_to_string(t.path().join(FILE_NAME)).unwrap(),
+            "new.md\n"
+        );
+        assert!(load(t.path()).unwrap().unwrap().keeps_home("new.md"));
+    }
+
+    #[test]
+    fn rejected_write_does_not_mutate_scope_file() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join(FILE_NAME);
+        fs::write(&path, "old.md\n").unwrap();
+        let oversized = "x".repeat(MAX_SCOPE_BYTES as usize + 1);
+        assert!(write(t.path(), &oversized).unwrap_err().contains("exceeds"));
+        assert_eq!(fs::read_to_string(path).unwrap(), "old.md\n");
     }
 }

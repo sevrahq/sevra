@@ -12,16 +12,19 @@ option):
 
 MIT and/or Apache-2.0 (the bulk of the tree)
   adler2, aho-corasick, anstream, anstyle, anstyle-parse, anstyle-query,
-  anstyle-wincon, base64, block-buffer, bstr, cc, cfg-if, clap, clap_builder,
+  anstyle-wincon, base64, bitflags, block-buffer, bstr, cc, cfg-if, clap, clap_builder,
   clap_derive, clap_lex, colorchoice, cpufeatures, crc32fast, crypto-common,
   curve25519-dalek-derive, digest, displaydoc, ed25519, fiat-crypto,
-  find-msvc-tools, flate2, form_urlencoded, generic-array, getrandom, globset,
+  errno, fastrand, find-msvc-tools, flate2, form_urlencoded, generic-array,
+  getrandom, globset,
   heck, home, idna, idna_adapter, is_terminal_polyfill, itoa, libc, log, memchr,
-  miniz_oxide, once_cell, once_cell_polyfill, percent-encoding, proc-macro2,
+  linux-raw-sys, miniz_oxide, once_cell, once_cell_polyfill, percent-encoding,
+  proc-macro2,
   quote, regex, regex-automata, regex-syntax, rustc_version, rustls-pki-types,
-  semver, serde, serde_core, serde_derive, serde_json, sha2, shlex, signature,
-  simd-adler32, smallvec, stable_deref_trait, strsim, syn, synstructure,
-  typenum, unicode-ident, ureq, url, utf8_iter, utf8parse, version_check,
+  rustix, semver, serde, serde_core, serde_derive, serde_json, sha2, shlex,
+  signature, simd-adler32, smallvec, stable_deref_trait, strsim, syn,
+  synstructure, tempfile, typenum, unicode-ident, ureq, url, utf8_iter,
+  utf8parse, version_check,
   wasi, windows-link, windows-sys, windows-targets, windows_* target crates,
   zeroize, zmij
 
