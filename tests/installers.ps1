@@ -183,3 +183,7 @@ try {
   Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
   Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }
+
+# Expected negative-path verifier invocations leave `$LASTEXITCODE = 1`.
+# Reaching this line means every refusal and no-write assertion passed.
+exit 0
