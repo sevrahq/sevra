@@ -93,6 +93,10 @@
   capable verifier is present, with executable negative tests on Unix and
   Windows. Post-manifest smoke also proves the production installers remain
   byte-identical to this repository.
+- Supply chain: post-manifest smoke proves production still routes legacy
+  old-key-only CLIs through v0.2.8 before offering successor-signed releases,
+  and the release runbook deploys changed installer snapshots before the
+  byte-identity smoke gate.
 
 ## 0.2.7 — 2026-07-30
 

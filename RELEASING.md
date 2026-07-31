@@ -77,21 +77,24 @@ the hub's `/api/hub/versions`.
    after independent reproduction. The released version must equal the
    Cargo.toml version.
 6. Copy the verified asset digests into the platform repo's static trusted
-   manifest and deploy it. Ordinary installs do not trust the checksum served
-   beside the GitHub binary. After that deployment is live, manually dispatch
-   `smoke.yml` with the concrete version. It installs from the release on
-   macOS + Linux (install.sh) and Windows (install.ps1). It first proves both
-   production installer scripts are byte-identical to this repository, then
-   runs `sevra version` + the not-logged-in contract under
+   manifest. If `install.sh` or `install.ps1` changed, copy them to the
+   platform repo's `install/sevra.sh` / `install/sevra.ps1` at the same time
+   (the hub serves those snapshots at
+   https://www.sevrahq.com/install/sevra.sh and .../install/sevra.ps1).
+   Deploy the reviewed manifest and installer snapshots. Ordinary installs do
+   not trust the checksum served beside the GitHub binary.
+7. After that deployment is live, manually dispatch `smoke.yml` with the
+   concrete version. It first proves production still routes `sevra/0.2.7`
+   and older through the old-signed v0.2.8 bridge while v0.2.8 and newer see
+   the true latest. It then installs from the release on macOS + Linux
+   (install.sh) and Windows (install.ps1), proving both production installer
+   scripts are byte-identical to this repository before it runs
+   `sevra version` + the not-logged-in contract under
    `SEVRA_REQUIRE_SIGNATURE=1`. It intentionally does not
    auto-run at release publication: the independently controlled manifest is
    not approved yet, and the correct installer behavior at that point is to
    fail closed. Green post-manifest smoke = the release is live; installed
    CLIs pick it up on their next daily check (or `sevra update`).
-7. If `install.sh` or `install.ps1` changed: copy them to the platform repo's
-   `install/sevra.sh` / `install/sevra.ps1` (the hub serves those snapshots
-   at https://www.sevrahq.com/install/sevra.sh and .../install/sevra.ps1)
-   and deploy. Each pair must stay byte-identical.
 
 ## Key custody
 
@@ -134,9 +137,17 @@ Rotation is additive and order-sensitive:
      --repo sevrahq/sevra --env release-signing
    ```
 
-   Release the successor-key build through the wrapper's local `op://` path.
-   The controller requires the successor SPKI for every release after v0.2.8;
-   no GitHub runner receives the key. Prove both fresh install and v0.2.8
-   self-update before retiring the original public-key pin in a later release.
+   Release v0.2.9 through the wrapper's local `op://` path, still pinning both
+   public keys. The controller requires the successor SPKI for every release
+   after v0.2.8; no GitHub runner receives the key. Deploy its reviewed digest
+   manifest and byte-identical installers, then run the protected smoke. Prove
+   both a fresh install and a v0.2.8 self-update to v0.2.9.
+5. Only after v0.2.9 proves the successor signing path, remove the original
+   public-key pin from the updater, both installers, and `sevra.pub`; release
+   that successor-only trust set as v0.2.10 through the same local controller.
+   Deploy and smoke it in the same order. Keep v0.2.8's manifest entries and
+   the production User-Agent bridge: clients at v0.2.7 or older must still be
+   offered old-signed v0.2.8 first, then they can safely advance to the true
+   successor-signed latest on their next run.
 
 Full notes: the platform repo's `infra/README.md`.

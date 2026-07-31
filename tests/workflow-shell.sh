@@ -1,19 +1,24 @@
 #!/bin/sh
-# Extract every multiline `run: |` block in release.yml and parse it with
-# Bash. actionlint validates workflow structure, but an unmatched shell group
-# inside a YAML scalar otherwise survives until the one-time release run.
+# Extract every multiline `run: |` block in the release workflows and parse
+# each Bash block. actionlint validates workflow structure, but an unmatched
+# shell group inside a YAML scalar otherwise survives until the one-time
+# release run.
 set -eu
 
 root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)"
-workflow="$root/.github/workflows/release.yml"
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/sevra-workflow-shell.XXXXXX")"
 trap 'rm -rf -- "$tmp"' EXIT HUP INT TERM
 
-expected="$(
-  grep -Ec '^[[:space:]]+run: [|][+-]?$' "$workflow"
-)"
+check_workflow() {
+  workflow="$1"
+  workflow_name="$(basename "$workflow")"
+  output="$tmp/$workflow_name"
+  mkdir "$output"
+  expected="$(
+    grep -Ec '^[[:space:]]+run: [|][+-]?$' "$workflow"
+  )"
 
-awk -v output="$tmp" '
+  awk -v output="$output" '
 BEGIN {
   count_file = output "/count"
 }
@@ -42,12 +47,16 @@ function finish() {
       next
     }
   }
+  if (line ~ /^[ ]+- (name|uses):/) step_shell = ""
+  if (line ~ /^[ ]+shell: bash$/) step_shell = "bash"
+  if (line ~ /^[ ]+shell: pwsh$/) step_shell = "pwsh"
   if (line ~ /^[ ]+run: [|][+-]?$/) {
     active = 1
     run_indent = indent
     content_indent = -1
     count++
-    file = output "/run-" count ".bash"
+    extension = step_shell == "bash" ? ".bash" : ".other"
+    file = output "/run-" count extension
   }
 }
 END {
@@ -56,14 +65,25 @@ END {
 }
 ' "$workflow"
 
-actual="$(cat "$tmp/count")"
-[ "$actual" = "$expected" ] || {
-  printf 'workflow shell extraction mismatch: expected %s, extracted %s\n' \
-    "$expected" "$actual" >&2
-  exit 1
+  actual="$(cat "$output/count")"
+  [ "$actual" = "$expected" ] || {
+    printf '%s shell extraction mismatch: expected %s, extracted %s\n' \
+      "$workflow_name" "$expected" "$actual" >&2
+    exit 1
+  }
+
+  bash_blocks=0
+  for block in "$output"/run-*.bash; do
+    bash -n "$block"
+    bash_blocks=$((bash_blocks + 1))
+  done
+  printf '%s shell syntax: %s/%s Bash multiline blocks OK\n' \
+    "$workflow_name" "$bash_blocks" "$actual"
 }
 
-for block in "$tmp"/run-*.bash; do
-  bash -n "$block"
+for workflow in \
+  "$root/.github/workflows/release.yml" \
+  "$root/.github/workflows/smoke.yml"
+do
+  check_workflow "$workflow"
 done
-printf 'release workflow shell syntax: %s multiline blocks OK\n' "$actual"
