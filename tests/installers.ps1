@@ -114,7 +114,11 @@ try {
   try {
     & (Join-Path $root 'install.ps1')
   } catch {
-    $digestFailed = "$_" -match 'checksum mismatch'
+    # A freshly fetched mismatching digest may be reported as a mismatch or,
+    # when the local HTTP stack rejects the deliberately changed trust
+    # response, as an unavailable trusted checksum. Both are fail-closed; a
+    # stale cached good response would return success and fail this assertion.
+    $digestFailed = "$_" -match '(checksum mismatch|no trusted checksum)'
   }
   if (-not $digestFailed) {
     throw 'installer unexpectedly accepted a bad independent digest'
