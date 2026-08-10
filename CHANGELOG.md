@@ -2,6 +2,11 @@
 
 ## 0.2.8 — 2026-08-10
 
+- New: the brain vault now travels across machines. `sevra secrets list`,
+  `set`, `get`, and `rm` manage server-custodied values by brain. Set accepts
+  up to 256 KiB of arbitrary bytes from stdin only. Get emits exact bytes to a
+  pipe, requires explicit `--reveal` on a terminal, and returns canonical
+  base64 under `--json`. `delete` remains an alias for `rm`.
 - New: `sevra clone <brain> [dir]` restores verified records and declared
   assets into a fresh directory and records a dot-prefixed local baseline.
   `sevra pull [dir]` names and refuses local divergence before its first

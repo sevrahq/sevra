@@ -278,6 +278,8 @@ fn secrets_help_lists_actions_and_hides_the_argv_trap() {
         .stdout(
             predicate::str::contains("list")
                 .and(predicate::str::contains("set"))
+                .and(predicate::str::contains("get"))
+                .and(predicate::str::contains("rm"))
                 .and(predicate::str::contains("delete")),
         );
     // The hidden traps must not advertise a value positional in usage.
@@ -295,22 +297,33 @@ fn secrets_help_lists_actions_and_hides_the_argv_trap() {
 #[test]
 fn secrets_name_is_clap_validated() {
     // Bad names are usage errors (exit 2) before any I/O — the hub's
-    // ^[A-Z][A-Z0-9_]{0,63}$ mirrored client-side. Names are public metadata,
+    // ^[A-Za-z][A-Za-z0-9_-]{0,63}$ mirrored client-side. Names are public metadata,
     // so clap echoing them is fine.
     let over = "A".repeat(65);
-    for bad in ["lower", "1LEADING", "_LEAD", "HAS-DASH", over.as_str()] {
+    for bad in ["1LEADING", "_LEAD", "HAS SPACE", ".DOT", over.as_str()] {
         sevra()
             .args(["secrets", "set", "b", bad])
             .assert()
             .code(2)
-            .stderr(predicate::str::contains("UPPER_SNAKE_CASE"));
+            .stderr(predicate::str::contains("vault names"));
     }
-    // delete validates too, and the usage error honors --json on stdout.
+    // rm validates too, and the usage error honors --json on stdout.
     sevra()
-        .args(["secrets", "delete", "b", "bad-name", "--json"])
+        .args(["secrets", "rm", "b", "bad.name", "--json"])
         .assert()
         .code(2)
         .stdout(predicate::str::contains("\"error\""));
+
+    // Human-friendly and function-binding shapes are both valid.
+    for good in ["stripe-key", "STRIPE_KEY", "Key_2"] {
+        sevra()
+            .args(["secrets", "get", "b", good])
+            .env("SEVRA_HUB_URL", "http://localhost:9")
+            .env("SEVRA_API_KEY", "x")
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("hub unreachable"));
+    }
 }
 
 #[test]
@@ -426,8 +439,8 @@ fn secrets_set_refuses_empty_and_oversized_values_without_echo() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("empty value"));
-    // >4096 chars is refused client-side, naming the size, never the bytes.
-    let big = "x".repeat(4097);
+    // >256 KiB is refused client-side, naming the byte size, never the bytes.
+    let big = "x".repeat(256 * 1024 + 1);
     let out = sevra()
         .args(["secrets", "set", "b", "API_KEY"])
         .env("SEVRA_HUB_URL", "http://localhost:9")
@@ -437,8 +450,8 @@ fn secrets_set_refuses_empty_and_oversized_values_without_echo() {
         .unwrap();
     assert!(!out.status.success());
     let all = all_output(&out);
-    assert!(all.contains("4096"), "should name the cap: {all}");
-    assert!(all.contains("4097"), "should name the actual size: {all}");
+    assert!(all.contains("262144"), "should name the cap: {all}");
+    assert!(all.contains("262145"), "should name the actual size: {all}");
     assert!(
         !all.contains("xxxxxxxx"),
         "value bytes echoed into output: {all}"
@@ -446,7 +459,7 @@ fn secrets_set_refuses_empty_and_oversized_values_without_echo() {
 
     // The byte-level ceiling fires before UTF-8 decoding/character counting,
     // bounding memory even when a hostile producer never sends a newline.
-    let byte_flood = "x".repeat(4096 * 4 + 3);
+    let byte_flood = "x".repeat(256 * 1024 + 3);
     let out = sevra()
         .args(["secrets", "set", "b", "API_KEY"])
         .env("SEVRA_HUB_URL", "http://localhost:9")
@@ -464,8 +477,8 @@ fn secrets_set_refuses_empty_and_oversized_values_without_echo() {
 }
 
 #[test]
-fn secrets_list_and_delete_hold_the_json_error_contract() {
-    // Wiring smoke: both route through the hub client, honoring --json.
+fn secrets_list_get_and_rm_hold_the_error_contract() {
+    // Wiring smoke: all route through the hub client, honoring --json.
     sevra()
         .args(["secrets", "list", "b", "--json"])
         .env("SEVRA_HUB_URL", "http://localhost:9")
@@ -474,7 +487,14 @@ fn secrets_list_and_delete_hold_the_json_error_contract() {
         .failure()
         .stdout(predicate::str::contains("\"error\""));
     sevra()
-        .args(["secrets", "delete", "b", "API_KEY"])
+        .args(["secrets", "get", "b", "API_KEY", "--json"])
+        .env("SEVRA_HUB_URL", "http://localhost:9")
+        .env("SEVRA_API_KEY", "x")
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("\"error\""));
+    sevra()
+        .args(["secrets", "rm", "b", "API_KEY"])
         .env("SEVRA_HUB_URL", "http://localhost:9")
         .env("SEVRA_API_KEY", "x")
         .assert()
@@ -611,6 +631,128 @@ fn sevra_at_home(home: &std::path::Path) -> Command {
 
 const MOCK_KEY: &str =
     "sevra_account_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+#[test]
+fn brain_vault_set_list_get_and_rm_round_trip_bytes() {
+    let (base, log, handle) = mock_hub(vec![
+        (
+            200,
+            r#"{"ok":true,"name":"stripe-key","created":true,"updatedAt":"2026-08-10T00:00:00.000Z"}"#
+                .to_string(),
+        ),
+        (
+            200,
+            r#"{"items":[{"name":"stripe-key","updatedAt":"2026-08-10T00:00:00.000Z"}]}"#
+                .to_string(),
+        ),
+        (
+            200,
+            r#"{"name":"stripe-key","valueBase64":"AAECCv8=","encoding":"base64"}"#
+                .to_string(),
+        ),
+        (200, r#"{"ok":true,"name":"stripe-key"}"#.to_string()),
+    ]);
+
+    let set = sevra()
+        .args(["secrets", "set", "brain", "stripe-key"])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", MOCK_KEY)
+        .write_stdin(vec![0, 1, 2, 10, 255, 0])
+        .output()
+        .unwrap();
+    assert!(set.status.success(), "set: {}", all_output(&set));
+    assert!(
+        !all_output(&set).contains("AAECCv8A"),
+        "set must not echo encoded secret material"
+    );
+
+    let list = sevra()
+        .args(["secrets", "list", "brain"])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", MOCK_KEY)
+        .output()
+        .unwrap();
+    assert!(list.status.success(), "list: {}", all_output(&list));
+    assert!(all_output(&list).contains("stripe-key"));
+
+    let get = sevra()
+        .args(["secrets", "get", "brain", "stripe-key"])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", MOCK_KEY)
+        .output()
+        .unwrap();
+    assert!(get.status.success(), "get: {}", all_output(&get));
+    assert_eq!(get.stdout, vec![0, 1, 2, 10, 255]);
+    assert!(get.stderr.is_empty(), "pipe output stays clean");
+
+    let rm = sevra()
+        .args(["secrets", "rm", "brain", "stripe-key"])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", MOCK_KEY)
+        .output()
+        .unwrap();
+    assert!(rm.status.success(), "rm: {}", all_output(&rm));
+
+    handle.join().unwrap();
+    let reqs = log.lock().unwrap();
+    assert_eq!(reqs.len(), 4);
+    assert_eq!(reqs[0].method, "PUT");
+    assert_eq!(reqs[0].path, "/api/hub/brains/brain/vault");
+    let set_body: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+    assert_eq!(set_body["name"], "stripe-key");
+    assert_eq!(set_body["valueBase64"], "AAECCv8A");
+    assert!(!reqs[0].body.contains("TOPSECRET"));
+    assert_eq!(reqs[1].path, "/api/hub/brains/brain/vault");
+    assert_eq!(reqs[2].path, "/api/hub/brains/brain/vault?name=stripe-key");
+    assert_eq!(reqs[3].method, "DELETE");
+    assert_eq!(reqs[3].path, "/api/hub/brains/brain/vault");
+    let expected_auth = format!("Bearer {MOCK_KEY}");
+    assert!(
+        reqs.iter()
+            .all(|request| { request.authorization.as_deref() == Some(expected_auth.as_str()) }),
+        "every vault request carries the account credential"
+    );
+}
+
+#[test]
+fn brain_vault_get_requires_reveal_on_a_terminal() {
+    for json in [false, true] {
+        let mut command = sevra();
+        command.args(["secrets", "get", "brain", "API_KEY"]);
+        if json {
+            command.arg("--json");
+        }
+        let output = command
+            .env("SEVRA_HUB_URL", "http://localhost:9")
+            .env("SEVRA_API_KEY", MOCK_KEY)
+            .env("SEVRA_TEST_STDOUT_TTY", "1")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        let all = all_output(&output);
+        assert!(all.contains("--reveal"), "{all}");
+    }
+}
+
+#[test]
+fn brain_vault_terminal_reveal_escapes_control_bytes() {
+    let (base, _log, handle) = mock_hub(vec![(
+        200,
+        r#"{"name":"API_KEY","valueBase64":"YWJjG1szMW1wd24=","encoding":"base64"}"#.to_string(),
+    )]);
+    let output = sevra()
+        .args(["secrets", "get", "brain", "API_KEY", "--reveal"])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", MOCK_KEY)
+        .env("SEVRA_TEST_STDOUT_TTY", "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", all_output(&output));
+    assert!(!output.stdout.contains(&0x1b));
+    let human = String::from_utf8(output.stdout).unwrap();
+    assert!(human.contains("API_KEY: abc\\u{001b}[31mpwn"), "{human}");
+    handle.join().unwrap();
+}
 
 fn device_start_body() -> String {
     concat!(

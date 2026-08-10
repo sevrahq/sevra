@@ -193,7 +193,7 @@ enum Commands {
     Publish { brain: String },
     /// Pull all public pages
     Unpublish { brain: String },
-    /// The vault: write-only secrets for a brain's published functions
+    /// The brain vault: values stay server-side and follow you across machines
     Secrets {
         #[command(subcommand)]
         action: SecretsAction,
@@ -275,14 +275,14 @@ fn install_verified(dir: &str, expected_sha256: &str) -> Result<(), String> {
 
 #[derive(Subcommand)]
 enum SecretsAction {
-    /// List secret names + the functions they bind to
+    /// List vault item names (never values)
     List { brain: String },
-    /// Provision or rotate one secret. The VALUE is read from stdin — hidden
+    /// Store or rotate one vault item. The VALUE is read from stdin — hidden
     /// prompt on a TTY, piped otherwise (one trailing newline trimmed) —
     /// never from the command line, never echoed.
     Set {
         brain: String,
-        /// UPPER_SNAKE_CASE, e.g. STRIPE_KEY (A-Z start; A-Z/0-9/_; ≤64 chars)
+        /// 1-64 letters, numbers, underscores, or hyphens; starts with a letter
         #[arg(value_parser = commands::parse_secret_name)]
         name: String,
         // Traps, hidden from help: anything value-shaped in argv is refused
@@ -293,10 +293,21 @@ enum SecretsAction {
         #[arg(hide = true, value_name = "REFUSED", num_args = 0..)]
         value_argv: Vec<String>,
     },
-    /// Unbind one secret and forget its name
-    Delete {
+    /// Retrieve one value (pipe-safe; a terminal requires --reveal)
+    Get {
         brain: String,
-        /// The secret's name
+        /// The vault item's name
+        #[arg(value_parser = commands::parse_secret_name)]
+        name: String,
+        /// Reveal a value when stdout is a terminal
+        #[arg(long)]
+        reveal: bool,
+    },
+    /// Delete one vault item
+    #[command(name = "rm", visible_alias = "delete")]
+    Rm {
+        brain: String,
+        /// The vault item's name
         #[arg(value_parser = commands::parse_secret_name)]
         name: String,
     },
@@ -462,7 +473,12 @@ fn main() {
                 let value_in_argv = value.is_some() || !value_argv.is_empty();
                 commands::secrets_set(&cfg, &brain, &name, value_in_argv)
             }
-            SecretsAction::Delete { brain, name } => commands::secrets_delete(&cfg, &brain, &name),
+            SecretsAction::Get {
+                brain,
+                name,
+                reveal,
+            } => commands::secrets_get(&cfg, &brain, &name, reveal),
+            SecretsAction::Rm { brain, name } => commands::secrets_delete(&cfg, &brain, &name),
             // Local-store commands: no credential, no network.
             SecretsAction::Scan { dir } => commands::secrets_scan(dir),
             SecretsAction::Quarantine {

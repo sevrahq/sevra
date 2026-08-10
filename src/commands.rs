@@ -6,7 +6,7 @@
 //! public binary any third party gets.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
@@ -36,13 +36,11 @@ const MAX_STORE_FILES: usize = MAX_PACK_FILES;
 const MAX_STORE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_PACK_BYTES: u64 = MAX_CANONICAL_PACK_BYTES;
 const PACK_COMMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(330);
-/// The hub's cap on one secret value (mirrored client-side so an oversized
-/// paste fails fast, before any request).
-const MAX_SECRET_VALUE_CHARS: usize = 4096;
-/// Four UTF-8 bytes per allowed scalar plus one optional CRLF. Piped input is
-/// bounded before UTF-8 decoding so a hostile producer cannot grow memory
-/// without limit before the character-count check runs.
-const MAX_SECRET_STDIN_BYTES: usize = MAX_SECRET_VALUE_CHARS * 4 + 2;
+/// The hub's byte cap on one vault item, mirrored client-side so an oversized
+/// pipe fails before base64 expansion or any request.
+const MAX_SECRET_VALUE_BYTES: usize = 256 * 1024;
+/// One optional CRLF may be trimmed from piped input.
+const MAX_SECRET_STDIN_BYTES: usize = MAX_SECRET_VALUE_BYTES + 2;
 const SYNC_BASELINE_FILE: &str = ".sevra-sync.json";
 const MAX_SYNC_BASELINE_BYTES: u64 = 16 * 1024 * 1024;
 const PULL_JOURNAL_FILE: &str = ".sevra-pull-journal.json";
@@ -4253,26 +4251,25 @@ fn normalize(p: &Path) -> PathBuf {
 
 // --- secrets (the vault) -------------------------------------------------------
 //
-// Write-only Cloudflare secret values bound to the brain's published functions
-// (docs: /docs/publishing.md, "Functions + the vault"). The security contract,
+// Server-custodied values that follow the brain across machines. The security contract,
 // locked by tests: the VALUE is read from stdin only — never argv (argv is
 // visible to every process on the machine), never echoed back on any path
 // (prompts, errors, --json included). NAMES are public metadata (records
 // declare them; the dashboard lists them) and are clap-validated to the hub's
 // exact shape before any request.
 
-/// clap value_parser for a secret NAME — the hub's gate, mirrored exactly:
-/// `^[A-Z][A-Z0-9_]{0,63}$`. Refusal is a usage error (exit 2) before any I/O.
+/// clap value_parser for a vault NAME — the hub's gate, mirrored exactly:
+/// `^[A-Za-z][A-Za-z0-9_-]{0,63}$`. Refusal is a usage error (exit 2) before any I/O.
 pub fn parse_secret_name(s: &str) -> Result<String, String> {
-    let ok = matches!(s.as_bytes().first(), Some(b'A'..=b'Z'))
+    let ok = matches!(s.as_bytes().first(), Some(b'A'..=b'Z' | b'a'..=b'z'))
         && s.len() <= 64
         && s.bytes()
-            .all(|b| matches!(b, b'A'..=b'Z' | b'0'..=b'9' | b'_'));
+            .all(|b| matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'));
     if ok {
         Ok(s.to_string())
     } else {
         Err(
-            "secret names are UPPER_SNAKE_CASE: start with A-Z, then A-Z/0-9/_, at most 64 chars (e.g. STRIPE_KEY)"
+            "vault names start with a letter and use only letters, numbers, underscores, or hyphens (at most 64 characters; e.g. stripe-key)"
                 .into(),
         )
     }
@@ -4281,14 +4278,14 @@ pub fn parse_secret_name(s: &str) -> Result<String, String> {
 /// Trim exactly ONE trailing newline (`\n` or `\r\n`) — so `printf %s "$V" |`
 /// and `echo "$V" |` both deliver the same value, while a value that really
 /// ends in a newline can still be sent by appending one more.
-fn trim_one_newline(mut s: String) -> String {
-    if s.ends_with('\n') {
-        s.pop();
-        if s.ends_with('\r') {
-            s.pop();
+fn trim_one_newline(mut value: Vec<u8>) -> Vec<u8> {
+    if value.last() == Some(&b'\n') {
+        value.pop();
+        if value.last() == Some(&b'\r') {
+            value.pop();
         }
     }
-    s
+    value
 }
 
 /// Read the secret VALUE: prompted on the controlling terminal with echo OFF
@@ -4296,11 +4293,11 @@ fn trim_one_newline(mut s: String) -> String {
 /// stdout stays clean), else read whole from piped stdin. Never from argv;
 /// never echoed — the refusal messages below name sizes and shapes, never
 /// bytes.
-fn secret_value_from_stdin(name: &str) -> String {
+fn secret_value_from_stdin(name: &str) -> Vec<u8> {
     use std::io::{IsTerminal, Read};
-    let value = if std::io::stdin().is_terminal() {
+    let mut value = if std::io::stdin().is_terminal() {
         match rpassword::prompt_password(format!("value for {name} (input hidden): ")) {
-            Ok(v) => v,
+            Ok(v) => v.into_bytes(),
             Err(e) => fail(
                 &format!(
                     "could not read from the terminal: {e} — pipe the value instead: printf %s \"$VALUE\" | sevra secrets set <brain> {name}"
@@ -4314,26 +4311,19 @@ fn secret_value_from_stdin(name: &str) -> String {
         let mut limited = stdin.lock().take((MAX_SECRET_STDIN_BYTES + 1) as u64);
         if let Err(e) = limited.read_to_end(&mut bytes) {
             fail(
-                &format!("could not read the value from stdin (it must be UTF-8): {e}"),
+                &format!("could not read the value bytes from stdin: {e}"),
                 None,
             );
         }
         if bytes.len() > MAX_SECRET_STDIN_BYTES {
             fail(
                 &format!(
-                    "the value is too large — the hub caps one secret at {MAX_SECRET_VALUE_CHARS} characters"
+                    "the value is too large — the hub caps one vault item at {MAX_SECRET_VALUE_BYTES} bytes"
                 ),
                 None,
             );
         }
-        let buf = match String::from_utf8(bytes) {
-            Ok(buf) => buf,
-            Err(_) => fail(
-                "could not read the value from stdin (it must be UTF-8)",
-                None,
-            ),
-        };
-        trim_one_newline(buf)
+        trim_one_newline(bytes)
     };
     if value.is_empty() {
         fail(
@@ -4343,15 +4333,16 @@ fn secret_value_from_stdin(name: &str) -> String {
             None,
         );
     }
-    if value.chars().count() > MAX_SECRET_VALUE_CHARS {
+    if value.len() > MAX_SECRET_VALUE_BYTES {
         fail(
             &format!(
-                "the value is {} characters — the hub caps one secret at {MAX_SECRET_VALUE_CHARS}",
-                value.chars().count()
+                "the value is {} bytes — the hub caps one vault item at {MAX_SECRET_VALUE_BYTES} bytes",
+                value.len()
             ),
             None,
         );
     }
+    value.shrink_to_fit();
     value
 }
 
@@ -4360,7 +4351,7 @@ pub fn secrets_list(cfg: &Config, brain: &str) {
         request(
             cfg,
             "GET",
-            &format!("/api/hub/brains/{}/secrets", enc(brain)),
+            &format!("/api/hub/brains/{}/vault", enc(brain)),
             None,
             true,
         ),
@@ -4371,59 +4362,25 @@ pub fn secrets_list(cfg: &Config, brain: &str) {
         return;
     }
     let names: Vec<&str> = r
-        .get("secrets")
+        .get("items")
         .and_then(|s| s.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.get("name").and_then(Value::as_str))
+                .collect()
+        })
         .unwrap_or_default();
     if names.is_empty() {
         out(
-            "no secrets provisioned — printf %s \"$VALUE\" | sevra secrets set <brain> NAME",
+            "the brain vault is empty — printf %s \"$VALUE\" | sevra secrets set <brain> NAME",
             None,
         );
     } else {
         out(
             &format!(
-                "secrets ({}, values write-only): {}",
+                "vault items ({}; values stay hidden): {}",
                 names.len(),
                 names.join(", ")
-            ),
-            None,
-        );
-    }
-    let fns = r
-        .get("functions")
-        .and_then(|f| f.as_array())
-        .cloned()
-        .unwrap_or_default();
-    if fns.is_empty() {
-        return;
-    }
-    out(&format!("functions ({}):", fns.len()), None);
-    let join = |f: &Value, key: &str| -> String {
-        let items: Vec<&str> = f
-            .get(key)
-            .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
-            .unwrap_or_default();
-        if items.is_empty() {
-            "-".into()
-        } else {
-            items.join(", ")
-        }
-    };
-    for f in &fns {
-        let live = if f.get("live").and_then(|l| l.as_bool()).unwrap_or(false) {
-            "live"
-        } else {
-            "not live"
-        };
-        out_layout(
-            &format!(
-                "  {}\t{}\tneeds: {}\tegress: {}",
-                terminal_safe(str_field(f, "name")),
-                live,
-                terminal_safe(&join(f, "secrets")),
-                terminal_safe(&join(f, "egress"))
             ),
             None,
         );
@@ -4443,25 +4400,116 @@ pub fn secrets_set(cfg: &Config, brain: &str, name: &str, value_in_argv: bool) {
     if cfg.key.is_none() {
         fail(NOT_LOGGED_IN, None);
     }
-    let value = secret_value_from_stdin(name);
-    let body = json!({ "name": name, "value": value });
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+
+    let mut value = secret_value_from_stdin(name);
+    let body = json!({ "name": name, "valueBase64": STANDARD.encode(&value) });
+    value.fill(0);
     let r = ensure_ok(
         request(
             cfg,
             "PUT",
-            &format!("/api/hub/brains/{}/secrets", enc(brain)),
+            &format!("/api/hub/brains/{}/vault", enc(brain)),
             Some(&body),
             true,
         ),
         "secrets set",
     );
-    let hub_note = str_field(&r, "note");
-    let human = if hub_note.is_empty() {
-        format!("set secret {name} on {brain} (write-only)")
-    } else {
-        format!("set secret {name} on {brain} — {hub_note}")
+    out(&format!("set vault item {name} on {brain}"), Some(r));
+}
+
+fn stdout_is_terminal() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdout().is_terminal()
+        || (cfg!(debug_assertions) && std::env::var("SEVRA_TEST_STDOUT_TTY").as_deref() == Ok("1"))
+}
+
+pub fn secrets_get(cfg: &Config, brain: &str, name: &str, reveal: bool) {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+
+    if cfg.key.is_none() {
+        fail(NOT_LOGGED_IN, None);
+    }
+    let terminal = stdout_is_terminal();
+    if terminal && !reveal {
+        usage_fail(
+            "refusing to print a vault value to a terminal — pass --reveal, or pipe stdout to the consuming process",
+        );
+    }
+
+    let r = ensure_ok(
+        request(
+            cfg,
+            "GET",
+            &format!("/api/hub/brains/{}/vault?name={}", enc(brain), enc(name)),
+            None,
+            true,
+        ),
+        "secrets get",
+    );
+    let encoded = r
+        .get("valueBase64")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| fail("secrets get failed: the hub omitted valueBase64", None));
+    let max_encoded = MAX_SECRET_VALUE_BYTES.div_ceil(3) * 4;
+    if encoded.len() > max_encoded {
+        fail(
+            &format!(
+                "secrets get failed: the hub returned more than {MAX_SECRET_VALUE_BYTES} bytes"
+            ),
+            None,
+        );
+    }
+    let mut value = STANDARD
+        .decode(encoded)
+        .unwrap_or_else(|_| fail("secrets get failed: the hub returned invalid base64", None));
+    if value.is_empty()
+        || value.len() > MAX_SECRET_VALUE_BYTES
+        || STANDARD.encode(&value) != encoded
+    {
+        value.fill(0);
+        fail(
+            "secrets get failed: the hub returned a non-canonical or invalid vault value",
+            None,
+        );
+    }
+
+    if json_mode() {
+        value.fill(0);
+        out("", Some(r));
+        return;
+    }
+    if terminal {
+        let human = match std::str::from_utf8(&value) {
+            Ok(text) => format!(
+                "{}: {}",
+                terminal_safe(name),
+                terminal_safe(text)
+            ),
+            Err(_) => format!(
+                "{} is binary ({} bytes); pipe this command to a file, or use --json --reveal for base64",
+                terminal_safe(name),
+                value.len()
+            ),
+        };
+        value.fill(0);
+        out_layout(&human, None);
+        return;
+    }
+
+    let result = {
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(&value).and_then(|_| stdout.flush())
     };
-    out(&human, Some(r));
+    value.fill(0);
+    if let Err(error) = result {
+        fail(
+            &format!("could not write the vault value to stdout: {error}"),
+            None,
+        );
+    }
 }
 
 pub fn secrets_delete(cfg: &Config, brain: &str, name: &str) {
@@ -4470,16 +4518,16 @@ pub fn secrets_delete(cfg: &Config, brain: &str, name: &str) {
         request(
             cfg,
             "DELETE",
-            &format!("/api/hub/brains/{}/secrets", enc(brain)),
+            &format!("/api/hub/brains/{}/vault", enc(brain)),
             Some(&body),
             true,
         ),
-        "secrets delete",
+        "secrets rm",
     );
     let mut data = r.as_object().cloned().unwrap_or_default();
     data.insert("name".into(), json!(name));
     out(
-        &format!("deleted secret {name} from {brain} (unbound from its functions)"),
+        &format!("removed vault item {name} from {brain}"),
         Some(Value::Object(data)),
     );
 }
@@ -5370,20 +5418,18 @@ mod tests {
 
     #[test]
     fn secret_name_shape_matches_the_hub_gate() {
-        // ^[A-Z][A-Z0-9_]{0,63}$ — mirrored exactly, boundaries included.
+        // ^[A-Za-z][A-Za-z0-9_-]{0,63}$ — mirrored exactly, boundaries included.
         let max = "A".repeat(64);
-        for good in ["A", "STRIPE_KEY", "A1_B2_C3", "OPENAI_API_KEY", &max] {
+        for good in ["A", "stripe-key", "A1_B2_C3", "OpenAI_API-key", &max] {
             assert!(parse_secret_name(good).is_ok(), "should accept {good}");
         }
         let over = "A".repeat(65);
         for bad in [
             "",
-            "a",
-            "lower_case",
             "1LEADING",
             "_LEADING",
-            "HAS-DASH",
             "HAS SPACE",
+            "HAS.DOT",
             "Ä",
             "A\n",
             &over,
@@ -5564,12 +5610,14 @@ mod tests {
 
     #[test]
     fn trim_one_newline_trims_exactly_one() {
-        assert_eq!(trim_one_newline("v\n".into()), "v");
-        assert_eq!(trim_one_newline("v".into()), "v");
-        assert_eq!(trim_one_newline("v\n\n".into()), "v\n"); // exactly one
-        assert_eq!(trim_one_newline("v\r\n".into()), "v"); // CRLF is one newline
-        assert_eq!(trim_one_newline("v\r".into()), "v\r"); // a bare CR is data
-        assert_eq!(trim_one_newline("\n".into()), "");
-        assert_eq!(trim_one_newline("multi\nline\n".into()), "multi\nline");
+        let trim = |value: &str| trim_one_newline(value.as_bytes().to_vec());
+        assert_eq!(trim("v\n"), b"v");
+        assert_eq!(trim("v"), b"v");
+        assert_eq!(trim("v\n\n"), b"v\n"); // exactly one
+        assert_eq!(trim("v\r\n"), b"v"); // CRLF is one newline
+        assert_eq!(trim("v\r"), b"v\r"); // a bare CR is data
+        assert_eq!(trim("\n"), b"");
+        assert_eq!(trim("multi\nline\n"), b"multi\nline");
+        assert_eq!(trim_one_newline(vec![0xff, b'\n']), vec![0xff]);
     }
 }

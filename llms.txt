@@ -69,12 +69,18 @@ Commands:
                                           # {"command":"sevra","args":["mcp"]}
     grant <brain> <email> [--write] | grants <brain> | revoke <brain> <grantId>
     shared | publish <brain> | unpublish <brain>
-    secrets list|set|delete <brain> [NAME]
-                                          # the vault (write-only values for published
-                                          # functions). set reads the VALUE from stdin —
-                                          # pipe it: printf %s "$V" | sevra secrets set b NAME
-                                          # (one trailing newline trimmed); NEVER argv,
-                                          # never echoed. NAME: ^[A-Z][A-Z0-9_]{0,63}$
+    secrets list <brain>                  # list names in the brain's server-custodied vault
+    secrets set <brain> NAME              # create or replace up to 256 KiB from stdin only;
+                                          # arbitrary bytes accepted; one final LF/CRLF
+                                          # trimmed. NEVER argv.
+    secrets get <brain> NAME [--reveal]   # exact raw bytes when piped; a TTY refuses unless
+                                          # --reveal is explicit. --json returns canonical
+                                          # base64 and never plaintext.
+    secrets rm <brain> NAME               # permanently forget it (`delete` is an alias)
+                                          # NAME: ^[A-Za-z][A-Za-z0-9_-]{0,63}$
+                                          # Account credentials can retrieve values across
+                                          # machines; browser sessions can manage the vault
+                                          # but never retrieve stored values.
     secrets scan [dir]                    # push's secret scan, read-only, offline: exit 1 on
                                           # matches ({"secretHits":[{path,kind,inPath}],
                                           # "total", "assetSecretScan", "error"}), 0 clean;
