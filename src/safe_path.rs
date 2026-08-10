@@ -439,6 +439,75 @@ mod platform {
             Ok(Some(file))
         }
 
+        pub(super) fn directory_exists_relative(&self, rel: &str) -> io::Result<bool> {
+            let components = parts(rel)?;
+            let parent = match open_parent_from(self.file.try_clone()?, &components, false) {
+                Ok(parent) => parent,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            match open_dir_at(parent.as_raw_fd(), components.last().unwrap()) {
+                Ok(_) => Ok(true),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(error),
+            }
+        }
+
+        pub(super) fn lock_relative(&self, rel: &str) -> io::Result<fs::File> {
+            let components = parts(rel)?;
+            if components.len() != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "lock name must be one component",
+                ));
+            }
+            let name = c_name(&components[0])?;
+            // SAFETY: the held root descriptor and NUL-terminated name live
+            // through the call. O_NOFOLLOW refuses a planted symlink.
+            let fd = unsafe {
+                libc::openat(
+                    self.file.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    0o600,
+                )
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: openat returned a fresh owned descriptor.
+            let file = unsafe { fs::File::from_raw_fd(fd) };
+            if !file.metadata()?.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "lock entry is not a regular file",
+                ));
+            }
+            // The file is intentionally permanent. Removing a held lock file
+            // would let another process create and lock a different inode.
+            self.file.sync_all()?;
+            // SAFETY: file owns a live descriptor. flock blocks until the
+            // other pull/push exits and the kernel releases its lock on death.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(file)
+        }
+
+        pub(super) fn restore_permissions_relative(
+            &self,
+            rel: &str,
+            mode: u32,
+            _readonly: bool,
+        ) -> io::Result<()> {
+            use std::os::unix::fs::PermissionsExt;
+            let file = self.open_relative(rel)?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "restored file disappeared")
+            })?;
+            file.set_permissions(fs::Permissions::from_mode(mode))?;
+            file.sync_all()
+        }
+
         pub(super) fn atomic_write_relative<F>(
             &self,
             rel: &str,
@@ -763,14 +832,18 @@ mod platform {
     use super::*;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::FromRawHandle;
-    use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::Storage::FileSystem::{
-        CreateDirectoryW, CreateFileW, GetFileInformationByHandle, MoveFileExW, RemoveDirectoryW,
-        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-        OPEN_EXISTING,
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
     };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateDirectoryW, CreateFileW, GetFileInformationByHandle, LockFileEx, MoveFileExW,
+        RemoveDirectoryW, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
+        FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_WRITE_ATTRIBUTES, LOCKFILE_EXCLUSIVE_LOCK, MOVEFILE_REPLACE_EXISTING,
+        MOVEFILE_WRITE_THROUGH, OPEN_ALWAYS, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
 
     pub(super) struct SafeDir {
         // Keep the complete root-to-directory chain locked against rename.
@@ -999,6 +1072,108 @@ mod platform {
 
         pub(super) fn open_relative(&self, rel: &str) -> io::Result<Option<fs::File>> {
             open_regular(&self.path, rel)
+        }
+
+        pub(super) fn directory_exists_relative(&self, rel: &str) -> io::Result<bool> {
+            let components = parts(rel)?;
+            let (_held, parent) = match locked_parent(&self.path, &components, false) {
+                Ok(parent) => parent,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            match open_locked_dir(&parent.join(components.last().unwrap())) {
+                Ok(_) => Ok(true),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(error),
+            }
+        }
+
+        pub(super) fn lock_relative(&self, rel: &str) -> io::Result<fs::File> {
+            let components = parts(rel)?;
+            if components.len() != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "lock name must be one component",
+                ));
+            }
+            let path = wide(&self.path.join(&components[0]));
+            // The held directory chain prevents root replacement. Opening the
+            // reparse point itself lets us reject one instead of following it.
+            let handle = unsafe {
+                CreateFileW(
+                    path.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    std::ptr::null(),
+                    OPEN_ALWAYS,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                    std::ptr::null_mut(),
+                )
+            };
+            if handle == INVALID_HANDLE_VALUE {
+                return Err(io::Error::last_os_error());
+            }
+            let attributes = match handle_attributes(handle) {
+                Ok(attributes) => attributes,
+                Err(error) => {
+                    unsafe { CloseHandle(handle) };
+                    return Err(error);
+                }
+            };
+            if attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0 {
+                unsafe { CloseHandle(handle) };
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "lock entry is a reparse point or not a regular file",
+                ));
+            }
+            let mut overlapped = unsafe { std::mem::zeroed::<OVERLAPPED>() };
+            if unsafe {
+                LockFileEx(
+                    handle,
+                    LOCKFILE_EXCLUSIVE_LOCK,
+                    0,
+                    u32::MAX,
+                    u32::MAX,
+                    &mut overlapped,
+                )
+            } == 0
+            {
+                let error = io::Error::last_os_error();
+                unsafe { CloseHandle(handle) };
+                return Err(error);
+            }
+            Ok(file_from_handle(handle))
+        }
+
+        pub(super) fn restore_permissions_relative(
+            &self,
+            rel: &str,
+            _mode: u32,
+            readonly: bool,
+        ) -> io::Result<()> {
+            let components = parts(rel)?;
+            let (_held, parent) = locked_parent(&self.path, &components, false)?;
+            let path = parent.join(components.last().unwrap());
+            let handle = open_raw(&path, FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES, false)?;
+            let attributes = match handle_attributes(handle) {
+                Ok(attributes) => attributes,
+                Err(error) => {
+                    unsafe { CloseHandle(handle) };
+                    return Err(error);
+                }
+            };
+            if attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0 {
+                unsafe { CloseHandle(handle) };
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "restored entry is a reparse point or not a regular file",
+                ));
+            }
+            let file = file_from_handle(handle);
+            let mut permissions = file.metadata()?.permissions();
+            permissions.set_readonly(readonly);
+            file.set_permissions(permissions)
         }
 
         pub(super) fn atomic_write_relative<F>(
@@ -1442,6 +1617,32 @@ mod platform {
             ))
         }
 
+        pub(super) fn directory_exists_relative(&self, _rel: &str) -> io::Result<bool> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "secure relative filesystem access is unsupported on this platform",
+            ))
+        }
+
+        pub(super) fn lock_relative(&self, _rel: &str) -> io::Result<fs::File> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "secure filesystem locking is unsupported on this platform",
+            ))
+        }
+
+        pub(super) fn restore_permissions_relative(
+            &self,
+            _rel: &str,
+            _mode: u32,
+            _readonly: bool,
+        ) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "secure permission restoration is unsupported on this platform",
+            ))
+        }
+
         pub(super) fn atomic_write_relative<F>(
             &self,
             _rel: &str,
@@ -1555,6 +1756,18 @@ impl SafeDir {
 
     pub fn open_relative(&self, rel: &str) -> io::Result<Option<fs::File>> {
         self.0.open_relative(rel)
+    }
+
+    pub fn directory_exists_relative(&self, rel: &str) -> io::Result<bool> {
+        self.0.directory_exists_relative(rel)
+    }
+
+    pub fn lock_relative(&self, rel: &str) -> io::Result<fs::File> {
+        self.0.lock_relative(rel)
+    }
+
+    pub fn restore_permissions(&self, rel: &str, mode: u32, readonly: bool) -> io::Result<()> {
+        self.0.restore_permissions_relative(rel, mode, readonly)
     }
 
     pub fn atomic_write(
@@ -1755,6 +1968,18 @@ mod unix_tests {
         assert!(remove_regular(&root, "config.json").unwrap());
         assert!(!temp.path().join("config.json").exists());
         assert!(!remove_regular(&root, "config.json").unwrap());
+    }
+
+    #[test]
+    fn store_lock_never_follows_a_symlink_leaf() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        fs::write(root.join("outside"), b"KEEP").unwrap();
+        std::os::unix::fs::symlink(root.join("outside"), root.join(".sevra-pull.lock")).unwrap();
+        let held = SafeDir::open(&root).unwrap();
+
+        assert!(held.lock_relative(".sevra-pull.lock").is_err());
+        assert_eq!(fs::read(root.join("outside")).unwrap(), b"KEEP");
     }
 }
 

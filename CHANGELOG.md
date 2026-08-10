@@ -14,6 +14,13 @@
   inside the same write lease as the commit and returns typed
   `stale_baseline` before any durable mutation. `--force` is the explicit
   overwrite-newer-hosted-state path.
+- Integrity: in-place pull commits are recoverable across hard process death.
+  A per-store OS lock serializes push/pull; a bounded, path-validated journal
+  and private SHA-verified backups become durable before the first riding path
+  changes; `.sevra-sync.json` remains the last-write commit marker. The next
+  push or pull completes a committed cleanup or restores every old path and
+  transaction-created directory before its first hub request. Recovery first
+  validates the complete namespace and refuses to clobber a post-crash edit.
 
 - Security: the pre-upload secret gate now scans the exact manifest-bound
   bytes of declared assets up to an independent 8 MiB per-asset and 64 MiB

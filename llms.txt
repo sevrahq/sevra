@@ -39,7 +39,8 @@ Commands:
                                           # .sevra-sync.json (brain/feed/pack/path baseline)
     pull [dir] [--force]                  # refresh that clone. Refuses and names local
                                           # divergence before network access; --force is
-                                          # the explicit discard-local-work path.
+                                          # the explicit discard-local-work path. Hard-killed
+                                          # commits recover before the next network request.
     push <dir> --brain <id|slug> [--force] [--allow-secrets]
                                           # REPLACES the hosted store with <dir> (files absent
                                           # locally are removed); --force allows a shrinking

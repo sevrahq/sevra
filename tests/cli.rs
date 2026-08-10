@@ -2136,6 +2136,130 @@ fn pull_fetches_the_exact_advanced_snapshot_and_force_discards_local_edits() {
 }
 
 #[test]
+fn killed_pull_recovers_the_old_snapshot_before_its_next_request() {
+    let work = tempfile::tempdir().unwrap();
+    let (clone_base, _, clone_handle) = mock_hub(vec![(200, clone_snapshot(1, FEED_ONE, "alpha"))]);
+    sevra()
+        .args(["clone", "b", "brain"])
+        .current_dir(work.path())
+        .env("SEVRA_HUB_URL", &clone_base)
+        .env("SEVRA_API_KEY", "x")
+        .assert()
+        .success();
+    clone_handle.join().unwrap();
+
+    let mut files = vec![serde_json::json!({ "path": "a.md", "content": "remote beta" })];
+    for index in 0..128 {
+        files.push(serde_json::json!({
+            "path": format!("records/{index:04}.md"),
+            "content": format!("remote record {index}"),
+        }));
+    }
+    let snapshot = serde_json::json!({
+        "brain": "brain-1",
+        "slug": "b",
+        "headSeq": 2,
+        "feedHash": FEED_TWO,
+        "files": files,
+    })
+    .to_string();
+    let (pull_base, _, pull_handle) = mock_hub(vec![
+        (
+            200,
+            format!(r#"{{"id":"brain-1","slug":"b","headSeq":2,"feedHash":"{FEED_TWO}"}}"#),
+        ),
+        (200, snapshot),
+    ]);
+
+    let home = tempfile::tempdir().unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_sevra"))
+        .args(["pull", "brain"])
+        .current_dir(work.path())
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("SEVRA_NO_AUTO_UPDATE", "1")
+        .env("SEVRA_HUB_URL", &pull_base)
+        .env("SEVRA_API_KEY", "x")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let changed = work.path().join("brain/a.md");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if std::fs::read(&changed).is_ok_and(|bytes| bytes == b"remote beta") {
+            child.kill().unwrap();
+            break;
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("pull completed before the kill boundary: {status}");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pull never reached its first committed path"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    child.wait().unwrap();
+    pull_handle.join().unwrap();
+
+    let brain = work.path().join("brain");
+    let baseline: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(brain.join(".sevra-sync.json")).unwrap()).unwrap();
+    assert_eq!(baseline["headSeq"], 1, "the baseline is the commit marker");
+    assert!(
+        brain.join(".sevra-pull-journal.json").exists(),
+        "the durable journal survives process death"
+    );
+
+    let (recovery_base, recovery_log, recovery_handle) = mock_hub(vec![(
+        200,
+        format!(r#"{{"id":"brain-1","slug":"b","headSeq":1,"feedHash":"{FEED_ONE}"}}"#),
+    )]);
+    let recovery = sevra()
+        .args(["pull", "brain"])
+        .current_dir(work.path())
+        .env("SEVRA_HUB_URL", &recovery_base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(recovery.status.success(), "{}", all_output(&recovery));
+    assert!(
+        all_output(&recovery).contains("recovered an interrupted pull"),
+        "{}",
+        all_output(&recovery)
+    );
+    recovery_handle.join().unwrap();
+    assert_eq!(
+        recovery_log.lock().unwrap().len(),
+        1,
+        "recovery completes before the first head request"
+    );
+    assert_eq!(std::fs::read(brain.join("a.md")).unwrap(), b"alpha");
+    for index in 0..128 {
+        assert!(
+            !brain.join(format!("records/{index:04}.md")).exists(),
+            "partially installed path survived recovery"
+        );
+    }
+    assert!(
+        !brain.join("records").exists(),
+        "recovery removes transaction-created empty directories"
+    );
+    assert!(!brain.join(".sevra-pull-journal.json").exists());
+    assert!(
+        std::fs::read_dir(&brain).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".sevra-pull-backup-")
+        }),
+        "recovery removed its private backup directory"
+    );
+}
+
+#[test]
 fn cloned_push_sends_the_baseline_and_force_is_the_explicit_bypass() {
     for force in [false, true] {
         let work = tempfile::tempdir().unwrap();

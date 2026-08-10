@@ -45,6 +45,10 @@ const MAX_SECRET_VALUE_CHARS: usize = 4096;
 const MAX_SECRET_STDIN_BYTES: usize = MAX_SECRET_VALUE_CHARS * 4 + 2;
 const SYNC_BASELINE_FILE: &str = ".sevra-sync.json";
 const MAX_SYNC_BASELINE_BYTES: u64 = 16 * 1024 * 1024;
+const PULL_JOURNAL_FILE: &str = ".sevra-pull-journal.json";
+const PULL_BACKUP_PREFIX: &str = ".sevra-pull-backup-";
+const PULL_LOCK_FILE: &str = ".sevra-pull.lock";
+const MAX_PULL_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -56,6 +60,36 @@ struct SyncBaseline {
     feed_hash: Option<String>,
     pack_sha256: Option<String>,
     paths: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PullJournalPhase {
+    Preparing,
+    Ready,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PullJournalEntry {
+    path: String,
+    backup: Option<String>,
+    old_sha256: Option<String>,
+    old_mode: Option<u32>,
+    old_readonly: Option<bool>,
+    new_sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PullJournal {
+    version: u8,
+    phase: PullJournalPhase,
+    backup_dir: String,
+    previous_baseline_sha256: String,
+    next_baseline_sha256: String,
+    created_directories: Vec<String>,
+    entries: Vec<PullJournalEntry>,
 }
 
 struct PulledSnapshot {
@@ -1450,6 +1484,18 @@ pub fn push(
     }
     let root = std::fs::canonicalize(dir)
         .unwrap_or_else(|error| fail(&format!("could not resolve store directory: {error}"), None));
+    let held_root = crate::safe_path::SafeDir::open(&root).unwrap_or_else(|error| {
+        fail(
+            &format!("cannot securely hold store directory: {error}"),
+            None,
+        )
+    });
+    let _pull_lock = held_root
+        .lock_relative(PULL_LOCK_FILE)
+        .unwrap_or_else(|error| fail(&format!("cannot lock store sync state: {error}"), None));
+    if recover_pull_transaction(&held_root).unwrap_or_else(|error| fail(&error, None)) {
+        note("recovered an interrupted pull before reading the store");
+    }
     let prior_baseline = load_sync_baseline(&root).unwrap_or_else(|error| fail(&error, None));
     let (store, stats) = read_store_checked(dir, true);
     if store.files.is_empty() {
@@ -2726,28 +2772,11 @@ fn rollback_held_export(
                     .expect("existing backup retains permissions");
                 root.atomic_write(&backup.path, bytes, true, export_mode(permissions))
                     .and_then(|()| {
-                        // Unix mode restoration is descriptor-based and
-                        // meaningful. The atomic writer already fsyncs on
-                        // every platform. Reopening with GENERIC_READ on
-                        // Windows cannot call either SetFileInformation or
-                        // FlushFileBuffers, so a redundant post-commit sync
-                        // would turn a successful durable restore into
-                        // ERROR_ACCESS_DENIED.
-                        #[cfg(unix)]
-                        {
-                            let file = root.open_relative(&backup.path)?.ok_or_else(|| {
-                                std::io::Error::new(
-                                    std::io::ErrorKind::NotFound,
-                                    "restored file disappeared",
-                                )
-                            })?;
-                            file.set_permissions(permissions.clone())?;
-                            file.sync_all()
-                        }
-                        #[cfg(not(unix))]
-                        {
-                            Ok(())
-                        }
+                        root.restore_permissions(
+                            &backup.path,
+                            export_mode(permissions),
+                            permissions.readonly(),
+                        )
                     })
             }
             None => root.remove_regular(&backup.path).map(|_| ()),
@@ -2766,6 +2795,435 @@ fn rollback_held_export(
     } else {
         Err(errors.join("; "))
     }
+}
+
+fn pull_journal_bytes(journal: &PullJournal) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec_pretty(journal).expect("pull journal serializes");
+    bytes.push(b'\n');
+    bytes
+}
+
+fn validate_pull_journal(journal: PullJournal) -> Result<PullJournal, String> {
+    if journal.version != 1 {
+        return Err(format!(
+            "unsupported {PULL_JOURNAL_FILE} version {}",
+            journal.version
+        ));
+    }
+    let suffix = journal
+        .backup_dir
+        .strip_prefix(PULL_BACKUP_PREFIX)
+        .ok_or_else(|| format!("{PULL_JOURNAL_FILE} has an invalid backup directory"))?;
+    if suffix.len() != 32
+        || !suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(format!(
+            "{PULL_JOURNAL_FILE} has an invalid backup directory"
+        ));
+    }
+    if !canonical_sha256(&journal.previous_baseline_sha256)
+        || !canonical_sha256(&journal.next_baseline_sha256)
+        || journal.entries.is_empty()
+        || journal.entries.len() > MAX_STORE_FILES + 100_001
+    {
+        return Err(format!(
+            "{PULL_JOURNAL_FILE} has invalid transaction bounds"
+        ));
+    }
+
+    let mut paths = BTreeSet::new();
+    let mut directories = BTreeSet::new();
+    for directory in &journal.created_directories {
+        portable_export_components(directory)
+            .map_err(|_| format!("{PULL_JOURNAL_FILE} contains an unsafe created directory"))?;
+        if directory.starts_with(PULL_BACKUP_PREFIX)
+            || directory == PULL_JOURNAL_FILE
+            || directory == PULL_LOCK_FILE
+            || !directories.insert(directory.clone())
+        {
+            return Err(format!(
+                "{PULL_JOURNAL_FILE} contains an invalid created directory"
+            ));
+        }
+    }
+    let mut baseline_entry = None;
+    for (index, entry) in journal.entries.iter().enumerate() {
+        if entry.path != SYNC_BASELINE_FILE {
+            portable_export_components(&entry.path).map_err(|_| {
+                format!(
+                    "{PULL_JOURNAL_FILE} contains an unsafe path: {}",
+                    terminal_safe(&entry.path)
+                )
+            })?;
+        }
+        if entry.path == PULL_JOURNAL_FILE
+            || entry.path == PULL_LOCK_FILE
+            || entry.path.starts_with(PULL_BACKUP_PREFIX)
+            || !paths.insert(entry.path.clone())
+        {
+            return Err(format!(
+                "{PULL_JOURNAL_FILE} contains a duplicate or internal path"
+            ));
+        }
+        let old_complete = entry.backup.is_some()
+            && entry.old_sha256.as_deref().is_some_and(canonical_sha256)
+            && entry.old_mode.is_some()
+            && entry.old_readonly.is_some();
+        let old_empty = entry.backup.is_none()
+            && entry.old_sha256.is_none()
+            && entry.old_mode.is_none()
+            && entry.old_readonly.is_none();
+        if (!old_complete && !old_empty)
+            || entry.old_mode.is_some_and(|mode| mode > 0o7777)
+            || !entry.new_sha256.as_deref().is_none_or(canonical_sha256)
+            || (old_empty && entry.new_sha256.is_none())
+        {
+            return Err(format!(
+                "{PULL_JOURNAL_FILE} contains an invalid path state"
+            ));
+        }
+        if old_complete && entry.backup.as_deref() != Some(&format!("{index:08x}")) {
+            return Err(format!(
+                "{PULL_JOURNAL_FILE} contains an invalid backup address"
+            ));
+        }
+        if entry.path == SYNC_BASELINE_FILE {
+            baseline_entry = Some(entry);
+        }
+    }
+    let Some(baseline_entry) = baseline_entry else {
+        return Err(format!("{PULL_JOURNAL_FILE} has no baseline commit marker"));
+    };
+    if baseline_entry.old_sha256.as_deref() != Some(&journal.previous_baseline_sha256)
+        || baseline_entry.new_sha256.as_deref() != Some(&journal.next_baseline_sha256)
+    {
+        return Err(format!(
+            "{PULL_JOURNAL_FILE} baseline marker does not match its transaction"
+        ));
+    }
+    if journal.created_directories.iter().any(|directory| {
+        let prefix = format!("{directory}/");
+        !paths.iter().any(|path| path.starts_with(&prefix))
+    }) {
+        return Err(format!(
+            "{PULL_JOURNAL_FILE} names a directory outside its mutation paths"
+        ));
+    }
+    Ok(journal)
+}
+
+fn load_pull_journal(root: &crate::safe_path::SafeDir) -> Result<Option<PullJournal>, String> {
+    let Some(mut file) = root
+        .open_relative(PULL_JOURNAL_FILE)
+        .map_err(|error| format!("cannot securely open {PULL_JOURNAL_FILE}: {error}"))?
+    else {
+        return Ok(None);
+    };
+    let advertised = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect {PULL_JOURNAL_FILE}: {error}"))?
+        .len();
+    if advertised > MAX_PULL_JOURNAL_BYTES {
+        return Err(format!("{PULL_JOURNAL_FILE} exceeds its 64 MiB limit"));
+    }
+    let bytes = read_bounded(&mut file, MAX_PULL_JOURNAL_BYTES)
+        .map_err(|error| format!("cannot read {PULL_JOURNAL_FILE}: {error}"))?;
+    let journal: PullJournal = serde_json::from_slice(&bytes)
+        .map_err(|_| format!("{PULL_JOURNAL_FILE} is not valid recovery JSON"))?;
+    validate_pull_journal(journal).map(Some)
+}
+
+fn cleanup_pull_transaction(
+    root: &crate::safe_path::SafeDir,
+    journal: &PullJournal,
+) -> Result<(), String> {
+    let expected: BTreeSet<&str> = journal
+        .entries
+        .iter()
+        .filter_map(|entry| entry.backup.as_deref())
+        .collect();
+    let backup = match root.open_dir(std::ffi::OsStr::new(&journal.backup_dir)) {
+        Ok(backup) => Some(backup),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(format!(
+                "cannot securely open pull recovery directory: {error}"
+            ))
+        }
+    };
+    if let Some(backup) = backup {
+        for entry in backup
+            .entries()
+            .map_err(|error| format!("cannot inspect pull recovery directory: {error}"))?
+        {
+            let name = entry
+                .name
+                .to_str()
+                .ok_or_else(|| "pull recovery directory contains a non-UTF-8 entry".to_string())?;
+            if entry.kind != crate::safe_path::EntryKind::File || !expected.contains(name) {
+                return Err(
+                    "pull recovery directory contains an unexpected entry; refusing cleanup"
+                        .to_string(),
+                );
+            }
+            backup
+                .remove_regular(name)
+                .map_err(|error| format!("cannot remove pull recovery backup {name}: {error}"))?;
+        }
+        drop(backup);
+        root.remove_empty_dir(&journal.backup_dir)
+            .map_err(|error| format!("cannot remove pull recovery directory: {error}"))?;
+    }
+    root.remove_regular(PULL_JOURNAL_FILE)
+        .map_err(|error| format!("cannot remove {PULL_JOURNAL_FILE}: {error}"))?;
+    Ok(())
+}
+
+fn recover_ready_pull(
+    root: &crate::safe_path::SafeDir,
+    journal: &PullJournal,
+) -> Result<(), String> {
+    enum RecoveryAction {
+        Restore {
+            path: String,
+            bytes: Vec<u8>,
+            mode: u32,
+            readonly: bool,
+            current_exists: bool,
+        },
+        Remove(String),
+    }
+
+    let mut actions = Vec::new();
+    let mut backup_bytes = 0u64;
+    for entry in &journal.entries {
+        let current = held_file_state(root, &entry.path)?;
+        let current_sha = current
+            .as_ref()
+            .map(|(bytes, _, _)| format!("{:x}", Sha256::digest(bytes)));
+        if current_sha != entry.old_sha256 && current_sha != entry.new_sha256 {
+            return Err(format!(
+                "cannot recover interrupted pull because {} changed afterward; no files were restored",
+                terminal_safe(&entry.path)
+            ));
+        }
+        if let (Some(backup_name), Some(old_sha256), Some(mode), Some(readonly)) = (
+            entry.backup.as_deref(),
+            entry.old_sha256.as_deref(),
+            entry.old_mode,
+            entry.old_readonly,
+        ) {
+            let backup_path = format!("{}/{backup_name}", journal.backup_dir);
+            let Some(mut backup) = root
+                .open_relative(&backup_path)
+                .map_err(|error| format!("cannot securely open pull recovery backup: {error}"))?
+            else {
+                return Err(format!(
+                    "pull recovery backup is missing for {}",
+                    terminal_safe(&entry.path)
+                ));
+            };
+            let len = backup
+                .metadata()
+                .map_err(|error| format!("cannot inspect pull recovery backup: {error}"))?
+                .len();
+            if len > MAX_STORE_BYTES.saturating_sub(backup_bytes) {
+                return Err("pull recovery backups exceed the 512 MB transaction limit".into());
+            }
+            let bytes = read_bounded(&mut backup, MAX_STORE_BYTES - backup_bytes)
+                .map_err(|error| format!("cannot read pull recovery backup: {error}"))?;
+            backup_bytes += bytes.len() as u64;
+            if format!("{:x}", Sha256::digest(&bytes)) != old_sha256 {
+                return Err(format!(
+                    "pull recovery backup failed verification for {}",
+                    terminal_safe(&entry.path)
+                ));
+            }
+            actions.push(RecoveryAction::Restore {
+                path: entry.path.clone(),
+                bytes,
+                mode,
+                readonly,
+                current_exists: current.is_some(),
+            });
+        } else if current.is_some() {
+            actions.push(RecoveryAction::Remove(entry.path.clone()));
+        }
+    }
+
+    for action in actions.into_iter().rev() {
+        match action {
+            RecoveryAction::Restore {
+                path,
+                bytes,
+                mode,
+                readonly,
+                current_exists,
+            } => {
+                let restored = if current_exists {
+                    root.atomic_write(&path, &bytes, true, mode)
+                } else {
+                    root.atomic_create(&path, &bytes, true, mode)
+                };
+                restored.map_err(|error| {
+                    format!(
+                        "could not restore {} from interrupted pull: {error}",
+                        terminal_safe(&path)
+                    )
+                })?;
+                root.restore_permissions(&path, mode, readonly)
+                    .map_err(|error| format!("could not restore recovered mode: {error}"))?;
+            }
+            RecoveryAction::Remove(path) => {
+                root.remove_regular(&path).map_err(|error| {
+                    format!(
+                        "could not remove {} from interrupted pull: {error}",
+                        terminal_safe(&path)
+                    )
+                })?;
+            }
+        }
+    }
+    for directory in journal.created_directories.iter().rev() {
+        match root.remove_empty_dir(directory) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                // A post-crash local write owns the directory now. Its paths
+                // were already rejected above if they collided with a riding
+                // mutation, so keep the non-empty directory intact.
+            }
+            Err(error) => {
+                return Err(format!(
+                    "could not clean created directory {} after interrupted pull: {error}",
+                    terminal_safe(directory)
+                ))
+            }
+        }
+    }
+    cleanup_pull_transaction(root, journal)
+}
+
+fn recover_pull_transaction(root: &crate::safe_path::SafeDir) -> Result<bool, String> {
+    let Some(journal) = load_pull_journal(root)? else {
+        return Ok(false);
+    };
+    if journal.phase == PullJournalPhase::Preparing {
+        cleanup_pull_transaction(root, &journal)?;
+        return Ok(true);
+    }
+    let Some((baseline, _, _)) = held_file_state(root, SYNC_BASELINE_FILE)? else {
+        return Err(format!(
+            "cannot recover interrupted pull because {SYNC_BASELINE_FILE} is missing"
+        ));
+    };
+    let baseline_sha256 = format!("{:x}", Sha256::digest(&baseline));
+    if baseline_sha256 == journal.next_baseline_sha256
+        && journal.next_baseline_sha256 != journal.previous_baseline_sha256
+    {
+        cleanup_pull_transaction(root, &journal)?;
+        return Ok(true);
+    }
+    if baseline_sha256 != journal.previous_baseline_sha256 {
+        return Err(format!(
+            "cannot recover interrupted pull because {SYNC_BASELINE_FILE} changed afterward"
+        ));
+    }
+    recover_ready_pull(root, &journal)?;
+    Ok(true)
+}
+
+fn prepare_pull_transaction(
+    root: &crate::safe_path::SafeDir,
+    backups: &[ExportBackup],
+    new_sha256: &[Option<String>],
+    created_directories: Vec<String>,
+) -> Result<PullJournal, String> {
+    if backups.len() != new_sha256.len() {
+        return Err("internal pull transaction state is inconsistent".to_string());
+    }
+    let mut random = [0_u8; 16];
+    getrandom::getrandom(&mut random)
+        .map_err(|_| "operating-system randomness unavailable".to_string())?;
+    let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+    let backup_dir = format!("{PULL_BACKUP_PREFIX}{suffix}");
+    let entries: Vec<PullJournalEntry> = backups
+        .iter()
+        .zip(new_sha256)
+        .enumerate()
+        .map(|(index, (backup, new_sha256))| PullJournalEntry {
+            path: backup.path.clone(),
+            backup: backup.bytes.as_ref().map(|_| format!("{index:08x}")),
+            old_sha256: backup
+                .bytes
+                .as_ref()
+                .map(|bytes| format!("{:x}", Sha256::digest(bytes))),
+            old_mode: backup.permissions.as_ref().map(export_mode),
+            old_readonly: backup
+                .permissions
+                .as_ref()
+                .map(std::fs::Permissions::readonly),
+            new_sha256: new_sha256.clone(),
+        })
+        .collect();
+    let baseline = entries
+        .iter()
+        .find(|entry| entry.path == SYNC_BASELINE_FILE)
+        .ok_or_else(|| "pull transaction has no baseline commit marker".to_string())?;
+    let mut journal = validate_pull_journal(PullJournal {
+        version: 1,
+        phase: PullJournalPhase::Preparing,
+        backup_dir,
+        previous_baseline_sha256: baseline
+            .old_sha256
+            .clone()
+            .ok_or_else(|| "pull transaction baseline disappeared".to_string())?,
+        next_baseline_sha256: baseline
+            .new_sha256
+            .clone()
+            .ok_or_else(|| "pull transaction has no next baseline".to_string())?,
+        created_directories,
+        entries,
+    })?;
+    root.atomic_create(
+        PULL_JOURNAL_FILE,
+        &pull_journal_bytes(&journal),
+        false,
+        0o600,
+    )
+    .map_err(|error| format!("cannot create durable pull journal: {error}"))?;
+
+    let prepared = (|| -> Result<(), String> {
+        let backup_dir = root
+            .create_dir(&journal.backup_dir, 0o700)
+            .map_err(|error| format!("cannot create pull recovery directory: {error}"))?;
+        for (entry, backup) in journal.entries.iter().zip(backups) {
+            if let (Some(name), Some(bytes)) = (entry.backup.as_deref(), backup.bytes.as_ref()) {
+                backup_dir
+                    .atomic_create(name, bytes, false, 0o600)
+                    .map_err(|error| format!("cannot persist pull recovery backup: {error}"))?;
+            }
+        }
+        drop(backup_dir);
+        journal.phase = PullJournalPhase::Ready;
+        root.atomic_write(
+            PULL_JOURNAL_FILE,
+            &pull_journal_bytes(&journal),
+            false,
+            0o600,
+        )
+        .map_err(|error| format!("cannot arm durable pull journal: {error}"))
+    })();
+    if let Err(error) = prepared {
+        return match cleanup_pull_transaction(root, &journal) {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(format!(
+                "{error}; pull recovery metadata cleanup also failed: {cleanup}"
+            )),
+        };
+    }
+    Ok(journal)
 }
 
 fn install_complete_export(
@@ -3546,6 +4004,18 @@ pub fn pull(cfg: &Config, dir: Option<String>, force: bool) {
     let dir = dir.unwrap_or_else(|| ".".to_string());
     let root = std::fs::canonicalize(&dir)
         .unwrap_or_else(|error| fail(&format!("cannot open pull directory {dir}: {error}"), None));
+    let held_root = crate::safe_path::SafeDir::open(&root).unwrap_or_else(|error| {
+        fail(
+            &format!("cannot securely hold pull directory: {error}"),
+            None,
+        )
+    });
+    let _pull_lock = held_root
+        .lock_relative(PULL_LOCK_FILE)
+        .unwrap_or_else(|error| fail(&format!("cannot lock pull state: {error}"), None));
+    if recover_pull_transaction(&held_root).unwrap_or_else(|error| fail(&error, None)) {
+        note("recovered an interrupted pull before checking the hub");
+    }
     let baseline = load_sync_baseline(&root)
         .unwrap_or_else(|error| fail(&error, None))
         .unwrap_or_else(|| {
@@ -3645,12 +4115,6 @@ pub fn pull(cfg: &Config, dir: Option<String>, force: bool) {
         .into_iter()
         .filter(|asset| path_rides(scope.as_ref(), &asset.path))
         .collect();
-    let held_root = crate::safe_path::SafeDir::open(&root).unwrap_or_else(|error| {
-        fail(
-            &format!("cannot securely hold pull directory: {error}"),
-            None,
-        )
-    });
     let mut prepared =
         crate::assets::prepare_restore(cfg, &baseline.brain_id, Some(&held_root), &riding_assets)
             .unwrap_or_else(|error| fail(&error, None));
@@ -3673,9 +4137,46 @@ pub fn pull(cfg: &Config, dir: Option<String>, force: bool) {
             .map(String::as_str),
     )
     .unwrap_or_else(|error| fail(&error, None));
+    let created_directories: Vec<String> = parent_directories(mutation_paths.iter().cloned())
+        .into_iter()
+        .filter(|directory| {
+            !held_root
+                .directory_exists_relative(directory)
+                .unwrap_or_else(|error| {
+                    fail(
+                        &format!(
+                            "cannot securely inspect pull directory {}: {error}",
+                            terminal_safe(directory)
+                        ),
+                        None,
+                    )
+                })
+        })
+        .collect();
     let backups = snapshot_held_destinations(&held_root, &mutation_paths)
         .unwrap_or_else(|error| fail(&error, None));
-    install_complete_export(
+    let riding_asset_hashes: BTreeMap<&str, &str> = riding_assets
+        .iter()
+        .map(|asset| (asset.path.as_str(), asset.sha256.as_str()))
+        .collect();
+    let mut mutation_sha256: Vec<Option<String>> = entries
+        .iter()
+        .map(|(_, content)| Some(format!("{:x}", Sha256::digest(content))))
+        .collect();
+    mutation_sha256.extend(pending_assets.iter().map(|path| {
+        Some(
+            riding_asset_hashes
+                .get(path.as_str())
+                .expect("pending asset came from riding declarations")
+                .to_string(),
+        )
+    }));
+    mutation_sha256.extend(remove_paths.iter().map(|_| None));
+    mutation_sha256.push(Some(format!("{:x}", Sha256::digest(&baseline_entry.1))));
+    let journal =
+        prepare_pull_transaction(&held_root, &backups, &mutation_sha256, created_directories)
+            .unwrap_or_else(|error| fail(&error, None));
+    let install = install_complete_export(
         &held_root,
         &entries,
         &mut prepared,
@@ -3683,8 +4184,25 @@ pub fn pull(cfg: &Config, dir: Option<String>, force: bool) {
         Vec::new(),
         &remove_paths,
         Some(&baseline_entry),
-    )
-    .unwrap_or_else(|error| fail(&error, None));
+    );
+    if let Err(error) = install {
+        let recovery = recover_pull_transaction(&held_root);
+        match recovery {
+            Ok(_) => fail(&error, None),
+            Err(recovery_error) => fail(
+                &format!("{error}; durable pull recovery also failed: {recovery_error}"),
+                None,
+            ),
+        }
+    }
+    cleanup_pull_transaction(&held_root, &journal).unwrap_or_else(|error| {
+        fail(
+            &format!(
+                "pull committed, but recovery metadata cleanup failed: {error}; rerun pull to finish cleanup"
+            ),
+            None,
+        )
+    });
 
     let restore = prepared.report();
     let mut data = snapshot.response.as_object().cloned().unwrap_or_default();
@@ -4703,6 +5221,102 @@ mod tests {
             std::fs::read(root_path.join("existing.md")).unwrap(),
             b"CONCURRENT"
         );
+    }
+
+    #[test]
+    fn durable_pull_recovery_preflights_every_path_before_restoring_any() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = std::fs::canonicalize(temp.path()).unwrap();
+        std::fs::write(root_path.join("a.md"), b"OLD-A").unwrap();
+        std::fs::write(root_path.join("b.md"), b"OLD-B").unwrap();
+        std::fs::write(root_path.join(SYNC_BASELINE_FILE), b"OLD-BASELINE").unwrap();
+        let held = crate::safe_path::SafeDir::open(&root_path).unwrap();
+        let paths = vec![
+            "a.md".to_string(),
+            "b.md".to_string(),
+            SYNC_BASELINE_FILE.to_string(),
+        ];
+        let backups = snapshot_held_destinations(&held, &paths).unwrap();
+        let next = vec![
+            Some(format!("{:x}", Sha256::digest(b"NEW-A"))),
+            Some(format!("{:x}", Sha256::digest(b"NEW-B"))),
+            Some(format!("{:x}", Sha256::digest(b"NEW-BASELINE"))),
+        ];
+        prepare_pull_transaction(&held, &backups, &next, Vec::new()).unwrap();
+        held.atomic_write("a.md", b"NEW-A", false, 0o600).unwrap();
+        held.atomic_write("b.md", b"POST-CRASH-LOCAL-EDIT", false, 0o600)
+            .unwrap();
+
+        let error = recover_pull_transaction(&held).unwrap_err();
+        assert!(error.contains("b.md changed afterward"), "{error}");
+        assert_eq!(
+            std::fs::read(root_path.join("a.md")).unwrap(),
+            b"NEW-A",
+            "recovery validates the complete namespace before restoring a.md"
+        );
+        assert_eq!(
+            std::fs::read(root_path.join("b.md")).unwrap(),
+            b"POST-CRASH-LOCAL-EDIT",
+            "recovery never clobbers a post-crash edit"
+        );
+        assert!(root_path.join(PULL_JOURNAL_FILE).exists());
+    }
+
+    #[test]
+    fn durable_pull_recovery_keeps_a_transaction_whose_baseline_committed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = std::fs::canonicalize(temp.path()).unwrap();
+        std::fs::write(root_path.join("a.md"), b"OLD-A").unwrap();
+        std::fs::write(root_path.join(SYNC_BASELINE_FILE), b"OLD-BASELINE").unwrap();
+        let held = crate::safe_path::SafeDir::open(&root_path).unwrap();
+        let paths = vec!["a.md".to_string(), SYNC_BASELINE_FILE.to_string()];
+        let backups = snapshot_held_destinations(&held, &paths).unwrap();
+        let next = vec![
+            Some(format!("{:x}", Sha256::digest(b"NEW-A"))),
+            Some(format!("{:x}", Sha256::digest(b"NEW-BASELINE"))),
+        ];
+        prepare_pull_transaction(&held, &backups, &next, Vec::new()).unwrap();
+        held.atomic_write("a.md", b"NEW-A", false, 0o600).unwrap();
+        held.atomic_write(SYNC_BASELINE_FILE, b"NEW-BASELINE", false, 0o600)
+            .unwrap();
+
+        assert!(recover_pull_transaction(&held).unwrap());
+        assert_eq!(std::fs::read(root_path.join("a.md")).unwrap(), b"NEW-A");
+        assert_eq!(
+            std::fs::read(root_path.join(SYNC_BASELINE_FILE)).unwrap(),
+            b"NEW-BASELINE"
+        );
+        assert!(!root_path.join(PULL_JOURNAL_FILE).exists());
+        assert!(std::fs::read_dir(&root_path).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(PULL_BACKUP_PREFIX)
+        }));
+    }
+
+    #[test]
+    fn pull_journal_rejects_paths_outside_its_private_namespace() {
+        let sha = "1".repeat(64);
+        let journal = PullJournal {
+            version: 1,
+            phase: PullJournalPhase::Ready,
+            backup_dir: format!("{PULL_BACKUP_PREFIX}{}", "a".repeat(32)),
+            previous_baseline_sha256: sha.clone(),
+            next_baseline_sha256: sha.clone(),
+            created_directories: vec!["../outside".to_string()],
+            entries: vec![PullJournalEntry {
+                path: SYNC_BASELINE_FILE.to_string(),
+                backup: Some("00000000".to_string()),
+                old_sha256: Some(sha.clone()),
+                old_mode: Some(0o600),
+                old_readonly: Some(false),
+                new_sha256: Some(sha),
+            }],
+        };
+        let error = validate_pull_journal(journal).unwrap_err();
+        assert!(error.contains("unsafe created directory"), "{error}");
     }
 
     #[cfg(unix)]
