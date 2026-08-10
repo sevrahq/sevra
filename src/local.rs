@@ -215,6 +215,28 @@ pub fn append_entries(raw: &str, new_entries: &[String]) -> String {
     out
 }
 
+/// Remove only exact entries previously emitted by [`entry_for`]. Comments,
+/// blank lines, broad user-authored globs, line endings, and every unrelated
+/// byte remain untouched. `secrets adopt` uses this after all plaintext has
+/// been replaced; a broad glob is never weakened implicitly.
+pub fn remove_exact_entries(
+    raw: &str,
+    entries: &std::collections::BTreeSet<String>,
+) -> (String, usize) {
+    let mut out = String::with_capacity(raw.len());
+    let mut removed = 0usize;
+    for segment in raw.split_inclusive('\n') {
+        let without_lf = segment.strip_suffix('\n').unwrap_or(segment);
+        let line = without_lf.strip_suffix('\r').unwrap_or(without_lf);
+        if entries.contains(line) {
+            removed += 1;
+        } else {
+            out.push_str(segment);
+        }
+    }
+    (out, removed)
+}
+
 /// An exact path as a `.sevralocal` entry: verbatim when it carries no glob
 /// metacharacter, else with each metacharacter wrapped in a one-character
 /// class (`[*]`) so the entry matches the literal file instead of
@@ -358,6 +380,17 @@ mod tests {
         assert!(s.keeps_home("notes/one.md"));
         assert!(!s.keeps_home("notes/two.md"));
         assert!(!s.keeps_home("# keep these home"));
+    }
+
+    #[test]
+    fn exact_entry_removal_preserves_comments_globs_and_line_endings() {
+        let entries = ["sources/one.md".to_string(), "records/two.md".to_string()]
+            .into_iter()
+            .collect();
+        let raw = "# keep\r\nsources/one.md\r\nsources/**\n\nrecords/two.md";
+        let (next, removed) = remove_exact_entries(raw, &entries);
+        assert_eq!(removed, 2);
+        assert_eq!(next, "# keep\r\nsources/**\n\n");
     }
 
     #[test]

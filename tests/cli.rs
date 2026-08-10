@@ -4,6 +4,7 @@
 //! the platform repo's hub-demo battery driven with SEVRA_BIN.
 
 use assert_cmd::Command;
+use base64::Engine as _;
 use predicates::prelude::*;
 use sha2::{Digest, Sha256};
 
@@ -280,7 +281,10 @@ fn secrets_help_lists_actions_and_hides_the_argv_trap() {
                 .and(predicate::str::contains("set"))
                 .and(predicate::str::contains("get"))
                 .and(predicate::str::contains("rm"))
-                .and(predicate::str::contains("delete")),
+                .and(predicate::str::contains("delete"))
+                .and(predicate::str::contains("scan"))
+                .and(predicate::str::contains("quarantine"))
+                .and(predicate::str::contains("adopt")),
         );
     // The hidden traps must not advertise a value positional in usage.
     sevra()
@@ -1111,6 +1115,39 @@ fn store_dir(files: &[(&str, &str)]) -> tempfile::TempDir {
     t
 }
 
+fn add_adopt_baseline(root: &std::path::Path) {
+    let baseline = serde_json::json!({
+        "version": 1,
+        "brainId": "brain-1",
+        "brainSlug": "b",
+        "headSeq": 0,
+        "feedHash": null,
+        "packSha256": null,
+        "paths": {},
+    });
+    std::fs::write(
+        root.join(".sevra-sync.json"),
+        format!("{}\n", serde_json::to_string_pretty(&baseline).unwrap()),
+    )
+    .unwrap();
+}
+
+fn note_markdown(body: &str) -> String {
+    format!(
+        "---\ntype: note\nid: 01kxrwrfj75t95dccf2vqekzw3\ncreated: 2026-08-10T00:00:00Z\nupdated: 2026-08-10T00:00:00Z\nsummary: Synthetic adoption fixture\n---\n{body}\n"
+    )
+}
+
+fn operational_markdown(body: &str) -> String {
+    format!(
+        "---\ntype: integration\nmeta-type: operational\nid: 01kxrww75p5mnhgammsgvzj11c\ncreated: 2026-08-10T00:00:00Z\nupdated: 2026-08-10T00:00:00Z\nsummary: Synthetic workflow record\n---\n{body}\n"
+    )
+}
+
+fn canonical_base64(value: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(value)
+}
+
 #[test]
 fn push_help_states_replacement_and_the_new_flags() {
     sevra().args(["push", "--help"]).assert().success().stdout(
@@ -1256,12 +1293,13 @@ fn push_refuses_secrets_before_any_request_and_never_echoes_them() {
         !all.contains("hub unreachable"),
         "the scan must refuse before any request: {all}"
     );
-    // The three exits, in order: keep home · edit · override.
+    // The exits, in order: adopt · whole-file quarantine · edit · override.
+    let adopt = all.find("secrets adopt").expect("names adopt");
     let quarantine = all.find("secrets quarantine").expect("names quarantine");
-    let edit = all.find("edit the files").expect("names the edit path");
+    let edit = all.find("edit deliberately").expect("names the edit path");
     let allow = all.find("--allow-secrets").expect("names the override");
     assert!(
-        quarantine < edit && edit < allow,
+        adopt < quarantine && quarantine < edit && edit < allow,
         "exits out of order: {all}"
     );
 }
@@ -2039,6 +2077,389 @@ fn secrets_quarantine_closure_without_dbmd_fails_before_writing() {
         !t.path().join(".sevralocal").exists(),
         "a missing dbmd must fail before anything is written"
     );
+}
+
+// --- secrets adopt: vault-first, resumable migration -------------------------
+
+#[test]
+fn secrets_adopt_deduplicates_rewrites_and_unquarantines_exact_paths() {
+    let first = format!("sk-proj-{}", "a".repeat(24));
+    let second = format!("ghp_{}", "b".repeat(36));
+    let source = note_markdown(&format!("api_key: {first}\nagain: {first}"));
+    let record = operational_markdown(&format!(
+        "api_key: {second}\nevidence: [[sources/evidence]]\napi_key: {first}"
+    ));
+    let t = store_dir(&[
+        ("sources/evidence.md", &source),
+        ("records/config.md", &record),
+        (
+            ".sevralocal",
+            "# exact quarantines from scan\nsources/evidence.md\nrecords/config.md\n",
+        ),
+    ]);
+    add_adopt_baseline(t.path());
+    let (base, log, handle) = mock_hub(vec![
+        (201, r#"{"ok":true,"created":true}"#.to_string()),
+        (201, r#"{"ok":true,"created":true}"#.to_string()),
+    ]);
+    let out = sevra()
+        .args(["secrets", "adopt", t.path().to_str().unwrap(), "--json"])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", MOCK_KEY)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", all_output(&out));
+    let shown = all_output(&out);
+    assert!(
+        !shown.contains(&first) && !shown.contains(&second),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("immutable evidence"),
+        "source warning: {shown}"
+    );
+    let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["distinctValues"], 2);
+    assert_eq!(result["replacements"], 4);
+    assert_eq!(result["unquarantinedEntries"], 2);
+
+    handle.join().unwrap();
+    let reqs = log.lock().unwrap();
+    assert_eq!(reqs.len(), 2, "same value is committed only once");
+    assert!(reqs.iter().all(|request| {
+        request.method == "POST" && request.path == "/api/hub/brains/brain-1/vault"
+    }));
+    let mut names = reqs
+        .iter()
+        .map(|request| {
+            serde_json::from_str::<serde_json::Value>(&request.body).unwrap()["name"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names.len(), 2);
+    assert!(names.iter().any(|name| name == "API_KEY"));
+    assert!(names.iter().any(|name| name.starts_with("API_KEY_")));
+    drop(reqs);
+
+    for path in ["sources/evidence.md", "records/config.md"] {
+        let content = std::fs::read_to_string(t.path().join(path)).unwrap();
+        assert!(!content.contains(&first) && !content.contains(&second));
+        assert!(content.contains("redacted: ["), "{path}: {content}");
+        assert!(content.contains("$API_KEY"), "{path}: {content}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(t.path().join(".sevralocal")).unwrap(),
+        "# exact quarantines from scan\n"
+    );
+    assert!(!t.path().join(".sevra-adopt.json").exists());
+
+    // A completed migration is idempotent and needs no hub round trip.
+    let rerun = sevra()
+        .args(["secrets", "adopt", t.path().to_str().unwrap()])
+        .env("SEVRA_HUB_URL", "http://localhost:9")
+        .env("SEVRA_API_KEY", MOCK_KEY)
+        .output()
+        .unwrap();
+    assert!(rerun.status.success(), "{}", all_output(&rerun));
+    assert!(all_output(&rerun).contains("no adoptable markdown credentials remain"));
+}
+
+#[test]
+fn secrets_adopt_kill_between_vault_and_file_is_safely_resumable() {
+    let token = format!("sk-proj-{}", "c".repeat(24));
+    let markdown = note_markdown(&format!("api_key: {token}"));
+    let t = store_dir(&[
+        ("sources/credential.md", &markdown),
+        (".sevralocal", "sources/credential.md\n"),
+    ]);
+    add_adopt_baseline(t.path());
+
+    let (first_base, first_log, first_handle) =
+        mock_hub(vec![(201, r#"{"ok":true,"created":true}"#.to_string())]);
+    let first = sevra()
+        .args(["secrets", "adopt", t.path().to_str().unwrap()])
+        .env("SEVRA_HUB_URL", &first_base)
+        .env("SEVRA_API_KEY", MOCK_KEY)
+        .env("SEVRA_TEST_ADOPT_EXIT_AFTER_VAULT", "1")
+        .output()
+        .unwrap();
+    assert_eq!(first.status.code(), Some(86), "{}", all_output(&first));
+    first_handle.join().unwrap();
+    assert_eq!(first_log.lock().unwrap().len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(t.path().join("sources/credential.md")).unwrap(),
+        markdown,
+        "vault commit happens before the first literal is removed"
+    );
+    assert!(t.path().join(".sevra-adopt.json").exists());
+    assert_eq!(
+        std::fs::read_to_string(t.path().join(".sevralocal")).unwrap(),
+        "sources/credential.md\n"
+    );
+
+    let encoded = canonical_base64(token.as_bytes());
+    let (resume_base, resume_log, resume_handle) = mock_hub(vec![
+        (
+            409,
+            r#"{"error":"exists","code":"vault_item_exists"}"#.to_string(),
+        ),
+        (
+            200,
+            format!(r#"{{"name":"API_KEY","valueBase64":"{encoded}"}}"#),
+        ),
+    ]);
+    let resumed = sevra()
+        .args(["secrets", "adopt", t.path().to_str().unwrap()])
+        .env("SEVRA_HUB_URL", &resume_base)
+        .env("SEVRA_API_KEY", MOCK_KEY)
+        .output()
+        .unwrap();
+    assert!(resumed.status.success(), "{}", all_output(&resumed));
+    assert!(!all_output(&resumed).contains(&token));
+    resume_handle.join().unwrap();
+    let reqs = resume_log.lock().unwrap();
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(reqs[0].method, "POST");
+    assert_eq!(reqs[1].method, "GET");
+    drop(reqs);
+    let content = std::fs::read_to_string(t.path().join("sources/credential.md")).unwrap();
+    assert!(!content.contains(&token));
+    assert!(content.contains("$API_KEY"));
+    assert!(!t.path().join(".sevra-adopt.json").exists());
+}
+
+#[test]
+fn secrets_adopt_resumes_after_one_of_several_files_was_rewritten() {
+    let token = format!("sk-proj-{}", "d".repeat(24));
+    let first_markdown = operational_markdown(&format!("api_key: {token}"));
+    let second_markdown = note_markdown(&format!("api_key: {token}"));
+    let t = store_dir(&[
+        ("records/a.md", &first_markdown),
+        ("sources/b.md", &second_markdown),
+        (".sevralocal", "records/a.md\nsources/b.md\n"),
+    ]);
+    add_adopt_baseline(t.path());
+    let (first_base, _, first_handle) =
+        mock_hub(vec![(201, r#"{"ok":true,"created":true}"#.to_string())]);
+    let first = sevra()
+        .args(["secrets", "adopt", t.path().to_str().unwrap()])
+        .env("SEVRA_HUB_URL", &first_base)
+        .env("SEVRA_API_KEY", MOCK_KEY)
+        .env("SEVRA_TEST_ADOPT_EXIT_AFTER_FILE", "1")
+        .output()
+        .unwrap();
+    assert_eq!(first.status.code(), Some(87), "{}", all_output(&first));
+    first_handle.join().unwrap();
+    let states = ["records/a.md", "sources/b.md"].map(|path| {
+        std::fs::read_to_string(t.path().join(path))
+            .unwrap()
+            .contains(&token)
+    });
+    assert_ne!(states[0], states[1], "exactly one file was committed");
+
+    let encoded = canonical_base64(token.as_bytes());
+    let (resume_base, _, resume_handle) = mock_hub(vec![
+        (
+            409,
+            r#"{"error":"exists","code":"vault_item_exists"}"#.to_string(),
+        ),
+        (
+            200,
+            format!(r#"{{"name":"API_KEY","valueBase64":"{encoded}"}}"#),
+        ),
+    ]);
+    let resumed = sevra()
+        .args(["secrets", "adopt", t.path().to_str().unwrap()])
+        .env("SEVRA_HUB_URL", &resume_base)
+        .env("SEVRA_API_KEY", MOCK_KEY)
+        .output()
+        .unwrap();
+    assert!(resumed.status.success(), "{}", all_output(&resumed));
+    resume_handle.join().unwrap();
+    for path in ["records/a.md", "sources/b.md"] {
+        let content = std::fs::read_to_string(t.path().join(path)).unwrap();
+        assert!(!content.contains(&token));
+        assert!(content.contains("$API_KEY"));
+    }
+    assert!(!t.path().join(".sevra-adopt.json").exists());
+}
+
+#[test]
+fn secrets_adopt_never_overwrites_a_different_existing_vault_value() {
+    let token = format!("sk-proj-{}", "e".repeat(24));
+    let other = format!("sk-proj-{}", "f".repeat(24));
+    let markdown = operational_markdown(&format!("api_key: {token}"));
+    let t = store_dir(&[("records/config.md", &markdown)]);
+    add_adopt_baseline(t.path());
+    let hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+    let expected = format!("API_KEY_{}", &hash[..8]);
+    let (base, log, handle) = mock_hub(vec![
+        (
+            409,
+            r#"{"error":"exists","code":"vault_item_exists"}"#.to_string(),
+        ),
+        (
+            200,
+            format!(
+                r#"{{"name":"API_KEY","valueBase64":"{}"}}"#,
+                canonical_base64(other.as_bytes())
+            ),
+        ),
+        (201, r#"{"ok":true,"created":true}"#.to_string()),
+    ]);
+    let out = sevra()
+        .args(["secrets", "adopt", t.path().to_str().unwrap()])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", MOCK_KEY)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", all_output(&out));
+    handle.join().unwrap();
+    let reqs = log.lock().unwrap();
+    let first: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+    let retry: serde_json::Value = serde_json::from_str(&reqs[2].body).unwrap();
+    assert_eq!(first["name"], "API_KEY");
+    assert_eq!(retry["name"], expected);
+    assert_eq!(reqs[1].path, "/api/hub/brains/brain-1/vault?name=API_KEY");
+    drop(reqs);
+    let content = std::fs::read_to_string(t.path().join("records/config.md")).unwrap();
+    assert!(content.contains(&format!("${expected}")));
+    assert!(!content.contains(&token));
+}
+
+#[test]
+fn secrets_adopt_refuses_asset_hits_before_vault_access() {
+    let token = format!("ghp_{}", "g".repeat(36));
+    let hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+    let manifest = format!(
+        "{{\"path\":\"_files/secret.txt\",\"sha256\":\"{hash}\",\"bytes\":{}}}\n",
+        token.len()
+    );
+    let clean = operational_markdown("no credential here");
+    let t = store_dir(&[
+        ("records/clean.md", &clean),
+        ("assets.jsonl", &manifest),
+        ("_files/secret.txt", &token),
+    ]);
+    add_adopt_baseline(t.path());
+    let (base, log, handle) = mock_hub(vec![]);
+    let out = sevra()
+        .args(["secrets", "adopt", t.path().to_str().unwrap()])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", MOCK_KEY)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let shown = all_output(&out);
+    assert!(
+        shown.contains("outside editable markdown content"),
+        "{shown}"
+    );
+    assert!(!shown.contains(&token), "asset value leaked: {shown}");
+    handle.join().unwrap();
+    assert!(log.lock().unwrap().is_empty());
+    assert!(!t.path().join(".sevra-adopt.json").exists());
+}
+
+#[test]
+fn secrets_adopt_refuses_an_oversized_pem_before_vault_access() {
+    let pem = format!(
+        "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----",
+        "A".repeat(256 * 1024)
+    );
+    let markdown = note_markdown(&format!("private_key: {pem}"));
+    let t = store_dir(&[("sources/key.md", &markdown)]);
+    add_adopt_baseline(t.path());
+    let (base, log, handle) = mock_hub(vec![]);
+    let out = sevra()
+        .args(["secrets", "adopt", t.path().to_str().unwrap()])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", MOCK_KEY)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let shown = all_output(&out);
+    assert!(
+        shown.contains("above the 262144-byte vault item limit"),
+        "{shown}"
+    );
+    assert!(!shown.contains("AAAAAAAA"), "PEM bytes leaked: {shown}");
+    handle.join().unwrap();
+    assert!(log.lock().unwrap().is_empty());
+    assert!(!t.path().join(".sevra-adopt.json").exists());
+}
+
+#[test]
+fn workflow_shaped_adopt_then_push_has_zero_dangling_source_links() {
+    let token = format!("sk-proj-{}", "h".repeat(24));
+    let db = "---\ntype: db-md\nscope: synthetic-adopt\nowner: test@sevrahq.com\n---\n\n# Synthetic adoption brain\n";
+    let source = note_markdown(&format!("api_key: {token}\nImported workflow evidence."));
+    let t = store_dir(&[
+        ("DB.md", db),
+        ("sources/import.md", &source),
+        (".sevralocal", "sources/import.md\n"),
+    ]);
+    // Workflowy-shaped means one quarantined source with broad fan-in. Keep
+    // the fixture generated and synthetic: enough edges to exercise the same
+    // topology without ever touching the founder's real brain.
+    std::fs::create_dir_all(t.path().join("records/workflows")).unwrap();
+    for index in 0..512 {
+        let title = format!("Workflow item {index:04}");
+        let record = format!(
+            "---\ntype: workflow\nmeta-type: operational\ncreated: 2026-08-10T00:00:00Z\nupdated: 2026-08-10T00:00:00Z\nsummary: {title}\n---\n{title}. Evidence: [[sources/import]].\n"
+        );
+        std::fs::write(
+            t.path().join(format!("records/workflows/{index:04}.md")),
+            record,
+        )
+        .unwrap();
+    }
+    add_adopt_baseline(t.path());
+    let (adopt_base, _, adopt_handle) =
+        mock_hub(vec![(201, r#"{"ok":true,"created":true}"#.to_string())]);
+    let adopted = sevra()
+        .args(["secrets", "adopt", t.path().to_str().unwrap()])
+        .env("SEVRA_HUB_URL", &adopt_base)
+        .env("SEVRA_API_KEY", MOCK_KEY)
+        .output()
+        .unwrap();
+    assert!(adopted.status.success(), "{}", all_output(&adopted));
+    adopt_handle.join().unwrap();
+
+    let (push_base, push_log, push_handle) = mock_hub(vec![
+        (200, r#"{"id":"brain-1"}"#.to_string()),
+        (200, push_response(513, 0, 1)),
+    ]);
+    let pushed = sevra()
+        .args(["push", t.path().to_str().unwrap(), "--brain", "b"])
+        .env("SEVRA_HUB_URL", &push_base)
+        .env("SEVRA_API_KEY", MOCK_KEY)
+        .output()
+        .unwrap();
+    assert!(pushed.status.success(), "{}", all_output(&pushed));
+    push_handle.join().unwrap();
+    let requests = push_log.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let body: serde_json::Value = serde_json::from_str(&requests[1].body).unwrap();
+    let files = body["files"]
+        .as_array()
+        .expect("small push carries JSON files");
+    let paths = files
+        .iter()
+        .map(|file| file["path"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(paths.contains("sources/import.md"));
+    assert!(paths.contains("records/workflows/0000.md"));
+    assert!(paths.contains("records/workflows/0256.md"));
+    assert!(paths.contains("records/workflows/0511.md"));
+    let hosted = requests[1].body.as_str();
+    assert_eq!(hosted.matches("[[sources/import]]").count(), 512);
+    assert!(hosted.contains("$API_KEY"));
+    assert!(!hosted.contains(&token));
+    assert!(!hosted.contains(".sevralocal"));
 }
 
 #[test]

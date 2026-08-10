@@ -86,8 +86,17 @@ Commands:
                                           # "total", "assetSecretScan", "error"}), 0 clean;
                                           # values never shown; honors .sevralocal
                                           # (kept-home files never ride)
+    secrets adopt [dir]                   # for markdown content: create-if-absent in the brain
+                                          # vault FIRST, then replace each literal with inert
+                                          # $NAME and add frontmatter redacted provenance.
+                                          # Requires .sevra-sync.json. Hash-keyed private journal
+                                          # makes interruption resumable and deduplicates values.
+                                          # Removes exact .sevralocal entries only after all
+                                          # rewrites; preserves and reports broader globs.
+                                          # Warns before editing sources/. Asset hits refuse.
     secrets quarantine [dir] [--dry-run] [--closure]
-                                          # keep hit files home: scans the FULL store and
+                                          # when the whole file is secret, keep it home: scans
+                                          # the FULL store and
                                           # appends each hit file's exact path to .sevralocal
                                           # (created if absent; idempotent). Forward-only:
                                           # retained packs keep what already rode; declared

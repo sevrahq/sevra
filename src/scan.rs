@@ -49,6 +49,13 @@ pub struct SecretHit {
     pub in_path: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SecretSpan {
+    pub start: usize,
+    pub end: usize,
+    pub kind: &'static str,
+}
+
 struct Scanner {
     /// One compiled automaton over all patterns: a single pass per haystack.
     set: RegexSet,
@@ -141,6 +148,64 @@ fn matching_patterns(text: &str) -> Vec<usize> {
         .into_iter()
         .filter(|index| !bounded_spans(&sc.each[*index], text, right_boundary(*index)).is_empty())
         .collect()
+}
+
+/// Exact value spans for `secrets adopt`. Unlike the refusal scanner's
+/// kind-only result, this enumerates every occurrence and expands the two
+/// prefix patterns to the complete credential: the full 1Password share URL
+/// token and the complete PEM private-key block. An incomplete PEM block is a
+/// refusal, never a partial redaction that leaves key material behind.
+pub(crate) fn content_secret_spans(text: &str) -> Result<Vec<SecretSpan>, String> {
+    let sc = scanner();
+    let mut spans = Vec::new();
+    for index in sc.set.matches(text) {
+        for (matched_start, matched_end) in
+            bounded_spans(&sc.each[index], text, right_boundary(index))
+        {
+            let kind = PATTERNS[index].0;
+            let start =
+                if kind == "1Password share link" && text[..matched_start].ends_with("https://") {
+                    matched_start - "https://".len()
+                } else {
+                    matched_start
+                };
+            let end = match kind {
+                "1Password share link" => {
+                    let bytes = text.as_bytes();
+                    let mut end = matched_end;
+                    while end < bytes.len()
+                        && (bytes[end].is_ascii_alphanumeric() || matches!(bytes[end], b'-' | b'_'))
+                    {
+                        end += 1;
+                    }
+                    if end == matched_end {
+                        return Err("an incomplete 1Password share link cannot be adopted".into());
+                    }
+                    end
+                }
+                "private key (PEM block)" => {
+                    let begin = &text[start..matched_end];
+                    let end_marker = begin.replacen("BEGIN", "END", 1);
+                    let Some(relative_end) = text[matched_end..].find(&end_marker) else {
+                        return Err(
+                            "an unterminated PEM private-key block cannot be adopted".into()
+                        );
+                    };
+                    matched_end + relative_end + end_marker.len()
+                }
+                _ => matched_end,
+            };
+            spans.push(SecretSpan { start, end, kind });
+        }
+    }
+    spans.sort_by_key(|span| (span.start, span.end));
+    spans.dedup_by_key(|span| (span.start, span.end));
+    for pair in spans.windows(2) {
+        if pair[0].end > pair[1].start {
+            return Err("overlapping secret formats cannot be adopted safely".into());
+        }
+    }
+    Ok(spans)
 }
 
 /// Scan a store-relative path. Asset transport uses this independently of
@@ -346,5 +411,25 @@ mod tests {
             "rotate keys quarterly; store them in the password manager".into(),
         )]);
         assert!(scan_store(&store).is_empty());
+    }
+
+    #[test]
+    fn adopt_spans_enumerate_duplicates_and_cover_complete_compound_values() {
+        let github = fake("ghp_", "a", 36);
+        let share = "https://share.1password.com/s#abc_DEF-123";
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nYWJj\n-----END RSA PRIVATE KEY-----";
+        let text = format!("one={github}\ntwo={github}\nshare={share}\nkey={pem}\n");
+        let spans = content_secret_spans(&text).unwrap();
+        let values: Vec<&str> = spans
+            .iter()
+            .map(|span| &text[span.start..span.end])
+            .collect();
+        assert_eq!(values, vec![github.as_str(), github.as_str(), share, pem]);
+    }
+
+    #[test]
+    fn adopt_refuses_an_unterminated_pem_instead_of_redacting_only_the_header() {
+        let error = content_secret_spans("-----BEGIN PRIVATE KEY-----\nYWJj").unwrap_err();
+        assert!(error.contains("unterminated PEM"), "{error}");
     }
 }

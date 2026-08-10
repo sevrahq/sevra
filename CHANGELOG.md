@@ -2,6 +2,14 @@
 
 ## 0.2.8 — 2026-08-10
 
+- New: `sevra secrets adopt [dir]` moves detected markdown credentials into
+  the brain vault before replacing their literals with inert `$NAME`
+  references. It deduplicates by value hash, derives deterministic
+  collision-safe names without overwriting existing items, and records
+  `redacted:` provenance. A private restart journal makes vault-first and
+  partial-file interruptions resumable. Exact `.sevralocal` entries are
+  removed only after every rewrite; broad globs remain visible. Asset hits
+  still refuse, and push now recommends adopt before whole-file quarantine.
 - New: `sevra export` always writes the brain's vault names to the private
   `.sevra-vault.json` file inside the exported directory. Values remain absent
   unless `--with-secrets` is explicit. That mode reads each item through the

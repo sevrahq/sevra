@@ -335,6 +335,9 @@ enum SecretsAction {
         #[arg(long)]
         closure: bool,
     },
+    /// Move detected markdown credentials into the brain vault, then replace
+    /// each literal with an inert `$NAME` reference. Requires a sync baseline.
+    Adopt { dir: Option<String> },
 }
 
 fn main() {
@@ -482,13 +485,15 @@ fn main() {
                 reveal,
             } => commands::secrets_get(&cfg, &brain, &name, reveal),
             SecretsAction::Rm { brain, name } => commands::secrets_delete(&cfg, &brain, &name),
-            // Local-store commands: no credential, no network.
+            // Scan/quarantine are local-only. Adopt is vault-backed and
+            // enforces login before it reads the store.
             SecretsAction::Scan { dir } => commands::secrets_scan(dir),
             SecretsAction::Quarantine {
                 dir,
                 dry_run,
                 closure,
             } => commands::secrets_quarantine(dir, dry_run, closure),
+            SecretsAction::Adopt { dir } => commands::secrets_adopt(&cfg, dir),
         },
         Commands::Inbox { action, brain } => commands::inbox(&cfg, &action, &brain),
         Commands::Export {

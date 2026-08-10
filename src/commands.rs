@@ -49,6 +49,8 @@ const PULL_JOURNAL_FILE: &str = ".sevra-pull-journal.json";
 const PULL_BACKUP_PREFIX: &str = ".sevra-pull-backup-";
 const PULL_LOCK_FILE: &str = ".sevra-pull.lock";
 const MAX_PULL_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
+const ADOPT_JOURNAL_FILE: &str = ".sevra-adopt.json";
+const MAX_ADOPT_JOURNAL_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -111,6 +113,35 @@ struct VaultExportFile<'a> {
     names: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
     values_base64: Option<&'a BTreeMap<String, String>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AdoptJournal {
+    version: u8,
+    brain_id: String,
+    mappings: BTreeMap<String, String>,
+    paths: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+struct RedactedProvenance {
+    name: String,
+    kind: String,
+}
+
+#[derive(Clone, Debug)]
+struct AdoptOccurrence {
+    hash: String,
+    start: usize,
+    end: usize,
+    line: usize,
+    kind: &'static str,
+}
+
+struct AdoptValue {
+    bytes: Vec<u8>,
+    base_name: String,
 }
 
 fn canonical_sha256(value: &str) -> bool {
@@ -1372,8 +1403,9 @@ fn secret_hits_data(hits: &[SecretHit]) -> Value {
     })
 }
 
-/// The push secret-scan refusal, naming the three exits in order: keep the
-/// files home, edit them, or ship them anyway.
+/// The push secret-scan refusal, naming the exits in safety order: adopt a
+/// content literal, keep a whole secret-bearing file home, edit deliberately,
+/// or make the explicit unsafe override.
 fn fail_secret_hits(
     hits: &[SecretHit],
     dir: &str,
@@ -1385,7 +1417,7 @@ fn fail_secret_hits(
     );
     msg.push_str(&secret_hits_block(hits));
     msg.push_str(&format!(
-        "\nrotate anything that ever lived here; keep live secrets in a password manager and references to them in the brain.\n{EXISTING_BYTES_REMEDIATION}\nthree ways out, in order: `sevra secrets quarantine {dir}` (keep these files home) · edit the files yourself · `--allow-secrets` (push them verbatim)"
+        "\nrotate anything that ever lived here; keep live secrets in a password manager and references to them in the brain.\n{EXISTING_BYTES_REMEDIATION}\nways out, in order: `sevra secrets adopt {dir}` (move markdown literals into the brain vault) · `sevra secrets quarantine {dir}` (only when the whole file is secret or an asset) · edit deliberately · `--allow-secrets` (push verbatim)"
     ));
     let mut data = secret_hits_data(hits);
     if let (Some(scan), Some(object)) = (asset_scan, data.as_object_mut()) {
@@ -4677,6 +4709,783 @@ pub fn secrets_delete(cfg: &Config, brain: &str, name: &str) {
     );
 }
 
+fn utc_rfc3339_now() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let days = seconds.div_euclid(86_400);
+    let second_of_day = seconds.rem_euclid(86_400);
+    // Howard Hinnant's civil-from-days algorithm, with Unix day zero shifted
+    // to the proleptic Gregorian epoch. Avoids a platform/runtime dependency.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    let hour = second_of_day / 3_600;
+    let minute = (second_of_day % 3_600) / 60;
+    let second = second_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+fn load_adopt_journal(root: &crate::safe_path::SafeDir) -> Result<Option<AdoptJournal>, String> {
+    let Some(mut file) = root
+        .open_relative(ADOPT_JOURNAL_FILE)
+        .map_err(|error| format!("cannot securely open {ADOPT_JOURNAL_FILE}: {error}"))?
+    else {
+        return Ok(None);
+    };
+    let len = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect {ADOPT_JOURNAL_FILE}: {error}"))?
+        .len();
+    if len > MAX_ADOPT_JOURNAL_BYTES {
+        return Err(format!("{ADOPT_JOURNAL_FILE} exceeds its 4 MiB limit"));
+    }
+    let bytes = read_bounded(&mut file, MAX_ADOPT_JOURNAL_BYTES)
+        .map_err(|error| format!("cannot read {ADOPT_JOURNAL_FILE}: {error}"))?;
+    let journal: AdoptJournal = serde_json::from_slice(&bytes)
+        .map_err(|_| format!("{ADOPT_JOURNAL_FILE} is not valid journal JSON"))?;
+    if journal.version != 1
+        || journal.brain_id.is_empty()
+        || journal.brain_id.len() > 200
+        || journal.brain_id.chars().any(char::is_control)
+        || journal.mappings.len() > 256
+        || journal.paths.len() > MAX_STORE_FILES
+    {
+        return Err(format!("{ADOPT_JOURNAL_FILE} has an invalid shape"));
+    }
+    for (hash, name) in &journal.mappings {
+        if !canonical_sha256(hash) || parse_secret_name(name).is_err() {
+            return Err(format!("{ADOPT_JOURNAL_FILE} has an invalid mapping"));
+        }
+    }
+    for path in &journal.paths {
+        portable_export_components(path)
+            .map_err(|_| format!("{ADOPT_JOURNAL_FILE} has an unsafe path"))?;
+        if !path.to_ascii_lowercase().ends_with(".md") {
+            return Err(format!("{ADOPT_JOURNAL_FILE} names a non-markdown path"));
+        }
+    }
+    Ok(Some(journal))
+}
+
+fn write_adopt_journal(
+    root: &crate::safe_path::SafeDir,
+    journal: &AdoptJournal,
+) -> Result<(), String> {
+    let mut bytes = serde_json::to_vec_pretty(journal)
+        .map_err(|_| format!("cannot encode {ADOPT_JOURNAL_FILE}"))?;
+    bytes.push(b'\n');
+    if bytes.len() as u64 > MAX_ADOPT_JOURNAL_BYTES {
+        return Err(format!("{ADOPT_JOURNAL_FILE} exceeds its 4 MiB limit"));
+    }
+    root.atomic_write(ADOPT_JOURNAL_FILE, &bytes, false, 0o600)
+        .map_err(|error| format!("cannot persist {ADOPT_JOURNAL_FILE}: {error}"))
+}
+
+fn frontmatter_bounds(content: &str) -> Result<(usize, usize, &'static str), String> {
+    let (mut cursor, newline) = if content.starts_with("---\r\n") {
+        (5, "\r\n")
+    } else if content.starts_with("---\n") {
+        (4, "\n")
+    } else {
+        return Err("markdown has no leading YAML frontmatter".into());
+    };
+    while cursor <= content.len() {
+        let next = content[cursor..]
+            .find('\n')
+            .map(|offset| cursor + offset)
+            .unwrap_or(content.len());
+        let line = content[cursor..next]
+            .strip_suffix('\r')
+            .unwrap_or(&content[cursor..next]);
+        if line == "---" {
+            return Ok((if newline == "\r\n" { 5 } else { 4 }, cursor, newline));
+        }
+        if next == content.len() {
+            break;
+        }
+        cursor = next + 1;
+    }
+    Err("markdown has unterminated YAML frontmatter".into())
+}
+
+fn apply_redacted_provenance(
+    content: &str,
+    additions: &BTreeSet<RedactedProvenance>,
+    updated_at: &str,
+) -> Result<String, String> {
+    let (open_end, close_start, newline) = frontmatter_bounds(content)?;
+    let frontmatter = &content[open_end..close_start];
+    let mut lines: Vec<String> = frontmatter
+        .lines()
+        .map(|line| line.strip_suffix('\r').unwrap_or(line).to_string())
+        .collect();
+    let mut updated_index = None;
+    let mut redacted_index = None;
+    let mut provenance = BTreeSet::new();
+    for (index, line) in lines.iter().enumerate() {
+        if line.starts_with("updated:") && updated_index.replace(index).is_some() {
+            return Err("frontmatter has duplicate updated keys".into());
+        }
+        if let Some(raw) = line.strip_prefix("redacted:") {
+            if redacted_index.replace(index).is_some() {
+                return Err("frontmatter has duplicate redacted keys".into());
+            }
+            let raw = raw.trim();
+            if raw.is_empty() {
+                return Err("frontmatter redacted provenance must be an inline JSON array".into());
+            }
+            let existing: Vec<RedactedProvenance> = serde_json::from_str(raw)
+                .map_err(|_| "frontmatter redacted provenance must be an inline JSON array")?;
+            for entry in existing {
+                if parse_secret_name(&entry.name).is_err()
+                    || entry.kind.is_empty()
+                    || entry.kind.len() > 100
+                    || entry.kind.chars().any(char::is_control)
+                {
+                    return Err("frontmatter contains invalid redacted provenance".into());
+                }
+                provenance.insert(entry);
+            }
+        }
+    }
+    provenance.extend(additions.iter().cloned());
+    let redacted = format!(
+        "redacted: {}",
+        serde_json::to_string(&provenance.into_iter().collect::<Vec<_>>())
+            .map_err(|_| "could not encode redacted provenance")?
+    );
+    match redacted_index {
+        Some(index) => lines[index] = redacted,
+        None => lines.push(redacted),
+    }
+    match updated_index {
+        Some(index) => lines[index] = format!("updated: {updated_at}"),
+        None => lines.push(format!("updated: {updated_at}")),
+    }
+
+    let mut next = String::with_capacity(content.len() + 256);
+    next.push_str(&content[..open_end]);
+    for line in lines {
+        next.push_str(&line);
+        next.push_str(newline);
+    }
+    next.push_str(&content[close_start..]);
+    Ok(next)
+}
+
+fn fallback_secret_name(kind: &str) -> &'static str {
+    match kind {
+        "AWS access key id" => "AWS_ACCESS_KEY_ID",
+        "GitHub personal access token" | "GitHub fine-grained token" => "GITHUB_TOKEN",
+        "GitHub app/OAuth token" => "GITHUB_APP_TOKEN",
+        "Anthropic API key" => "ANTHROPIC_API_KEY",
+        "OpenAI API key" => "OPENAI_API_KEY",
+        "Slack token" => "SLACK_TOKEN",
+        "Google API key" => "GOOGLE_API_KEY",
+        "Stripe live key" => "STRIPE_KEY",
+        "private key (PEM block)" => "PRIVATE_KEY",
+        "1Password share link" => "ONEPASSWORD_SHARE",
+        _ => "SECRET",
+    }
+}
+
+fn screaming_snake(value: &str) -> String {
+    let mut out = String::with_capacity(value.len().min(64));
+    let mut separator = false;
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() {
+            if separator && !out.is_empty() {
+                out.push('_');
+            }
+            separator = false;
+            out.push(character.to_ascii_uppercase());
+        } else {
+            separator = true;
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    if out.is_empty() {
+        out.push_str("SECRET");
+    }
+    if out.as_bytes()[0].is_ascii_digit() {
+        out.insert_str(0, "SECRET_");
+    }
+    out.truncate(64);
+    out
+}
+
+fn contextual_secret_name(content: &str, start: usize, kind: &str) -> String {
+    let line_start = content[..start]
+        .rfind('\n')
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let prefix = content[line_start..start]
+        .trim_end()
+        .trim_end_matches(['"', '\'', '`', ' ']);
+    let label = prefix
+        .rfind([':', '='])
+        .map(|delimiter| &prefix[..delimiter])
+        .and_then(|before| before.rsplit(['{', '[', ',', ';']).next().map(str::trim))
+        .map(|candidate| candidate.trim_matches(['"', '\'', '`', ' ']))
+        .filter(|candidate| {
+            !candidate.is_empty()
+                && candidate.len() <= 48
+                && candidate
+                    .chars()
+                    .any(|character| character.is_ascii_alphabetic())
+        });
+    screaming_snake(label.unwrap_or_else(|| fallback_secret_name(kind)))
+}
+
+fn disambiguated_name(base: &str, hash: &str, attempt: usize) -> String {
+    if attempt == 0 {
+        return base.to_string();
+    }
+    let hash_len = (8 + (attempt - 1) * 4).min(62);
+    if hash_len >= 62 {
+        return format!("S_{}", &hash[..62]);
+    }
+    let base_len = 64usize.saturating_sub(hash_len + 1).max(1);
+    format!(
+        "{}_{}",
+        &base[..base.len().min(base_len)],
+        &hash[..hash_len]
+    )
+}
+
+fn read_vault_value(cfg: &Config, brain: &str, name: &str) -> Vec<u8> {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    let mut response = ensure_ok(
+        request(
+            cfg,
+            "GET",
+            &format!("/api/hub/brains/{}/vault?name={}", enc(brain), enc(name)),
+            None,
+            true,
+        ),
+        "reading an existing vault item for adopt",
+    );
+    let encoded = match response.get_mut("valueBase64").map(std::mem::take) {
+        Some(Value::String(value)) => value,
+        _ => fail("hub omitted an existing vault value during adopt", None),
+    };
+    let max_encoded = MAX_SECRET_VALUE_BYTES.div_ceil(3) * 4;
+    if encoded.len() > max_encoded {
+        fail("hub returned an oversized vault value during adopt", None);
+    }
+    let mut encoded = encoded.into_bytes();
+    let mut decoded = STANDARD
+        .decode(&encoded)
+        .unwrap_or_else(|_| fail("hub returned invalid base64 during adopt", None));
+    if decoded.is_empty()
+        || decoded.len() > MAX_SECRET_VALUE_BYTES
+        || STANDARD.encode(&decoded).as_bytes() != encoded
+    {
+        encoded.fill(0);
+        decoded.fill(0);
+        fail(
+            "hub returned a non-canonical vault value during adopt",
+            None,
+        );
+    }
+    encoded.fill(0);
+    decoded
+}
+
+fn commit_adopt_value(
+    cfg: &Config,
+    brain: &str,
+    hash: &str,
+    value: &[u8],
+    base_name: &str,
+    journal: &mut AdoptJournal,
+    root: &crate::safe_path::SafeDir,
+) -> String {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+
+    for attempt in 0..=16 {
+        let candidate = if attempt == 0 {
+            journal
+                .mappings
+                .get(hash)
+                .cloned()
+                .unwrap_or_else(|| base_name.to_string())
+        } else {
+            disambiguated_name(base_name, hash, attempt)
+        };
+        if journal
+            .mappings
+            .iter()
+            .any(|(other_hash, name)| other_hash != hash && name == &candidate)
+        {
+            continue;
+        }
+        if journal.mappings.get(hash) != Some(&candidate) {
+            journal.mappings.insert(hash.to_string(), candidate.clone());
+            write_adopt_journal(root, journal).unwrap_or_else(|error| fail(&error, None));
+        }
+        let response = request(
+            cfg,
+            "POST",
+            &format!("/api/hub/brains/{}/vault", enc(brain)),
+            Some(&json!({ "name": candidate, "valueBase64": STANDARD.encode(value) })),
+            true,
+        );
+        if (200..300).contains(&response.status) {
+            ensure_ok(response, "adopting a vault item");
+            return candidate;
+        }
+        if response.status == 409 && body_code(&response) == Some("vault_item_exists") {
+            let mut existing = read_vault_value(cfg, brain, &candidate);
+            let existing_hash = format!("{:x}", Sha256::digest(&existing));
+            existing.fill(0);
+            if existing_hash == hash {
+                return candidate;
+            }
+            continue;
+        }
+        ensure_ok(response, "adopting a vault item");
+    }
+    fail(
+        "could not derive a collision-free vault name during adopt",
+        None,
+    )
+}
+
+fn rewritten_adopt_file(
+    content: &str,
+    occurrences: &[AdoptOccurrence],
+    mappings: &BTreeMap<String, String>,
+    updated_at: &str,
+) -> Result<String, String> {
+    let mut next = content.to_string();
+    let mut provenance = BTreeSet::new();
+    let mut ordered = occurrences.to_vec();
+    ordered.sort_by_key(|occurrence| (occurrence.start, occurrence.end));
+    for pair in ordered.windows(2) {
+        if pair[0].end > pair[1].start {
+            return Err("overlapping credential spans cannot be rewritten safely".into());
+        }
+    }
+    for occurrence in ordered.iter().rev() {
+        let Some(name) = mappings.get(&occurrence.hash) else {
+            return Err("adopt journal lost a credential mapping".into());
+        };
+        let Some(value) = content.as_bytes().get(occurrence.start..occurrence.end) else {
+            return Err("credential span moved before rewrite".into());
+        };
+        if format!("{:x}", Sha256::digest(value)) != occurrence.hash {
+            return Err("credential bytes changed before rewrite".into());
+        }
+        next.replace_range(occurrence.start..occurrence.end, &format!("${name}"));
+        provenance.insert(RedactedProvenance {
+            name: name.clone(),
+            kind: occurrence.kind.to_string(),
+        });
+    }
+    apply_redacted_provenance(&next, &provenance, updated_at)
+}
+
+fn finish_adopt_scope(
+    root_path: &Path,
+    journal: &AdoptJournal,
+) -> Result<(usize, Vec<String>), String> {
+    let scope = local::load(root_path)?;
+    let mut exact_entries = BTreeSet::new();
+    for path in &journal.paths {
+        exact_entries.insert(local::entry_for(path)?);
+    }
+    let removed = if let Some(scope) = &scope {
+        let (next, removed) = local::remove_exact_entries(scope.raw(), &exact_entries);
+        if removed > 0 {
+            local::write(root_path, &next)?;
+        }
+        removed
+    } else {
+        0
+    };
+    let remaining_scope = local::load(root_path)?;
+    let still_kept = journal
+        .paths
+        .iter()
+        .filter(|path| {
+            remaining_scope
+                .as_ref()
+                .is_some_and(|scope| scope.keeps_home(path))
+        })
+        .cloned()
+        .collect();
+    Ok((removed, still_kept))
+}
+
+pub fn secrets_adopt(cfg: &Config, dir: Option<String>) {
+    if cfg.key.is_none() {
+        fail(NOT_LOGGED_IN, None);
+    }
+    let dir = dir.unwrap_or_else(|| ".".to_string());
+    if !Path::new(&dir).is_dir() {
+        fail(&format!("directory not found: {dir}"), None);
+    }
+    let root_path = std::fs::canonicalize(&dir)
+        .unwrap_or_else(|error| fail(&format!("could not resolve store directory: {error}"), None));
+    let root = crate::safe_path::SafeDir::open(&root_path).unwrap_or_else(|error| {
+        fail(
+            &format!("cannot securely hold store directory: {error}"),
+            None,
+        )
+    });
+    let _lock = root
+        .lock_relative(PULL_LOCK_FILE)
+        .unwrap_or_else(|error| fail(&format!("cannot lock store state: {error}"), None));
+    if recover_pull_transaction(&root).unwrap_or_else(|error| fail(&error, None)) {
+        note("recovered an interrupted pull before adopting credentials");
+    }
+    let baseline = load_sync_baseline(&root_path)
+        .unwrap_or_else(|error| fail(&error, None))
+        .unwrap_or_else(|| {
+            fail(
+                &format!(
+                    "{dir} has no {SYNC_BASELINE_FILE}; clone or push the brain once before `sevra secrets adopt` so the vault destination is unambiguous"
+                ),
+                None,
+            )
+        });
+    let mut journal = load_adopt_journal(&root)
+        .unwrap_or_else(|error| fail(&error, None))
+        .unwrap_or_else(|| AdoptJournal {
+            version: 1,
+            brain_id: baseline.brain_id.clone(),
+            mappings: BTreeMap::new(),
+            paths: BTreeSet::new(),
+        });
+    if journal.brain_id != baseline.brain_id {
+        fail(
+            &format!(
+                "{ADOPT_JOURNAL_FILE} belongs to a different brain; refusing to move credentials"
+            ),
+            None,
+        );
+    }
+    if journal.mappings.values().collect::<BTreeSet<_>>().len() != journal.mappings.len() {
+        fail(
+            &format!("{ADOPT_JOURNAL_FILE} maps different values to the same vault name"),
+            None,
+        );
+    }
+
+    let scope = local::load(&root_path).unwrap_or_else(|error| fail(&error, None));
+    let (store, _) = read_store_checked(&dir, false);
+    let mut asset_scan = crate::assets::scan_declared_asset_secrets(
+        &dir,
+        store.assets.as_deref(),
+        scope.as_ref(),
+        true,
+    );
+    if let Some(message) = asset_scan.coverage_note() {
+        note(&message);
+    }
+    let store_hits = scan_store(&store);
+    let mut unsupported: Vec<SecretHit> = store_hits
+        .into_iter()
+        .filter(|hit| hit.in_path || hit.store_path == "assets.jsonl")
+        .collect();
+    unsupported.append(&mut asset_scan.hits);
+    if !unsupported.is_empty() {
+        let mut message = format!(
+            "adopt refused before vault access: {} match(es) are outside editable markdown content:",
+            unsupported.len()
+        );
+        message.push_str(&secret_hits_block(&unsupported));
+        message.push_str(
+            "\nasset bytes are content-addressed and filenames are identity; keep the file home with `sevra secrets quarantine`, or rename/edit it deliberately",
+        );
+        fail(&message, Some(secret_hits_data(&unsupported)));
+    }
+
+    let mut originals = BTreeMap::new();
+    let mut by_path: BTreeMap<String, Vec<AdoptOccurrence>> = BTreeMap::new();
+    let mut values: BTreeMap<String, AdoptValue> = BTreeMap::new();
+    let updated_at = utc_rfc3339_now();
+    for file in &store.files {
+        let spans = crate::scan::content_secret_spans(&file.content).unwrap_or_else(|error| {
+            fail(
+                &format!(
+                    "cannot adopt {} safely: {error}",
+                    terminal_safe(&redact_path(&file.path))
+                ),
+                None,
+            )
+        });
+        if spans.is_empty() {
+            continue;
+        }
+        // Validate the frontmatter shape for every file before the first vault
+        // request. A later local failure may leave an unused vault item, but
+        // can never leave a literal removed without its durable value.
+        apply_redacted_provenance(&file.content, &BTreeSet::new(), &updated_at).unwrap_or_else(
+            |error| {
+                fail(
+                    &format!(
+                        "cannot record redaction provenance in {}: {error}",
+                        terminal_safe(&file.path)
+                    ),
+                    None,
+                )
+            },
+        );
+        originals.insert(file.path.clone(), file.content.clone());
+        for span in spans {
+            let bytes = file.content.as_bytes()[span.start..span.end].to_vec();
+            if bytes.len() > MAX_SECRET_VALUE_BYTES {
+                fail(
+                    &format!(
+                        "cannot adopt {} in {}: the matched value is {} bytes, above the {MAX_SECRET_VALUE_BYTES}-byte vault item limit",
+                        span.kind,
+                        terminal_safe(&file.path),
+                        bytes.len()
+                    ),
+                    None,
+                );
+            }
+            let hash = format!("{:x}", Sha256::digest(&bytes));
+            let occurrence = AdoptOccurrence {
+                hash: hash.clone(),
+                start: span.start,
+                end: span.end,
+                line: file.content[..span.start]
+                    .bytes()
+                    .filter(|byte| *byte == b'\n')
+                    .count()
+                    + 1,
+                kind: span.kind,
+            };
+            by_path
+                .entry(file.path.clone())
+                .or_default()
+                .push(occurrence.clone());
+            let entry = values.entry(hash.clone()).or_insert_with(|| AdoptValue {
+                bytes: bytes.clone(),
+                base_name: contextual_secret_name(&file.content, span.start, span.kind),
+            });
+            if entry.bytes != bytes {
+                fail("SHA-256 collision while grouping credentials", None);
+            }
+        }
+    }
+
+    if values.len() > 256 {
+        fail(
+            &format!(
+                "adopt found {} distinct values; one brain vault holds at most 256 items",
+                values.len()
+            ),
+            None,
+        );
+    }
+
+    for path in by_path.keys() {
+        journal.paths.insert(path.clone());
+        if path.starts_with("sources/") {
+            note(&format!(
+                "warning: adopt will edit immutable evidence {} after its vault values are durable; redacted provenance will record every replacement",
+                terminal_safe(path)
+            ));
+        }
+    }
+    if journal.paths.len() > MAX_STORE_FILES {
+        fail(
+            &format!("{ADOPT_JOURNAL_FILE} would exceed the store path limit"),
+            None,
+        );
+    }
+    for (hash, value) in &values {
+        if journal.mappings.contains_key(hash) {
+            continue;
+        }
+        let mut assigned = false;
+        for attempt in 0..=16 {
+            let candidate = disambiguated_name(&value.base_name, hash, attempt);
+            if !journal.mappings.values().any(|name| name == &candidate) {
+                journal.mappings.insert(hash.clone(), candidate);
+                assigned = true;
+                break;
+            }
+        }
+        if !assigned {
+            fail(
+                "could not derive a collision-free vault name from the adopt journal",
+                None,
+            );
+        }
+    }
+    if !values.is_empty() || !journal.paths.is_empty() {
+        write_adopt_journal(&root, &journal).unwrap_or_else(|error| fail(&error, None));
+    }
+
+    for (hash, value) in &mut values {
+        let final_name = commit_adopt_value(
+            cfg,
+            &baseline.brain_id,
+            hash,
+            &value.bytes,
+            &value.base_name,
+            &mut journal,
+            &root,
+        );
+        value.bytes.fill(0);
+        debug_assert_eq!(journal.mappings.get(hash), Some(&final_name));
+    }
+
+    if cfg!(debug_assertions)
+        && std::env::var("SEVRA_TEST_ADOPT_EXIT_AFTER_VAULT").as_deref() == Ok("1")
+    {
+        std::process::exit(86);
+    }
+
+    let mut rewrites: BTreeMap<String, (String, std::fs::Permissions)> = BTreeMap::new();
+    for (path, occurrences) in &by_path {
+        let Some((bytes, permissions, _)) =
+            held_file_state(&root, path).unwrap_or_else(|error| fail(&error, None))
+        else {
+            fail(
+                &format!(
+                    "adopt source disappeared before rewrite: {}",
+                    terminal_safe(path)
+                ),
+                None,
+            )
+        };
+        let original = originals.get(path).expect("affected path has source text");
+        if bytes != original.as_bytes() {
+            fail(
+                &format!(
+                    "adopt stopped because {} changed after scanning; no stale bytes were overwritten (rerun to resume)",
+                    terminal_safe(path)
+                ),
+                None,
+            );
+        }
+        let next = rewritten_adopt_file(original, occurrences, &journal.mappings, &updated_at)
+            .unwrap_or_else(|error| {
+                fail(
+                    &format!("cannot rewrite {}: {error}", terminal_safe(path)),
+                    None,
+                )
+            });
+        rewrites.insert(path.clone(), (next, permissions));
+    }
+
+    let mut rewritten = Vec::new();
+    let mut replacement_count = 0usize;
+    for (path, (next, permissions)) in &rewrites {
+        root.atomic_write(path, next.as_bytes(), false, export_mode(permissions))
+            .unwrap_or_else(|error| {
+                fail(
+                    &format!(
+                        "could not securely rewrite {} after vault commit: {error}; rerun to resume",
+                        terminal_safe(path)
+                    ),
+                    None,
+                )
+            });
+        root.restore_permissions(path, export_mode(permissions), permissions.readonly())
+            .unwrap_or_else(|error| {
+                fail(
+                    &format!(
+                        "rewrote {} but could not restore its permissions: {error}",
+                        terminal_safe(path)
+                    ),
+                    None,
+                )
+            });
+        replacement_count += by_path[path].len();
+        rewritten.push(path.clone());
+        if cfg!(debug_assertions)
+            && rewritten.len() == 1
+            && std::env::var("SEVRA_TEST_ADOPT_EXIT_AFTER_FILE").as_deref() == Ok("1")
+        {
+            std::process::exit(87);
+        }
+    }
+
+    let (unquarantined, still_kept) =
+        finish_adopt_scope(&root_path, &journal).unwrap_or_else(|error| {
+            fail(
+                &format!("adopted values but {error}; rerun to resume"),
+                None,
+            )
+        });
+    root.remove_regular(ADOPT_JOURNAL_FILE)
+        .unwrap_or_else(|error| {
+            fail(
+                &format!("could not remove {ADOPT_JOURNAL_FILE}: {error}"),
+                None,
+            )
+        });
+
+    let mut human = if replacement_count == 0 {
+        "no adoptable markdown credentials remain".to_string()
+    } else {
+        format!(
+            "adopted {} distinct vault item(s); replaced {replacement_count} literal(s) across {} markdown file(s):",
+            values.len(),
+            rewritten.len()
+        )
+    };
+    for path in &rewritten {
+        human.push_str(&format!("\n  {}", terminal_safe(path)));
+        for occurrence in &by_path[path] {
+            let name = &journal.mappings[&occurrence.hash];
+            human.push_str(&format!(
+                "\n    line {}: [credential] -> ${}",
+                occurrence.line,
+                terminal_safe(name)
+            ));
+        }
+    }
+    if unquarantined > 0 {
+        human.push_str(&format!(
+            "\nunquarantined {unquarantined} exact .sevralocal entr{} after redaction",
+            if unquarantined == 1 { "y" } else { "ies" }
+        ));
+    }
+    if !still_kept.is_empty() {
+        human.push_str(
+            "\nwarning: these clean files are still covered by a broader .sevralocal glob; review that glob before push:",
+        );
+        for path in &still_kept {
+            human.push_str(&format!("\n  {}", terminal_safe(path)));
+        }
+    }
+    out_layout(
+        &human,
+        Some(json!({
+            "brain": baseline.brain_id,
+            "vaultItems": journal.mappings.values().collect::<Vec<_>>(),
+            "distinctValues": values.len(),
+            "replacements": replacement_count,
+            "files": rewritten,
+            "unquarantinedEntries": unquarantined,
+            "stillKeptHome": still_kept,
+            "journalRemoved": true,
+        })),
+    );
+}
+
 // --- secrets scan / quarantine (the local store, no hub) -----------------------
 //
 // The other half of the vault story: secrets that are FILES in the store.
@@ -4737,7 +5546,7 @@ pub fn secrets_scan(dir: Option<String>) {
     );
     msg.push_str(&secret_hits_block(&hits));
     msg.push_str(&format!(
-        "\nrotate anything that ever lived here; keep live secrets in a password manager and references to them in the brain.\n{EXISTING_BYTES_REMEDIATION}\nkeep the files home instead of shipping them: `sevra secrets quarantine {dir}` — or edit them yourself"
+        "\nrotate anything that ever lived here; keep live secrets in a password manager and references to them in the brain.\n{EXISTING_BYTES_REMEDIATION}\nmove markdown literals into the brain vault: `sevra secrets adopt {dir}`. Quarantine only when the whole file is secret or an asset: `sevra secrets quarantine {dir}`. Or edit deliberately"
     ));
     let mut data = secret_hits_data(&hits);
     if let Some(object) = data.as_object_mut() {
@@ -5751,6 +6560,89 @@ mod tests {
             ["a.md"],
             "no files array: the seeds are the component"
         );
+    }
+
+    #[test]
+    fn adopt_names_are_contextual_deterministic_and_collision_safe() {
+        let value = format!("sk-proj-{}", "a".repeat(24));
+        let content = format!("api key: {value}\n");
+        let start = content.find(&value).unwrap();
+        assert_eq!(
+            contextual_secret_name(&content, start, "OpenAI API key"),
+            "API_KEY"
+        );
+        assert_eq!(
+            contextual_secret_name(&value, 0, "OpenAI API key"),
+            "OPENAI_API_KEY"
+        );
+        let hash = format!("{:x}", Sha256::digest(value.as_bytes()));
+        assert_eq!(disambiguated_name("API_KEY", &hash, 0), "API_KEY");
+        assert_eq!(
+            disambiguated_name("API_KEY", &hash, 1),
+            format!("API_KEY_{}", &hash[..8])
+        );
+        assert!(disambiguated_name(&"A".repeat(64), &hash, 16).len() <= 64);
+    }
+
+    #[test]
+    fn adopt_rewrite_replaces_every_literal_and_merges_provenance() {
+        let first = format!("sk-proj-{}", "a".repeat(24));
+        let second = format!("ghp_{}", "b".repeat(36));
+        let content = format!(
+            "---\r\ntype: note\r\nupdated: 2026-01-01T00:00:00Z\r\nredacted: [{{\"name\":\"OLD_KEY\",\"kind\":\"previous\"}}]\r\n---\r\nopenai: {first}\r\ngithub: {second}\r\nagain: {first}\r\n"
+        );
+        let mut occurrences = Vec::new();
+        let mut mappings = BTreeMap::new();
+        for span in crate::scan::content_secret_spans(&content).unwrap() {
+            let bytes = &content.as_bytes()[span.start..span.end];
+            let hash = format!("{:x}", Sha256::digest(bytes));
+            let name = if bytes == first.as_bytes() {
+                "OPENAI_KEY"
+            } else {
+                "GITHUB_KEY"
+            };
+            mappings.insert(hash.clone(), name.to_string());
+            occurrences.push(AdoptOccurrence {
+                hash,
+                start: span.start,
+                end: span.end,
+                line: 0,
+                kind: span.kind,
+            });
+        }
+        let next = rewritten_adopt_file(&content, &occurrences, &mappings, "2026-08-10T12:34:56Z")
+            .unwrap();
+        assert!(!next.contains(&first));
+        assert!(!next.contains(&second));
+        assert_eq!(next.matches("$OPENAI_KEY").count(), 2);
+        assert_eq!(next.matches("$GITHUB_KEY").count(), 1);
+        assert!(next.contains("updated: 2026-08-10T12:34:56Z\r\n"));
+        assert!(next.contains("OLD_KEY"));
+        assert!(next.contains("OPENAI_KEY"));
+        assert!(next.contains("GITHUB_KEY"));
+        assert!(next.contains("\r\n---\r\n"), "CRLF shape stays intact");
+    }
+
+    #[test]
+    fn adopt_provenance_refuses_ambiguous_frontmatter_before_mutation() {
+        let additions = [RedactedProvenance {
+            name: "API_KEY".into(),
+            kind: "OpenAI API key".into(),
+        }]
+        .into_iter()
+        .collect();
+        for bad in [
+            "no frontmatter",
+            "---\ntype: note\n",
+            "---\nupdated: one\nupdated: two\n---\nbody",
+            "---\nredacted:\n---\nbody",
+            "---\nredacted: [{\"name\":\"bad.name\",\"kind\":\"x\"}]\n---\nbody",
+        ] {
+            assert!(
+                apply_redacted_provenance(bad, &additions, "2026-08-10T00:00:00Z").is_err(),
+                "must refuse {bad:?}"
+            );
+        }
     }
 
     #[test]
