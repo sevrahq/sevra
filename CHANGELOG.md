@@ -2,6 +2,12 @@
 
 ## 0.2.8 — 2026-08-10
 
+- New: `sevra export` always writes the brain's vault names to the private
+  `.sevra-vault.json` file inside the exported directory. Values remain absent
+  unless `--with-secrets` is explicit. That mode reads each item through the
+  audited account-key path, preserves arbitrary bytes as canonical base64, and
+  warns that the resulting 0600 file is as sensitive as the credentials. The
+  file is dot-prefixed, so the push walker cannot upload it back into a brain.
 - New: the brain vault now travels across machines. `sevra secrets list`,
   `set`, `get`, and `rm` manage server-custodied values by brain. Set accepts
   up to 256 KiB of arbitrary bytes from stdin only. Get emits exact bytes to a

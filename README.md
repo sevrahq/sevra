@@ -55,7 +55,7 @@ sevra secrets rm <brain> NAME                    permanently forget one value (`
 sevra secrets scan [dir]                         the push secret scan, read-only (exit 1 on matches)
 sevra secrets quarantine [dir] [--dry-run] [--closure]   keep hit files home in .sevralocal
 sevra inbox list|drain <brain>                   read the evidence inbox (drain = full JSON)
-sevra export <brain> [dir]                       write your brain back to disk (you own it)
+sevra export <brain> [dir] [--with-secrets]      write your brain back to disk (you own it)
 
 sevra validate [dir]                             wraps `dbmd validate --all`
 sevra version
@@ -73,6 +73,8 @@ A `.sevralocal` file at the store root keeps files home: one store-relative path
 `secrets scan [dir]` runs push's secret scan read-only (exit 1 on matches, 0 clean; matched values never shown). `secrets quarantine [dir]` appends each hit file's exact path to `.sevralocal`, creating it when absent — the third exit besides editing files and `--allow-secrets`. `--dry-run` previews; `--closure` also marks every file connected to a marked one through wiki-links (computed via `dbmd emit`). Kept-home is forward-only: marking changes future snapshots and erases nothing by itself. Retained packs keep bytes that already rode; a kept-home asset remains declared so its blob is not swept; retention-locked backups persist for about 31 days. Rotate at the issuer immediately. Byte erasure requires `sevra delete`, completion of the sweep and backup-retention window, then a fresh push. The only file sevra ever edits is `.sevralocal`, and only by appending.
 
 The brain vault keeps credentials with the brain, so an agent can retrieve them after moving to another machine. `secrets set` reads up to 256 KiB from stdin only, never from an argument. A hidden terminal prompt accepts text; a pipe accepts arbitrary bytes and trims exactly one final LF or CRLF. `secrets get` writes the exact bytes when stdout is piped. It refuses to reveal a value on a terminal unless `--reveal` is explicit; `--json` returns canonical base64 instead. Names match `^[A-Za-z][A-Za-z0-9_-]{0,63}$`. Browser sessions can manage names and values but cannot retrieve stored values.
+
+`export` always records the brain's vault names in `.sevra-vault.json` inside the exported directory. Values are absent by default. `--with-secrets` explicitly includes recoverable canonical-base64 values and prints a warning; the resulting 0600 file is as sensitive as the credentials themselves. The dot-prefixed file never rides a later push.
 
 `mcp` serves the hub's read surface (list_brains, search_brain, get_record, graph) to any MCP client over stdio — for agents that cannot run a CLI. Configure the client with `{"command": "sevra", "args": ["mcp"]}`. It uses the stored sign-in (env `SEVRA_API_KEY` / `SEVRA_HUB_URL` override it); without one it reaches public brains only. stdout carries only JSON-RPC frames; notices go to stderr.
 

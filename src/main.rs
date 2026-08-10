@@ -211,6 +211,9 @@ enum Commands {
         /// Skip restoring `assets.jsonl`-declared blobs beside the store
         #[arg(long)]
         skip_assets: bool,
+        /// Include vault values in the private `.sevra-vault.json` export file
+        #[arg(long)]
+        with_secrets: bool,
     },
     /// Validate a store (wraps `dbmd validate --all`)
     Validate { dir: Option<String> },
@@ -492,7 +495,8 @@ fn main() {
             brain,
             dir,
             skip_assets,
-        } => commands::export(&cfg, &brain, dir, skip_assets),
+            with_secrets,
+        } => commands::export(&cfg, &brain, dir, skip_assets, with_secrets),
         Commands::Update => update::cmd_update(&cfg),
         // handled above
         Commands::Login { .. }

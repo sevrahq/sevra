@@ -2757,6 +2757,160 @@ fn export_restores_missing_assets_sha_verified() {
 }
 
 #[test]
+fn export_always_writes_a_private_vault_name_manifest_without_values() {
+    let export_body = r#"{
+        "brain":"brain-id",
+        "slug":"b",
+        "vaultItems":["Z_TOKEN","API_KEY"],
+        "files":[{"path":"DB.md","content":"---\ntype: db-md\nscope: test\n---\n"},{"path":"records/a.md","content":"alpha"}]
+    }"#;
+    let (base, log, handle) = mock_hub(vec![(200, export_body.to_string())]);
+    let work = tempfile::tempdir().unwrap();
+    let out = sevra()
+        .args(["export", "b", "out", "--json"])
+        .current_dir(work.path())
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", MOCK_KEY)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "export failed: {}", all_output(&out));
+    let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["vaultFile"], ".sevra-vault.json");
+    assert_eq!(
+        result["vaultNames"],
+        serde_json::json!(["API_KEY", "Z_TOKEN"])
+    );
+    assert_eq!(result["vaultValuesIncluded"], false);
+
+    let path = work.path().join("out/.sevra-vault.json");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(manifest["version"], 1);
+    assert_eq!(manifest["brain"], "brain-id");
+    assert_eq!(manifest["names"], serde_json::json!(["API_KEY", "Z_TOKEN"]));
+    assert!(manifest.get("valuesBase64").is_none());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    handle.join().unwrap();
+    let reqs = log.lock().unwrap();
+    assert_eq!(reqs.len(), 1, "default export needs no value reads");
+    assert_eq!(
+        reqs[0].path,
+        "/api/hub/brains/b/export?format=pack&includeVaultNames=1"
+    );
+}
+
+#[test]
+fn export_with_secrets_reads_each_value_and_warns_without_echoing_it() {
+    let export_body = r#"{
+        "brain":"brain-id",
+        "slug":"b",
+        "vaultItems":["BINARY_KEY","API_KEY"],
+        "files":[{"path":"DB.md","content":"---\ntype: db-md\nscope: test\n---\n"}]
+    }"#;
+    let (base, log, handle) = mock_hub(vec![
+        (200, export_body.to_string()),
+        (
+            200,
+            r#"{"name":"API_KEY","valueBase64":"dmF1bHQtVE9QU0VDUkVULXZhbHVl","encoding":"base64"}"#
+                .to_string(),
+        ),
+        (
+            200,
+            r#"{"name":"BINARY_KEY","valueBase64":"AAEC/w==","encoding":"base64"}"#
+                .to_string(),
+        ),
+    ]);
+    let work = tempfile::tempdir().unwrap();
+    let out = sevra()
+        .args(["export", "b", "out", "--with-secrets"])
+        .current_dir(work.path())
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", MOCK_KEY)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "export failed: {}", all_output(&out));
+    let shown = all_output(&out);
+    assert!(shown.contains("as sensitive as the credentials themselves"));
+    assert!(shown.contains("values included"));
+    assert!(
+        !shown.contains("TOPSECRET"),
+        "value leaked into output: {shown}"
+    );
+    assert!(
+        !shown.contains("dmF1bHQt"),
+        "base64 leaked into output: {shown}"
+    );
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(work.path().join("out/.sevra-vault.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        manifest["names"],
+        serde_json::json!(["API_KEY", "BINARY_KEY"])
+    );
+    assert_eq!(
+        manifest["valuesBase64"]["API_KEY"],
+        "dmF1bHQtVE9QU0VDUkVULXZhbHVl"
+    );
+    assert_eq!(manifest["valuesBase64"]["BINARY_KEY"], "AAEC/w==");
+
+    handle.join().unwrap();
+    let reqs = log.lock().unwrap();
+    assert_eq!(reqs.len(), 3);
+    assert_eq!(
+        reqs[1].path,
+        "/api/hub/brains/b/vault?name=API_KEY&purpose=export"
+    );
+    assert_eq!(
+        reqs[2].path,
+        "/api/hub/brains/b/vault?name=BINARY_KEY&purpose=export"
+    );
+    let expected_auth = format!("Bearer {MOCK_KEY}");
+    assert!(reqs
+        .iter()
+        .all(|request| request.authorization.as_deref() == Some(expected_auth.as_str())));
+}
+
+#[test]
+fn export_with_secrets_fails_closed_before_publish_on_a_bad_value() {
+    let export_body = r#"{
+        "brain":"brain-id",
+        "slug":"b",
+        "vaultItems":["API_KEY"],
+        "files":[{"path":"DB.md","content":"---\ntype: db-md\nscope: test\n---\n"}]
+    }"#;
+    let (base, _log, handle) = mock_hub(vec![
+        (200, export_body.to_string()),
+        (
+            200,
+            r#"{"name":"API_KEY","valueBase64":"vault-TOPSECRET-not-base64"}"#.to_string(),
+        ),
+    ]);
+    let work = tempfile::tempdir().unwrap();
+    let out = sevra()
+        .args(["export", "b", "out", "--with-secrets"])
+        .current_dir(work.path())
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", MOCK_KEY)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let shown = all_output(&out);
+    assert!(shown.contains("invalid vault value"), "{shown}");
+    assert!(!shown.contains("TOPSECRET"), "bad value leaked: {shown}");
+    assert!(!work.path().join("out").exists());
+    handle.join().unwrap();
+}
+
+#[test]
 fn export_refuses_huge_manifest_asset_before_presign() {
     let manifest_line = format!(
         "{{\\\"path\\\":\\\"_files/x.bin\\\",\\\"sha256\\\":\\\"{BLOB_SHA}\\\",\\\"bytes\\\":2147483649}}\\n"

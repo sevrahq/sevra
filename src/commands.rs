@@ -41,6 +41,8 @@ const PACK_COMMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 const MAX_SECRET_VALUE_BYTES: usize = 256 * 1024;
 /// One optional CRLF may be trimmed from piped input.
 const MAX_SECRET_STDIN_BYTES: usize = MAX_SECRET_VALUE_BYTES + 2;
+const VAULT_EXPORT_FILE: &str = ".sevra-vault.json";
+const VAULT_EXPORT_WARNING: &str = "warning: this export includes recoverable vault values; .sevra-vault.json is as sensitive as the credentials themselves. Store it securely and delete it when no longer needed";
 const SYNC_BASELINE_FILE: &str = ".sevra-sync.json";
 const MAX_SYNC_BASELINE_BYTES: u64 = 16 * 1024 * 1024;
 const PULL_JOURNAL_FILE: &str = ".sevra-pull-journal.json";
@@ -99,6 +101,16 @@ struct PulledSnapshot {
     pack_sha256: Option<String>,
     entries: Vec<(String, Vec<u8>)>,
     assets: Vec<crate::assets::AssetDeclaration>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VaultExportFile<'a> {
+    version: u8,
+    brain: &'a str,
+    names: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    values_base64: Option<&'a BTreeMap<String, String>>,
 }
 
 fn canonical_sha256(value: &str) -> bool {
@@ -3389,10 +3401,12 @@ fn install_complete_export(
             let rollback = rollback_held_export(root, &backups[..completed], &created_directories);
             return match rollback {
                 Ok(()) => Err(format!(
-                    "secure baseline write failed: {error}; all store changes were rolled back"
+                    "secure final metadata write failed for {}: {error}; all store changes were rolled back",
+                    terminal_safe(path)
                 )),
                 Err(rollback_error) => Err(format!(
-                    "secure baseline write failed: {error}; rollback also failed: {rollback_error}"
+                    "secure final metadata write failed for {}: {error}; rollback also failed: {rollback_error}",
+                    terminal_safe(path)
                 )),
             };
         }
@@ -3573,12 +3587,124 @@ fn read_bounded(reader: &mut impl Read, max_bytes: u64) -> std::io::Result<Vec<u
     Ok(content)
 }
 
-pub fn export(cfg: &Config, brain: &str, dir: Option<String>, skip_assets: bool) {
+fn export_vault_names(response: &Value) -> Vec<String> {
+    let Some(raw) = response.get("vaultItems") else {
+        // A pre-vault hub did not send this additive field. Such a hub has no
+        // vault items to name, so keep old-hub export compatibility.
+        return Vec::new();
+    };
+    let items = raw
+        .as_array()
+        .unwrap_or_else(|| fail("hub returned malformed vault export metadata", None));
+    let mut names = BTreeSet::new();
+    for item in items {
+        let name = item
+            .as_str()
+            .unwrap_or_else(|| fail("hub returned malformed vault export metadata", None));
+        let name = parse_secret_name(name)
+            .unwrap_or_else(|_| fail("hub returned an invalid vault name for export", None));
+        if !names.insert(name) {
+            fail("hub returned a duplicate vault name for export", None);
+        }
+    }
+    names.into_iter().collect()
+}
+
+fn vault_export_entry(
+    cfg: &Config,
+    brain: &str,
+    response: &Value,
+    names: &[String],
+    with_secrets: bool,
+) -> (String, Vec<u8>) {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+
+    let mut values = BTreeMap::new();
+    if with_secrets {
+        note(VAULT_EXPORT_WARNING);
+        for name in names {
+            let mut item = ensure_ok(
+                request(
+                    cfg,
+                    "GET",
+                    &format!(
+                        "/api/hub/brains/{}/vault?name={}&purpose=export",
+                        enc(brain),
+                        enc(name)
+                    ),
+                    None,
+                    true,
+                ),
+                "export vault item",
+            );
+            if item.get("name").and_then(Value::as_str) != Some(name.as_str()) {
+                fail("hub returned a mismatched vault item during export", None);
+            }
+            let mut encoded = match item.get_mut("valueBase64").map(std::mem::take) {
+                Some(Value::String(value)) => value,
+                _ => fail("hub omitted a vault value during export", None),
+            };
+            let max_encoded = MAX_SECRET_VALUE_BYTES.div_ceil(3) * 4;
+            if encoded.len() > max_encoded {
+                let mut secret_bytes = encoded.into_bytes();
+                secret_bytes.fill(0);
+                fail("hub returned an oversized vault value during export", None);
+            }
+            let mut decoded = STANDARD.decode(&encoded).unwrap_or_else(|_| {
+                encoded.clear();
+                fail("hub returned an invalid vault value during export", None)
+            });
+            let valid = !decoded.is_empty()
+                && decoded.len() <= MAX_SECRET_VALUE_BYTES
+                && STANDARD.encode(&decoded) == encoded;
+            decoded.fill(0);
+            if !valid {
+                encoded.clear();
+                fail(
+                    "hub returned a non-canonical vault value during export",
+                    None,
+                );
+            }
+            values.insert(name.clone(), encoded);
+        }
+    }
+
+    let brain_id = response
+        .get("brain")
+        .and_then(Value::as_str)
+        .unwrap_or(brain);
+    let payload = VaultExportFile {
+        version: 1,
+        brain: brain_id,
+        names,
+        values_base64: with_secrets.then_some(&values),
+    };
+    let mut bytes = serde_json::to_vec_pretty(&payload)
+        .unwrap_or_else(|_| fail("could not encode vault export metadata", None));
+    bytes.push(b'\n');
+    for value in values.into_values() {
+        let mut secret_bytes = value.into_bytes();
+        secret_bytes.fill(0);
+    }
+    (VAULT_EXPORT_FILE.to_string(), bytes)
+}
+
+pub fn export(
+    cfg: &Config,
+    brain: &str,
+    dir: Option<String>,
+    skip_assets: bool,
+    with_secrets: bool,
+) {
     let r = ensure_ok(
         request(
             cfg,
             "GET",
-            &format!("/api/hub/brains/{}/export?format=pack", enc(brain)),
+            &format!(
+                "/api/hub/brains/{}/export?format=pack&includeVaultNames=1",
+                enc(brain)
+            ),
             None,
             true,
         ),
@@ -3663,6 +3789,7 @@ pub fn export(cfg: &Config, brain: &str, dir: Option<String>, skip_assets: bool)
     }
     let asset_declarations = crate::assets::parse_restore_manifest(asset_manifest)
         .unwrap_or_else(|error| fail(&error, None));
+    let vault_names = export_vault_names(&r);
 
     // Gate the complete namespace, including declared binary paths, before the
     // first filesystem mutation. Store files and assets share one portable
@@ -3698,6 +3825,7 @@ pub fn export(cfg: &Config, brain: &str, dir: Option<String>, skip_assets: bool)
         crate::assets::prepare_restore(cfg, brain, None, &asset_declarations)
     }
     .unwrap_or_else(|error| fail(&error, None));
+    let vault_entry = vault_export_entry(cfg, brain, &r, &vault_names, with_secrets);
 
     let parent_path = root
         .parent()
@@ -3731,7 +3859,8 @@ pub fn export(cfg: &Config, brain: &str, dir: Option<String>, skip_assets: bool)
                 None,
             )
         });
-    let paths: Vec<String> = all_paths().map(str::to_string).collect();
+    let mut paths: Vec<String> = all_paths().map(str::to_string).collect();
+    paths.push(VAULT_EXPORT_FILE.to_string());
     let backups = snapshot_missing_destinations(&paths);
     let created_directories = parent_directories(paths.iter().cloned());
     let completed = match install_complete_export(
@@ -3741,7 +3870,7 @@ pub fn export(cfg: &Config, brain: &str, dir: Option<String>, skip_assets: bool)
         backups,
         created_directories.clone(),
         &[],
-        None,
+        Some(&vault_entry),
     ) {
         Ok(completed) => completed,
         Err(error) => {
@@ -3789,8 +3918,15 @@ pub fn export(cfg: &Config, brain: &str, dir: Option<String>, skip_assets: bool)
     let mut data = r.as_object().cloned().unwrap_or_default();
     data.remove("files");
     data.remove("url");
+    data.remove("vaultItems");
     data.insert("dir".into(), json!(dir));
     data.insert("fileCount".into(), json!(entries.len()));
+    data.insert("vaultFile".into(), json!(VAULT_EXPORT_FILE));
+    data.insert("vaultNames".into(), json!(vault_names));
+    data.insert("vaultValuesIncluded".into(), json!(with_secrets));
+    if with_secrets {
+        data.insert("warning".into(), json!(VAULT_EXPORT_WARNING));
+    }
     let mut human = format!(
         "exported {} file(s) → {}",
         entries.len(),
@@ -3810,6 +3946,15 @@ pub fn export(cfg: &Config, brain: &str, dir: Option<String>, skip_assets: bool)
         }
         data.insert("assetRestore".into(), restore.to_json());
     }
+    human.push_str(&format!(
+        "\nvault: {} name(s) listed in {VAULT_EXPORT_FILE}; values {}",
+        vault_names.len(),
+        if with_secrets {
+            "included (private file; handle as credentials)"
+        } else {
+            "not included"
+        }
+    ));
     out_layout(&human, Some(Value::Object(data)));
 }
 

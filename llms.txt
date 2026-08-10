@@ -99,7 +99,12 @@ Commands:
                                           # {marked, closureMarked, alreadyCovered, warnings,
                                           # total, note}
     inbox list|drain <brain>              # drain prints full JSON (BYO-agent read half)
-    export <brain> [dir]                  # your brain back on disk
+    export <brain> [dir] [--with-secrets]
+                                          # your brain back on disk; vault names always land in
+                                          # private .sevra-vault.json. Values are absent unless
+                                          # --with-secrets is explicit; that file then contains
+                                          # recoverable base64 and must be handled as credentials.
+                                          # Dotfiles never ride a later push.
     validate [dir]                        # shells `dbmd validate --all`
     version | update                      # signed self-update; reports stale dbmd
 
