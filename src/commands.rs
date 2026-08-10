@@ -1513,6 +1513,92 @@ fn read_store_checked(dir: &str, scoped: bool) -> (Store, WalkStats) {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct WithheldPushMetadata {
+    paths: Vec<String>,
+    unlinked: usize,
+}
+
+/// Declare only kept-home names the hub already sees as link targets in the
+/// riding content. Every other kept-home filename remains local; only its
+/// contribution to `unlinked` crosses the boundary.
+fn withheld_push_metadata(
+    dir: &str,
+    store: &Store,
+    stats: &WalkStats,
+    scope: Option<&local::LocalScope>,
+) -> WithheldPushMetadata {
+    let kept_total = stats.kept_home + stats.catalogs_kept;
+    let Some(scope) = scope.filter(|scope| scope.active()) else {
+        return WithheldPushMetadata {
+            paths: Vec::new(),
+            unlinked: 0,
+        };
+    };
+    if kept_total == 0 {
+        return WithheldPushMetadata {
+            paths: Vec::new(),
+            unlinked: 0,
+        };
+    }
+    // No possible wiki-link token means no name needs parsing or disclosure.
+    // This fast path also keeps an unlinked local-only file from turning a
+    // routine push into a dependency on a second process.
+    if !store.files.iter().any(|file| file.content.contains("[[")) {
+        return WithheldPushMetadata {
+            paths: Vec::new(),
+            unlinked: kept_total,
+        };
+    }
+
+    // dbmd is the format authority for fence-aware wiki-link recognition and
+    // path normalization. A push with possible linked omissions refuses if it
+    // cannot compute the exact declaration; guessing would relabel true rot.
+    let emit = run_dbmd_emit_for(dir, "push withheld accounting");
+    let files = emit
+        .get("files")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_else(|| {
+            fail(
+                "push withheld accounting: `dbmd emit --json` returned no files array",
+                None,
+            )
+        });
+    let existing: BTreeSet<&str> = files
+        .iter()
+        .filter_map(|file| file.get("path").and_then(Value::as_str))
+        .collect();
+    let riding: BTreeSet<&str> = store.files.iter().map(|file| file.path.as_str()).collect();
+    let mut paths = BTreeSet::new();
+    for file in &files {
+        let Some(src) = file.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        if !riding.contains(src) {
+            continue;
+        }
+        for link in file
+            .get("links")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(target) = link.as_str() else {
+                continue;
+            };
+            if existing.contains(target) && scope.keeps_home(target) {
+                paths.insert(target.to_string());
+            }
+        }
+    }
+    let paths: Vec<String> = paths.into_iter().collect();
+    WithheldPushMetadata {
+        unlinked: kept_total.saturating_sub(paths.len()),
+        paths,
+    }
+}
+
 pub fn push(
     cfg: &Config,
     dir: &str,
@@ -1569,6 +1655,23 @@ pub fn push(
     // The markdown walk already validated this file; repeating the secure
     // load binds the following asset decisions to one explicit scope value.
     let scope = local::load(Path::new(dir)).unwrap_or_else(|msg| fail(&msg, None));
+    const MAX_WITHHELD_PATH_BYTES: usize = 2 * 1024 * 1024;
+    let withheld = withheld_push_metadata(dir, &store, &stats, scope.as_ref());
+    let withheld_path_bytes: usize = withheld.paths.iter().map(|path| path.len()).sum();
+    if withheld.paths.len() > MAX_STORE_FILES || withheld_path_bytes > MAX_WITHHELD_PATH_BYTES {
+        fail(
+            &format!(
+                "withheld declaration is too large ({} paths / {} UTF-8 bytes); reduce linked .sevralocal scope before pushing",
+                withheld.paths.len(),
+                withheld_path_bytes
+            ),
+            Some(json!({
+                "code": "withheld_declaration_too_large",
+                "paths": withheld.paths.len(),
+                "pathBytes": withheld_path_bytes,
+            })),
+        );
+    }
     // The last gate before bytes leave the machine: refuse secret-shaped
     // content and file names unless the operator explicitly overrides. Asset
     // bytes are checked against their exact manifest length and digest before
@@ -1624,6 +1727,8 @@ pub fn push(
         }
     }
     let mut payload = serde_json::to_value(&store).unwrap();
+    payload["withheld_paths"] = json!(withheld.paths);
+    payload["kept_home_unlinked"] = json!(withheld.unlinked);
     if force {
         payload["allow_shrink"] = json!(true);
     } else if let Some(baseline) = &prior_baseline {
@@ -1663,6 +1768,8 @@ pub fn push(
         }
         let sha256 = format!("{:x}", Sha256::digest(&pack));
         let mut meta = json!({ "sha256": sha256, "bytes": pack.len() });
+        meta["withheld_paths"] = json!(withheld.paths);
+        meta["kept_home_unlinked"] = json!(withheld.unlinked);
         if !force {
             if let Some(baseline) = &prior_baseline {
                 meta["expected_head_seq"] = json!(baseline.head_seq);
@@ -1697,12 +1804,20 @@ pub fn push(
     let s = r.get("indexed").cloned().unwrap_or(json!({}));
     let n = |k: &str| s.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
     let mut human = format!(
-        "pushed {file_count} files → indexed {} docs, {} edges ({} broken), {} assets",
+        "pushed {file_count} files → indexed {} docs, {} edges ({} withheld, {} broken), {} assets",
         n("documents"),
         n("edges"),
+        n("withheldEdges"),
         n("brokenEdges"),
         n("assets")
     );
+    if !withheld.paths.is_empty() || withheld.unlinked > 0 {
+        human.push_str(&format!(
+            "\nlinks: {} withheld target name(s) declared; {} other kept-home file(s) stay unnamed",
+            withheld.paths.len(),
+            withheld.unlinked,
+        ));
+    }
     // What stayed home, reported alongside what rode.
     let mut data = r;
     let brain_id = data
@@ -5811,7 +5926,7 @@ fn try_dbmd_emit(dir: &str) -> Option<Value> {
     serde_json::from_slice(&output.stdout).ok()
 }
 
-fn run_dbmd_emit(dir: &str) -> Value {
+fn run_dbmd_emit_for(dir: &str, purpose: &str) -> Value {
     let output = match Command::new("dbmd")
         .args(["emit", "--json"])
         .current_dir(dir)
@@ -5820,7 +5935,7 @@ fn run_dbmd_emit(dir: &str) -> Value {
         Ok(o) => o,
         Err(e) => fail(
             &format!(
-                "--closure needs dbmd and it could not run (is it installed? https://www.sevrahq.com/install): {e}"
+                "{purpose} needs dbmd and it could not run (is it installed? https://www.sevrahq.com/install): {e}"
             ),
             None,
         ),
@@ -5836,7 +5951,7 @@ fn run_dbmd_emit(dir: &str) -> Value {
             .collect();
         fail(
             &format!(
-                "--closure: `dbmd emit` failed in {dir}: {}",
+                "{purpose}: `dbmd emit` failed in {dir}: {}",
                 redact_path(first.trim())
             ),
             None,
@@ -5844,10 +5959,14 @@ fn run_dbmd_emit(dir: &str) -> Value {
     }
     serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
         fail(
-            &format!("--closure: `dbmd emit --json` produced unparseable output: {e}"),
+            &format!("{purpose}: `dbmd emit --json` produced unparseable output: {e}"),
             None,
         )
     })
+}
+
+fn run_dbmd_emit(dir: &str) -> Value {
+    run_dbmd_emit_for(dir, "--closure")
 }
 
 /// The undirected reachability component of `seeds` over the content graph

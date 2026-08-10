@@ -2,6 +2,12 @@
 
 ## 0.2.8 — 2026-08-10
 
+- Integrity: push now distinguishes a wiki-link intentionally withheld by
+  `.sevralocal` from a genuinely broken link. It uses `dbmd emit` locally and
+  declares only kept-home paths already named by riding content. Unlinked
+  kept-home files contribute a bare count, so their names never reach the hub.
+  Possible linked declarations fail closed before upload when dbmd cannot
+  compute them. JSON and pack transports carry identical bounded metadata.
 - New: `sevra secrets adopt [dir]` moves detected markdown credentials into
   the brain vault before replacing their literals with inert `$NAME`
   references. It deduplicates by value hash, derives deterministic

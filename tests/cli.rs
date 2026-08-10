@@ -2018,6 +2018,74 @@ fn fake_dbmd(bin_dir: &std::path::Path, emit_json: &str) {
 
 #[cfg(unix)]
 #[test]
+fn push_declares_only_linked_kept_home_names_and_counts_the_rest() {
+    let t = store_dir(&[
+        (
+            "a.md",
+            "Riding content links [[private]] twice: [[private]].",
+        ),
+        ("private.md", "linked but kept home"),
+        ("unlinked.md", "never named by riding content"),
+        (".sevralocal", "private.md\nunlinked.md\n"),
+    ]);
+    let bin = tempfile::tempdir().unwrap();
+    fake_dbmd(
+        bin.path(),
+        r#"{"store":".","files":[{"path":"a.md","links":["private.md"]},{"path":"private.md","links":[]},{"path":"unlinked.md","links":[]}],"summary":{"files":3,"sources":0,"records":3}}"#,
+    );
+    let (base, log, handle) = mock_hub(vec![(200, push_response(1, 0, 1))]);
+    let out = sevra()
+        .args(["push", t.path().to_str().unwrap(), "--brain", "b"])
+        .env("PATH", bin.path())
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", all_output(&out));
+    assert!(all_output(&out)
+        .contains("1 withheld target name(s) declared; 1 other kept-home file(s) stay unnamed"));
+    handle.join().unwrap();
+    let requests = log.lock().unwrap();
+    let body: serde_json::Value = serde_json::from_str(&requests[0].body).unwrap();
+    assert_eq!(body["withheld_paths"], serde_json::json!(["private.md"]));
+    assert_eq!(body["kept_home_unlinked"], 1);
+    assert!(
+        !requests[0].body.contains("unlinked.md")
+            && !requests[0].body.contains("never named by riding content"),
+        "an unlinked kept-home filename or body escaped: {}",
+        requests[0].body,
+    );
+    assert!(
+        !requests[0].body.contains("linked but kept home"),
+        "withheld metadata may name the target but never carry its body"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn push_with_possible_linked_withholding_refuses_without_dbmd_before_network() {
+    let t = store_dir(&[
+        ("a.md", "Maybe [[private]]."),
+        ("private.md", "kept"),
+        (".sevralocal", "private.md\n"),
+    ]);
+    let empty_bin = tempfile::tempdir().unwrap();
+    let (base, log, handle) = mock_hub(vec![]);
+    let out = sevra()
+        .args(["push", t.path().to_str().unwrap(), "--brain", "b"])
+        .env("PATH", empty_bin.path())
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(all_output(&out).contains("push withheld accounting needs dbmd"));
+    handle.join().unwrap();
+    assert!(log.lock().unwrap().is_empty(), "no request was attempted");
+}
+
+#[cfg(unix)]
+#[test]
 fn secrets_quarantine_closure_marks_the_linked_component() {
     let key = format!("AKIA{}", "J".repeat(16));
     let t = store_dir(&[
@@ -2517,7 +2585,14 @@ fn push_response(documents: u64, assets: u64, seq: u64) -> String {
         "headSeq": seq,
         "feedHash": feed,
         "packSha256": "a".repeat(64),
-        "indexed": { "documents": documents, "assets": assets },
+        "indexed": {
+            "documents": documents,
+            "edges": 0,
+            "resolvedEdges": 0,
+            "withheldEdges": 0,
+            "brokenEdges": 0,
+            "assets": assets
+        },
     })
     .to_string()
 }

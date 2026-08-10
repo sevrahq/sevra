@@ -60,7 +60,10 @@ Commands:
                                           # them is refused). Successful push records the
                                           # local baseline; later pushes are refused if the
                                           # durable hub feed advanced. --force explicitly
-                                          # replaces that newer state.
+                                          # replaces that newer state. Wiki-links from riding
+                                          # content to kept-home files are declared as withheld
+                                          # edges; other kept-home files contribute only an
+                                          # unnamed count. dbmd emit computes this locally.
     query <brain|--brain <ref>> [text] [--type --layer --meta-type --tag --where k=v --limit N]
     get <brain> <id|path> | graph <brain> <path> [--dir in|out|both]
     mcp                                   # stdio MCP server over the read surface
