@@ -35,6 +35,11 @@ use crate::output::{fail, note};
 /// neither a hostile manifest nor a compromised hub may make the CLI allocate
 /// or stream an unbounded object.
 const MAX_ASSET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Secret inspection is deliberately bounded independently of the transport
+/// ceiling. Assets above this size still use the streaming, checksummed
+/// transport, but the CLI says plainly that their content was not inspected.
+const MAX_ASSET_SECRET_SCAN_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_ASSET_SECRET_SCAN_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 
 fn reject_symlink_components(root: &Path, rel: &str) -> Result<(), String> {
     let mut current = root.to_path_buf();
@@ -544,6 +549,196 @@ pub fn parse_restore_manifest(manifest: Option<&[u8]>) -> Result<Vec<AssetDeclar
         });
     }
     Ok(declarations)
+}
+
+/// Coverage and omissions from the pre-upload asset secret gate. Counters are
+/// surfaced in both human and JSON output so a bounded scan is never mistaken
+/// for universal binary inspection.
+#[derive(Default)]
+pub struct AssetSecretScanReport {
+    pub hits: Vec<crate::scan::SecretHit>,
+    pub inspected: usize,
+    pub inspected_bytes: u64,
+    pub kept_home: usize,
+    pub skipped_too_large: usize,
+    pub skipped_budget: usize,
+    pub skipped_non_utf8: usize,
+    pub skipped_unavailable: usize,
+    pub skipped_drifted: usize,
+    pub invalid_manifest_rows: usize,
+}
+
+impl AssetSecretScanReport {
+    pub fn skipped(&self) -> usize {
+        self.skipped_too_large
+            + self.skipped_budget
+            + self.skipped_non_utf8
+            + self.skipped_unavailable
+            + self.skipped_drifted
+            + self.invalid_manifest_rows
+    }
+
+    pub fn coverage_note(&self) -> Option<String> {
+        if self.skipped() == 0 && self.kept_home == 0 {
+            return None;
+        }
+        Some(format!(
+            "asset secret scan inspected {} text asset(s); not inspected: {} over {} MiB, {} beyond the {} MiB total budget, {} binary/non-UTF-8, {} missing/unsafe, {} drifted, {} invalid manifest row(s); {} kept home by .sevralocal",
+            self.inspected,
+            self.skipped_too_large,
+            MAX_ASSET_SECRET_SCAN_BYTES / (1024 * 1024),
+            self.skipped_budget,
+            MAX_ASSET_SECRET_SCAN_TOTAL_BYTES / (1024 * 1024),
+            self.skipped_non_utf8,
+            self.skipped_unavailable,
+            self.skipped_drifted,
+            self.invalid_manifest_rows,
+            self.kept_home,
+        ))
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "inspected": self.inspected,
+            "inspectedBytes": self.inspected_bytes,
+            "keptHome": self.kept_home,
+            "skipped": {
+                "tooLarge": self.skipped_too_large,
+                "totalBudget": self.skipped_budget,
+                "nonUtf8": self.skipped_non_utf8,
+                "unavailable": self.skipped_unavailable,
+                "drifted": self.skipped_drifted,
+                "invalidManifestRows": self.invalid_manifest_rows,
+            },
+            "maxInspectedBytes": MAX_ASSET_SECRET_SCAN_BYTES,
+            "maxTotalInspectedBytes": MAX_ASSET_SECRET_SCAN_TOTAL_BYTES,
+        })
+    }
+}
+
+/// Parse the valid declaration rows for the scan without turning an unrelated
+/// malformed row into a claim that no other asset was inspected. The hub does
+/// not upload malformed declarations; they are counted explicitly instead.
+fn scan_declarations(manifest: Option<&str>) -> (Vec<AssetDeclaration>, usize) {
+    let Some(manifest) = manifest else {
+        return (Vec::new(), 0);
+    };
+    let mut declarations = Vec::new();
+    let mut invalid = 0usize;
+    for (index, raw) in manifest.lines().enumerate() {
+        if index >= MAX_MANIFEST_LINES {
+            invalid += 1;
+            continue;
+        }
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((path, sha256, bytes)) =
+            serde_json::from_str::<Value>(line).ok().and_then(|entry| {
+                let path = entry.get("path")?.as_str()?.to_string();
+                let sha256 = entry.get("sha256")?.as_str()?.to_string();
+                let bytes = entry.get("bytes")?.as_u64()?;
+                Some((path, sha256, bytes))
+            })
+        else {
+            invalid += 1;
+            continue;
+        };
+        let valid_sha = sha256.len() == 64
+            && sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
+        if crate::commands::validate_portable_asset_path(&path).is_err()
+            || !valid_sha
+            || bytes > MAX_ASSET_BYTES
+        {
+            invalid += 1;
+            continue;
+        }
+        declarations.push(AssetDeclaration {
+            path,
+            sha256,
+            bytes,
+        });
+    }
+    (declarations, invalid)
+}
+
+/// Scan the exact local bytes named by the pushed asset manifest. The held
+/// descriptor, manifest length, and SHA bind inspection to the same immutable
+/// content identity the upload path accepts. Missing, drifted, non-UTF-8, and
+/// oversized inputs are never silently treated as scanned.
+pub fn scan_declared_asset_secrets(
+    dir: &str,
+    manifest: Option<&str>,
+    scope: Option<&LocalScope>,
+    include_kept_home: bool,
+) -> AssetSecretScanReport {
+    let (declarations, invalid_manifest_rows) = scan_declarations(manifest);
+    let mut report = AssetSecretScanReport {
+        invalid_manifest_rows,
+        ..AssetSecretScanReport::default()
+    };
+    let root = Path::new(dir);
+    let mut scan_budget_used = 0_u64;
+
+    for declaration in declarations {
+        if !include_kept_home && scope.is_some_and(|s| s.keeps_home(&declaration.path)) {
+            report.kept_home += 1;
+            continue;
+        }
+        report
+            .hits
+            .extend(crate::scan::scan_path(&declaration.path));
+
+        let mut file = match open_asset_source(root, &declaration.path) {
+            Ok(file) => file,
+            Err(_) => {
+                report.skipped_unavailable += 1;
+                continue;
+            }
+        };
+        let Ok(metadata) = file.metadata() else {
+            report.skipped_unavailable += 1;
+            continue;
+        };
+        if metadata.len() != declaration.bytes {
+            report.skipped_drifted += 1;
+            continue;
+        }
+        if metadata.len() > MAX_ASSET_SECRET_SCAN_BYTES {
+            report.skipped_too_large += 1;
+            continue;
+        }
+        if scan_budget_used.saturating_add(metadata.len()) > MAX_ASSET_SECRET_SCAN_TOTAL_BYTES {
+            report.skipped_budget += 1;
+            continue;
+        }
+        scan_budget_used += metadata.len();
+
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        if Read::by_ref(&mut file)
+            .take(MAX_ASSET_SECRET_SCAN_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+            || bytes.len() as u64 != declaration.bytes
+            || format!("{:x}", Sha256::digest(&bytes)) != declaration.sha256
+        {
+            report.skipped_drifted += 1;
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            report.skipped_non_utf8 += 1;
+            continue;
+        };
+        report.inspected += 1;
+        report.inspected_bytes += bytes.len() as u64;
+        report
+            .hits
+            .extend(crate::scan::scan_content(&declaration.path, text));
+    }
+    report
 }
 
 pub struct PreparedAsset {

@@ -46,7 +46,8 @@ home = "0.5"
 # ecosystem standard; tiny (rtoolbox + the already-present libc family).
 rpassword = "7"
 # The push secret-scan preflight: one compiled RegexSet over the fixed
-# credential patterns, a single pass per file. The ecosystem standard; adds
+# credential patterns, with boundary validation for each candidate. The
+# ecosystem standard; adds
 # aho-corasick + regex-automata/-syntax (memchr was already in the tree).
 regex = "1"
 # `.sevralocal` (the store's local scope) entries are paths or globs; globset

@@ -935,6 +935,7 @@ fn fail_snapshot_limit(problem: &str, largest: &[(String, u64)], data: Value) ->
 
 /// How many secret hits a refusal shows before eliding.
 const SECRET_HITS_SHOWN: usize = 20;
+const EXISTING_BYTES_REMEDIATION: &str = "Already-pushed bytes persist in retained packs; a kept-home asset remains declared, so its blob is not swept; retention-locked backups persist for about 31 days. Rotate at the issuer immediately. Byte erasure requires `sevra delete`, completion of the sweep and backup-retention window, then a fresh push.";
 
 /// The hit list block shared by push's refusal and `secrets scan`: each hit
 /// as `path — kind`, never a matched value (paths that themselves match are
@@ -972,16 +973,24 @@ fn secret_hits_data(hits: &[SecretHit]) -> Value {
 
 /// The push secret-scan refusal, naming the three exits in order: keep the
 /// files home, edit them, or ship them anyway.
-fn fail_secret_hits(hits: &[SecretHit], dir: &str) -> ! {
+fn fail_secret_hits(
+    hits: &[SecretHit],
+    dir: &str,
+    asset_scan: Option<&crate::assets::AssetSecretScanReport>,
+) -> ! {
     let mut msg = format!(
         "push refused: {} match(es) for known secret formats in the store (matched values are never shown):",
         hits.len()
     );
     msg.push_str(&secret_hits_block(hits));
     msg.push_str(&format!(
-        "\nrotate anything that ever lived here; keep live secrets in a password manager and references to them in the brain.\nthree ways out, in order: `sevra secrets quarantine {dir}` (keep these files home) · edit the files yourself · `--allow-secrets` (push them verbatim)"
+        "\nrotate anything that ever lived here; keep live secrets in a password manager and references to them in the brain.\n{EXISTING_BYTES_REMEDIATION}\nthree ways out, in order: `sevra secrets quarantine {dir}` (keep these files home) · edit the files yourself · `--allow-secrets` (push them verbatim)"
     ));
-    fail(&msg, Some(secret_hits_data(hits)));
+    let mut data = secret_hits_data(hits);
+    if let (Some(scan), Some(object)) = (asset_scan, data.as_object_mut()) {
+        object.insert("assetSecretScan".into(), scan.to_json());
+    }
+    fail(&msg, Some(data));
 }
 
 fn body_code(r: &HubResponse) -> Option<&str> {
@@ -1108,12 +1117,37 @@ pub fn push(
             json!({ "limitFiles": MAX_STORE_FILES, "files": stats.files }),
         );
     }
+    // Load once for both the asset secret gate and the eventual byte sync.
+    // The markdown walk already validated this file; repeating the secure
+    // load binds the following asset decisions to one explicit scope value.
+    let scope = if skip_assets {
+        None
+    } else {
+        local::load(Path::new(dir)).unwrap_or_else(|msg| fail(&msg, None))
+    };
     // The last gate before bytes leave the machine: refuse secret-shaped
-    // content and file names unless the operator explicitly overrides.
+    // content and file names unless the operator explicitly overrides. Asset
+    // bytes are checked against their exact manifest length and digest before
+    // the first hub request; --skip-assets correctly skips bytes that will not
+    // upload during this push.
+    let mut asset_secret_scan = None;
     if !allow_secrets {
-        let hits = scan_store(&store);
+        let mut hits = scan_store(&store);
+        if !skip_assets {
+            let mut scan = crate::assets::scan_declared_asset_secrets(
+                dir,
+                store.assets.as_deref(),
+                scope.as_ref(),
+                false,
+            );
+            if let Some(message) = scan.coverage_note() {
+                note(&message);
+            }
+            hits.append(&mut scan.hits);
+            asset_secret_scan = Some(scan);
+        }
         if !hits.is_empty() {
-            fail_secret_hits(&hits, dir);
+            fail_secret_hits(&hits, dir, asset_secret_scan.as_ref());
         }
     }
     let mut payload = serde_json::to_value(&store).unwrap();
@@ -1191,6 +1225,9 @@ pub fn push(
     );
     // What stayed home, reported alongside what rode.
     let mut data = r;
+    if let (Some(scan), Some(object)) = (asset_secret_scan.as_ref(), data.as_object_mut()) {
+        object.insert("assetSecretScan".into(), scan.to_json());
+    }
     if stats.kept_home > 0 {
         human.push_str(&format!(
             "\n{} file(s) kept home (.sevralocal)",
@@ -1216,7 +1253,6 @@ pub fn push(
     // hashes) and skippable for a metadata-only push.
     let manifest_assets = n("assets");
     if !skip_assets && manifest_assets > 0 {
-        let scope = crate::local::load(Path::new(dir)).ok().flatten();
         let sync = crate::assets::sync_after_push(cfg, brain, dir, scope.as_ref());
         if sync.uploaded > 0 {
             human.push_str(&format!(
@@ -3026,7 +3062,7 @@ pub fn secrets_delete(cfg: &Config, brain: &str, name: &str) {
 // ever edits is `.sevralocal`, and only by appending.
 
 /// The forward-only truth, stated on every quarantine run.
-const FORWARD_ONLY_NOTE: &str = "kept-home is forward-only — files that already rode a push remain in earlier snapshots; marking removes them from the next snapshot and erases nothing";
+const FORWARD_ONLY_NOTE: &str = "kept-home is forward-only — marking changes future snapshots and erases nothing by itself. Files already pushed remain in retained packs; a kept-home asset remains declared, so its blob is not swept; retention-locked backups persist for about 31 days. Rotate at the issuer immediately. Byte erasure requires `sevra delete`, completion of the sweep and backup-retention window, then a fresh push";
 
 /// `secrets scan [dir]` — the push secret scan, read-only: report what a
 /// push of <dir> would refuse on, in exactly the push-refusal shape. Exit 1
@@ -3045,14 +3081,29 @@ pub fn secrets_scan(dir: Option<String>) {
             stats.kept_home
         ));
     }
-    let hits = scan_store(&store);
+    let scope = local::load(Path::new(&dir)).unwrap_or_else(|msg| fail(&msg, None));
+    let mut asset_scan = crate::assets::scan_declared_asset_secrets(
+        &dir,
+        store.assets.as_deref(),
+        scope.as_ref(),
+        false,
+    );
+    if let Some(message) = asset_scan.coverage_note() {
+        note(&message);
+    }
+    let mut hits = scan_store(&store);
+    hits.append(&mut asset_scan.hits);
     if hits.is_empty() {
         out(
             &format!(
                 "no matches for known secret formats across {} file(s)",
                 stats.files
             ),
-            Some(json!({ "secretHits": [], "total": 0 })),
+            Some(json!({
+                "secretHits": [],
+                "total": 0,
+                "assetSecretScan": asset_scan.to_json(),
+            })),
         );
         return;
     }
@@ -3062,9 +3113,13 @@ pub fn secrets_scan(dir: Option<String>) {
     );
     msg.push_str(&secret_hits_block(&hits));
     msg.push_str(&format!(
-        "\nrotate anything that ever lived here; keep live secrets in a password manager and references to them in the brain.\nkeep the files home instead of shipping them: `sevra secrets quarantine {dir}` — or edit them yourself"
+        "\nrotate anything that ever lived here; keep live secrets in a password manager and references to them in the brain.\n{EXISTING_BYTES_REMEDIATION}\nkeep the files home instead of shipping them: `sevra secrets quarantine {dir}` — or edit them yourself"
     ));
-    fail(&msg, Some(secret_hits_data(&hits)));
+    let mut data = secret_hits_data(&hits);
+    if let Some(object) = data.as_object_mut() {
+        object.insert("assetSecretScan".into(), asset_scan.to_json());
+    }
+    fail(&msg, Some(data));
 }
 
 /// `secrets quarantine [dir]` — keep secret-bearing files home: scan the
@@ -3085,7 +3140,17 @@ pub fn secrets_quarantine(dir: Option<String>, dry_run: bool, closure: bool) {
     let scope = local::load(Path::new(&dir)).unwrap_or_else(|msg| fail(&msg, None));
     let covered = |p: &str| scope.as_ref().is_some_and(|s| s.keeps_home(p));
     let (store, _stats) = read_store_checked(&dir, false);
-    let hits = scan_store(&store);
+    let mut asset_scan = crate::assets::scan_declared_asset_secrets(
+        &dir,
+        store.assets.as_deref(),
+        scope.as_ref(),
+        true,
+    );
+    if let Some(message) = asset_scan.coverage_note() {
+        note(&message);
+    }
+    let mut hits = scan_store(&store);
+    hits.append(&mut asset_scan.hits);
 
     // Unique hit files: exact path → shown (redacted) spelling.
     let mut hit_files: BTreeMap<String, String> = BTreeMap::new();
@@ -3288,6 +3353,7 @@ pub fn secrets_quarantine(dir: Option<String>, dry_run: bool, closure: bool) {
                 .map(|(kind, path)| json!({ "kind": kind, "path": path }))
                 .collect::<Vec<_>>(),
             "total": hits.len(),
+            "assetSecretScan": asset_scan.to_json(),
             "note": FORWARD_ONLY_NOTE,
         })),
     );

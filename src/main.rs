@@ -98,7 +98,8 @@ enum Commands {
     /// the hub. A push that would shrink the brain's document count is
     /// refused unless --force is given. Before anything uploads, the store is
     /// checked against the hub's snapshot limits and scanned for
-    /// secret-shaped file contents and names (--allow-secrets overrides).
+    /// secret-shaped markdown, asset contents, and names (--allow-secrets
+    /// overrides). Bounded asset inspection reports anything it skips.
     ///
     /// A `.sevralocal` file at the store root keeps files home: one
     /// store-relative path or glob per line (`#` comments). Matching files
@@ -285,15 +286,15 @@ enum SecretsAction {
         #[arg(value_parser = commands::parse_secret_name)]
         name: String,
     },
-    /// Scan a local store for secret-shaped file contents and names — the
-    /// same scan `push` runs, read-only and offline. Exit 1 on matches, 0
-    /// when clean; matched values are never shown. Honors `.sevralocal`
-    /// (kept-home files never ride, so they are not scanned).
+    /// Scan a local store for secret-shaped markdown, asset contents, and
+    /// names — the same bounded scan `push` runs, read-only and offline. Exit
+    /// 1 on matches, 0 when clean; matched values are never shown. Honors
+    /// `.sevralocal` (kept-home files never ride, so they are not scanned).
     Scan { dir: Option<String> },
     /// Keep secret-bearing files home: scan the full store and append each
     /// hit file's exact path to `.sevralocal` (created if absent), so the
-    /// NEXT push leaves those files on this machine. Forward-only: files
-    /// that already rode a push remain in earlier snapshots; marking erases
+    /// NEXT push leaves those files on this machine. Forward-only: retained
+    /// packs and backups preserve bytes that already rode; marking erases
     /// nothing. DB.md and assets.jsonl are never marked — they ride every
     /// push, so a secret inside them is an edit case.
     Quarantine {

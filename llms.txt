@@ -39,8 +39,11 @@ Commands:
                                           # locally are removed); --force allows a shrinking
                                           # replacement. Preflights the hub limits locally
                                           # (256 MiB pack / 512 MiB raw / 100k files, largest
-                                          # files listed) and refuses secret-shaped content or
-                                          # file names unless --allow-secrets. A `.sevralocal`
+                                          # files listed) and refuses secret-shaped markdown,
+                                          # asset bytes, or names unless --allow-secrets.
+                                          # Asset inspection is SHA-bound UTF-8, capped at
+                                          # 8 MiB each / 64 MiB total, and reports omissions.
+                                          # A `.sevralocal`
                                           # at the store root (one path/glob per line, `#`
                                           # comments) keeps matching files HOME: part of the
                                           # brain, never part of the cargo; the list never
@@ -64,14 +67,17 @@ Commands:
                                           # never echoed. NAME: ^[A-Z][A-Z0-9_]{0,63}$
     secrets scan [dir]                    # push's secret scan, read-only, offline: exit 1 on
                                           # matches ({"secretHits":[{path,kind,inPath}],
-                                          # "total", "error"}), 0 clean; values never shown;
-                                          # honors .sevralocal (kept-home files never ride)
+                                          # "total", "assetSecretScan", "error"}), 0 clean;
+                                          # values never shown; honors .sevralocal
+                                          # (kept-home files never ride)
     secrets quarantine [dir] [--dry-run] [--closure]
                                           # keep hit files home: scans the FULL store and
                                           # appends each hit file's exact path to .sevralocal
                                           # (created if absent; idempotent). Forward-only:
-                                          # earlier snapshots keep what already rode; marking
-                                          # affects the NEXT push only. --closure also marks
+                                          # retained packs keep what already rode; declared
+                                          # kept assets are not swept; backups retain ~31d.
+                                          # Rotate first; erasure requires brain delete + the
+                                          # retention window + fresh push. --closure also marks
                                           # wiki-linked files (needs dbmd). Never marks DB.md
                                           # or assets.jsonl (they ride; edit those). --json:
                                           # {marked, closureMarked, alreadyCovered, warnings,

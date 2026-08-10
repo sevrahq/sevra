@@ -5,9 +5,9 @@
 //! the hub index and the feed, not just the blob. A matched value is never
 //! printed on any path; a path that itself matches is shown redacted.
 //!
-//! Everything `push` sends is UTF-8 text (`.md` files plus the root
-//! `assets.jsonl`; binaries never ride a push), so the scan needs no lossy
-//! binary fallback — the content pass covers every byte that would leave.
+//! Markdown and `assets.jsonl` arrive here through [`scan_store`]. Declared
+//! asset bytes use the same entry scanner from `assets.rs`, after the asset
+//! transport has securely opened and verified the exact manifest bytes.
 
 use std::sync::OnceLock;
 
@@ -56,6 +56,35 @@ struct Scanner {
     each: Vec<Regex>,
 }
 
+/// Token formats are ASCII. Treat adjacent ASCII identifier bytes as part of
+/// the same run: a credential-shaped substring inside minified code, a hash,
+/// or encoded data is not a standalone token. Delimiters such as quotes,
+/// whitespace, `=`, `/`, and `:` remain valid boundaries.
+fn identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$'
+}
+
+fn bounded_spans<'a>(regex: &'a Regex, text: &'a str, right_boundary: bool) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
+    regex
+        .find_iter(text)
+        .filter_map(|found| {
+            let left_ok = found.start() == 0 || !identifier_byte(bytes[found.start() - 1]);
+            let right_ok = !right_boundary
+                || found.end() == bytes.len()
+                || !identifier_byte(bytes[found.end()]);
+            (left_ok && right_ok).then_some((found.start(), found.end()))
+        })
+        .collect()
+}
+
+fn right_boundary(index: usize) -> bool {
+    // The share-link pattern intentionally names the stable URL prefix. The
+    // share id begins immediately after `#`, so requiring a right boundary
+    // there would reject every real 1Password share link.
+    PATTERNS[index].0 != "1Password share link"
+}
+
 fn scanner() -> &'static Scanner {
     static SCANNER: OnceLock<Scanner> = OnceLock::new();
     SCANNER.get_or_init(|| {
@@ -76,12 +105,77 @@ fn scanner() -> &'static Scanner {
 /// unchanged.
 pub fn redact_path(text: &str) -> String {
     let sc = scanner();
-    let matches: Vec<usize> = sc.set.matches(text).into_iter().collect();
-    let mut redacted = text.to_string();
-    for idx in matches {
-        redacted = sc.each[idx].replace_all(&redacted, "\u{2026}").into_owned();
+    let mut spans = Vec::new();
+    for index in sc.set.matches(text) {
+        spans.extend(bounded_spans(&sc.each[index], text, right_boundary(index)));
     }
+    if spans.is_empty() {
+        return text.to_string();
+    }
+    spans.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in spans {
+        if let Some(last) = merged.last_mut() {
+            if start <= last.1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+    let mut redacted = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for (start, end) in merged {
+        redacted.push_str(&text[cursor..start]);
+        redacted.push('\u{2026}');
+        cursor = end;
+    }
+    redacted.push_str(&text[cursor..]);
     redacted
+}
+
+fn matching_patterns(text: &str) -> Vec<usize> {
+    let sc = scanner();
+    sc.set
+        .matches(text)
+        .into_iter()
+        .filter(|index| !bounded_spans(&sc.each[*index], text, right_boundary(*index)).is_empty())
+        .collect()
+}
+
+/// Scan a store-relative path. Asset transport uses this independently of
+/// content inspection so a binary or oversized asset can still be refused
+/// when its filename itself carries a credential.
+pub(crate) fn scan_path(path: &str) -> Vec<SecretHit> {
+    let matches = matching_patterns(path);
+    if matches.is_empty() {
+        return Vec::new();
+    }
+    let shown = redact_path(path);
+    matches
+        .into_iter()
+        .map(|index| SecretHit {
+            path: shown.clone(),
+            store_path: path.to_string(),
+            kind: PATTERNS[index].0,
+            in_path: true,
+        })
+        .collect()
+}
+
+/// Scan UTF-8 file bytes while reporting only the (possibly redacted) path
+/// and credential kind. Matched bytes never enter a printable field.
+pub(crate) fn scan_content(path: &str, content: &str) -> Vec<SecretHit> {
+    let shown = redact_path(path);
+    matching_patterns(content)
+        .into_iter()
+        .map(|index| SecretHit {
+            path: shown.clone(),
+            store_path: path.to_string(),
+            kind: PATTERNS[index].0,
+            in_path: false,
+        })
+        .collect()
 }
 
 /// Scan every file that would be pushed — content and path both. Hits carry
@@ -89,31 +183,10 @@ pub fn redact_path(text: &str) -> String {
 /// exact store path for `secrets quarantine` — never matched bytes on any
 /// printable field.
 pub fn scan_store(store: &Store) -> Vec<SecretHit> {
-    let sc = scanner();
     let mut hits = Vec::new();
     let mut check = |path: &str, content: &str| {
-        let path_matches: Vec<usize> = sc.set.matches(path).into_iter().collect();
-        let shown = if path_matches.is_empty() {
-            path.to_string()
-        } else {
-            redact_path(path)
-        };
-        for idx in path_matches {
-            hits.push(SecretHit {
-                path: shown.clone(),
-                store_path: path.to_string(),
-                kind: PATTERNS[idx].0,
-                in_path: true,
-            });
-        }
-        for idx in sc.set.matches(content) {
-            hits.push(SecretHit {
-                path: shown.clone(),
-                store_path: path.to_string(),
-                kind: PATTERNS[idx].0,
-                in_path: false,
-            });
-        }
+        hits.extend(scan_path(path));
+        hits.extend(scan_content(path, content));
     };
     for file in &store.files {
         check(&file.path, &file.content);
@@ -205,6 +278,28 @@ mod tests {
             let found = kinds_in(format!("text {value} text"));
             assert!(found.is_empty(), "false positive on {value:?}: {found:?}");
         }
+    }
+
+    #[test]
+    fn credential_shapes_inside_longer_identifier_runs_stay_clean() {
+        let github = fake("ghp_", "a", 36);
+        let aws = fake("AKIA", "B", 16);
+        let wrapped = format!("bundle={github}suffix;encoded=Z{aws}Q");
+        assert!(
+            kinds_in(wrapped).is_empty(),
+            "embedded substrings are not standalone credentials"
+        );
+
+        let standalone = kinds_in(format!("bundle=\"{github}\"; aws: {aws}"));
+        assert!(standalone.contains(&"GitHub personal access token"));
+        assert!(standalone.contains(&"AWS access key id"));
+    }
+
+    #[test]
+    fn redaction_only_blanks_boundary_valid_matches() {
+        let token = fake("ghp_", "a", 36);
+        let text = format!("x{token}y/{token}.md");
+        assert_eq!(redact_path(&text), format!("x{token}y/\u{2026}.md"));
     }
 
     #[test]

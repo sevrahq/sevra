@@ -5,6 +5,7 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use sha2::{Digest, Sha256};
 
 fn sevra() -> Command {
     let mut c = Command::cargo_bin("sevra").unwrap();
@@ -1940,6 +1941,162 @@ fn asset_store() -> tempfile::TempDir {
         ),
         ("_files/x.bin", "BLOB"),
     ])
+}
+
+fn manifest_asset_store(path: &str, bytes: &[u8], scope: Option<&str>) -> tempfile::TempDir {
+    let t = store_dir(&[(
+        "a.md",
+        "---\ntype: note\nsummary: asset fixture\n---\nasset fixture\n",
+    )]);
+    let asset = t.path().join(path);
+    std::fs::create_dir_all(asset.parent().unwrap()).unwrap();
+    std::fs::write(&asset, bytes).unwrap();
+    let sha256 = format!("{:x}", Sha256::digest(bytes));
+    std::fs::write(
+        t.path().join("assets.jsonl"),
+        format!(
+            "{{\"path\":\"{path}\",\"sha256\":\"{sha256}\",\"bytes\":{}}}\n",
+            bytes.len()
+        ),
+    )
+    .unwrap();
+    if let Some(scope) = scope {
+        std::fs::write(t.path().join(".sevralocal"), scope).unwrap();
+    }
+    t
+}
+
+#[test]
+fn push_refuses_a_secret_in_manifest_bound_asset_bytes_before_any_request() {
+    let token = format!("AKIA{}", "S".repeat(16));
+    let body = format!("provider_key={token}\n");
+    let t = manifest_asset_store("_files/provider.env", body.as_bytes(), None);
+    let out = sevra()
+        .args(["push", t.path().to_str().unwrap(), "--brain", "b"])
+        .env("SEVRA_HUB_URL", "http://localhost:9")
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let all = all_output(&out);
+    assert!(
+        all.contains("_files/provider.env") && all.contains("AWS access key id"),
+        "asset hit is reported in the standard refusal shape: {all}"
+    );
+    assert!(!all.contains(&token), "asset credential leaked: {all}");
+    assert!(
+        !all.contains("hub unreachable"),
+        "the asset gate must run before the first request: {all}"
+    );
+    assert!(
+        all.contains("Already-pushed bytes persist")
+            && all.contains("Rotate at the issuer immediately")
+            && all.contains("sevra delete"),
+        "the refusal carries precise existing-data remediation: {all}"
+    );
+}
+
+#[test]
+fn asset_scan_ignores_a_token_shape_inside_a_longer_minified_run() {
+    let token = format!("ghp_{}", "m".repeat(36));
+    let minified = format!("const x=\"A{token}Z\";");
+    let t = manifest_asset_store("_files/bundle.min.js", minified.as_bytes(), None);
+    sevra()
+        .args(["secrets", "scan", t.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no matches"));
+}
+
+#[test]
+fn asset_scan_names_bounded_binary_and_large_coverage_gaps() {
+    let t = manifest_asset_store("_files/image.bin", &[0xff, 0xfe, 0xfd], None);
+    let huge_path = t.path().join("_files/huge.txt");
+    let huge = std::fs::File::create(&huge_path).unwrap();
+    huge.set_len(8 * 1024 * 1024 + 1).unwrap();
+    drop(huge);
+    let mut manifest = std::fs::read_to_string(t.path().join("assets.jsonl")).unwrap();
+    manifest.push_str(&format!(
+        "{{\"path\":\"_files/huge.txt\",\"sha256\":\"{}\",\"bytes\":{}}}\n",
+        "0".repeat(64),
+        8 * 1024 * 1024 + 1
+    ));
+    std::fs::write(t.path().join("assets.jsonl"), manifest).unwrap();
+
+    sevra()
+        .args(["secrets", "scan", t.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no matches"))
+        .stderr(
+            predicate::str::contains("1 over 8 MiB")
+                .and(predicate::str::contains("1 binary/non-UTF-8")),
+        );
+
+    let json = sevra()
+        .args(["secrets", "scan", t.path().to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(json.status.success(), "{}", all_output(&json));
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let scan = &value["assetSecretScan"];
+    assert_eq!(scan["skipped"]["tooLarge"], 1);
+    assert_eq!(scan["skipped"]["nonUtf8"], 1);
+    assert_eq!(scan["maxInspectedBytes"], 8 * 1024 * 1024);
+    assert_eq!(scan["maxTotalInspectedBytes"], 64 * 1024 * 1024);
+}
+
+#[test]
+fn kept_home_asset_is_neither_scanned_nor_uploaded_but_quarantine_can_see_it() {
+    let token = format!("xoxb-{}", "7".repeat(10));
+    let body = format!("SLACK_TOKEN={token}\n");
+    let path = "_files/private.env";
+    let t = manifest_asset_store(path, body.as_bytes(), Some("_files/private.env\n"));
+    let manifest = std::fs::read_to_string(t.path().join("assets.jsonl")).unwrap();
+    let sha = serde_json::from_str::<serde_json::Value>(manifest.trim()).unwrap()["sha256"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let missing = format!(
+        r#"{{"assets":[{{"path":"{path}","sha256":"{sha}","bytes":{},"required":true,"presentInR2":false}}],"truncated":false}}"#,
+        body.len()
+    );
+    let (base, log, handle) = mock_hub(vec![
+        (200, r#"{"indexed":{"documents":1,"assets":1}}"#.to_string()),
+        (200, missing),
+    ]);
+    let out = sevra()
+        .args(["push", t.path().to_str().unwrap(), "--brain", "b"])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "push failed: {}", all_output(&out));
+    let all = all_output(&out);
+    assert!(!all.contains(&token), "kept-home bytes leaked: {all}");
+    assert!(all.contains("assets: 1 kept home"), "{all}");
+    handle.join().unwrap();
+    assert_eq!(
+        log.lock().unwrap().len(),
+        2,
+        "push + missing inventory only; no presign or PUT"
+    );
+
+    let quarantine = sevra()
+        .args(["secrets", "quarantine", t.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(quarantine.status.success(), "{}", all_output(&quarantine));
+    let all = all_output(&quarantine);
+    assert!(
+        all.contains("1 hit file(s) already covered by .sevralocal"),
+        "full-view quarantine sees the kept asset: {all}"
+    );
+    assert!(!all.contains(&token), "quarantine leaked the value: {all}");
+    assert_eq!(
+        std::fs::read_to_string(t.path().join(".sevralocal")).unwrap(),
+        "_files/private.env\n"
+    );
 }
 
 #[test]

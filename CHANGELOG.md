@@ -2,6 +2,15 @@
 
 ## 0.2.8 — 2026-07-30
 
+- Security: the pre-upload secret gate now scans the exact manifest-bound
+  bytes of declared assets up to an independent 8 MiB per-asset and 64 MiB
+  per-command inspection cap,
+  honors `.sevralocal`, and reports oversized, binary/non-UTF-8, unavailable,
+  drifted, and malformed-manifest omissions instead of implying full
+  coverage. Credential matches inside longer identifier runs no longer count,
+  preventing minified bundles and encoded blobs from training operators to
+  bypass the gate. Refusals state the forward-only remediation for bytes that
+  already reached retained packs, R2, and retention-locked backups.
 - Security: publisher-key rotation starts with an additive compatibility
   release. The updater and both installers trust the original and successor
   Ed25519 keys, while v0.2.8 remains signed by the original key. The
