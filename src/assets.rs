@@ -491,6 +491,58 @@ pub struct AssetDeclaration {
     pub bytes: u64,
 }
 
+/// Hash the current local bytes for every riding manifest declaration. Missing,
+/// unsafe, or over-limit paths are omitted so a baseline comparison reports
+/// them as divergent; an attacker-controlled path is never followed merely to
+/// produce a friendlier diff.
+pub fn current_declared_asset_hashes(
+    root: &Path,
+    declarations: &[AssetDeclaration],
+    scope: Option<&LocalScope>,
+) -> BTreeMap<String, String> {
+    let mut hashes = BTreeMap::new();
+    for declaration in declarations {
+        if scope.is_some_and(|value| value.keeps_home(&declaration.path)) {
+            continue;
+        }
+        let Ok(mut file) = open_asset_source(root, &declaration.path) else {
+            continue;
+        };
+        let Ok(metadata) = file.metadata() else {
+            continue;
+        };
+        if metadata.len() > MAX_ASSET_BYTES {
+            continue;
+        }
+        let mut hasher = Sha256::new();
+        let mut total = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        let mut valid = true;
+        loop {
+            let count = match file.read(&mut buffer) {
+                Ok(count) => count,
+                Err(_) => {
+                    valid = false;
+                    break;
+                }
+            };
+            if count == 0 {
+                break;
+            }
+            total = total.saturating_add(count as u64);
+            if total > MAX_ASSET_BYTES {
+                valid = false;
+                break;
+            }
+            hasher.update(&buffer[..count]);
+        }
+        if valid && total == metadata.len() {
+            hashes.insert(declaration.path.clone(), format!("{:x}", hasher.finalize()));
+        }
+    }
+    hashes
+}
+
 /// Parse the hosted manifest as untrusted input before the export root is
 /// touched. A malformed row cannot be silently skipped: that would make a
 /// successful export omit bytes the store explicitly declares.
@@ -803,6 +855,10 @@ pub struct PreparedRestore {
 impl PreparedRestore {
     pub fn assets_mut(&mut self) -> &mut [PreparedAsset] {
         &mut self.assets
+    }
+
+    pub fn pending_paths(&self) -> impl Iterator<Item = &str> {
+        self.assets.iter().map(|asset| asset.path.as_str())
     }
 
     pub fn report(&self) -> RestoreReport {

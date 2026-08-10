@@ -10,6 +10,7 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
@@ -23,7 +24,7 @@ use crate::local;
 use crate::output::{fail, json_mode, note, out, out_layout, terminal_safe, usage_fail};
 use crate::scan::{redact_path, scan_store, SecretHit};
 use crate::store::{
-    build_pack, read_store, read_store_unscoped, Store, StoreError, WalkStats,
+    build_pack, read_store, read_store_unscoped, Store, StoreError, StoreFile, WalkStats,
     MAX_CANONICAL_PACK_BYTES, MAX_PACK_FILES,
 };
 
@@ -42,6 +43,362 @@ const MAX_SECRET_VALUE_CHARS: usize = 4096;
 /// bounded before UTF-8 decoding so a hostile producer cannot grow memory
 /// without limit before the character-count check runs.
 const MAX_SECRET_STDIN_BYTES: usize = MAX_SECRET_VALUE_CHARS * 4 + 2;
+const SYNC_BASELINE_FILE: &str = ".sevra-sync.json";
+const MAX_SYNC_BASELINE_BYTES: u64 = 16 * 1024 * 1024;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncBaseline {
+    version: u8,
+    brain_id: String,
+    brain_slug: String,
+    head_seq: u64,
+    feed_hash: Option<String>,
+    pack_sha256: Option<String>,
+    paths: BTreeMap<String, String>,
+}
+
+struct PulledSnapshot {
+    response: Value,
+    brain_id: String,
+    brain_slug: String,
+    head_seq: u64,
+    feed_hash: Option<String>,
+    pack_sha256: Option<String>,
+    entries: Vec<(String, Vec<u8>)>,
+    assets: Vec<crate::assets::AssetDeclaration>,
+}
+
+fn canonical_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn valid_brain_slug(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 63
+        && value
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+}
+
+fn path_rides(scope: Option<&local::LocalScope>, path: &str) -> bool {
+    !scope.is_some_and(|value| {
+        value.keeps_home(path) || (value.active() && path.rsplit('/').next() == Some("index.md"))
+    })
+}
+
+fn expected_snapshot_hashes(
+    entries: &[(String, Vec<u8>)],
+    assets: &[crate::assets::AssetDeclaration],
+    scope: Option<&local::LocalScope>,
+) -> BTreeMap<String, String> {
+    let mut paths = BTreeMap::new();
+    for (path, bytes) in entries {
+        if path_rides(scope, path) {
+            paths.insert(path.clone(), format!("{:x}", Sha256::digest(bytes)));
+        }
+    }
+    for asset in assets {
+        if path_rides(scope, &asset.path) {
+            paths.insert(asset.path.clone(), asset.sha256.clone());
+        }
+    }
+    paths
+}
+
+fn current_store_hashes(root: &Path) -> Result<BTreeMap<String, String>, String> {
+    let root_text = root
+        .to_str()
+        .ok_or_else(|| "store directory is not portable UTF-8".to_string())?;
+    let (store, _) = match read_store(root_text, MAX_STORE_BYTES) {
+        Ok(value) => value,
+        Err(StoreError::OverCap(_)) => {
+            return Err("local store exceeds the 512 MB snapshot limit".to_string())
+        }
+        Err(StoreError::Scope(error)) => return Err(error),
+        Err(StoreError::Io(error)) => return Err(format!("could not read local store: {error}")),
+    };
+    let scope = local::load(root)?;
+    let mut hashes = BTreeMap::new();
+    for file in &store.files {
+        hashes.insert(
+            file.path.clone(),
+            format!("{:x}", Sha256::digest(file.content.as_bytes())),
+        );
+    }
+    let declarations = match store.assets.as_deref() {
+        Some(manifest) => {
+            hashes.insert(
+                "assets.jsonl".to_string(),
+                format!("{:x}", Sha256::digest(manifest.as_bytes())),
+            );
+            crate::assets::parse_restore_manifest(Some(manifest.as_bytes()))?
+        }
+        None => Vec::new(),
+    };
+    hashes.extend(crate::assets::current_declared_asset_hashes(
+        root,
+        &declarations,
+        scope.as_ref(),
+    ));
+    Ok(hashes)
+}
+
+fn validate_sync_baseline(mut baseline: SyncBaseline) -> Result<SyncBaseline, String> {
+    if baseline.version != 1 {
+        return Err(format!(
+            "unsupported {SYNC_BASELINE_FILE} version {}",
+            baseline.version
+        ));
+    }
+    if baseline.brain_id.is_empty()
+        || baseline.brain_id.len() > 200
+        || baseline.brain_id.chars().any(char::is_control)
+        || !valid_brain_slug(&baseline.brain_slug)
+    {
+        return Err(format!(
+            "{SYNC_BASELINE_FILE} has an invalid brain identity"
+        ));
+    }
+    if baseline.head_seq == 0 {
+        if baseline.feed_hash.is_some() || baseline.pack_sha256.is_some() {
+            return Err(format!(
+                "{SYNC_BASELINE_FILE} gives an empty brain a snapshot address"
+            ));
+        }
+    } else if !baseline.feed_hash.as_deref().is_some_and(canonical_sha256)
+        || !baseline
+            .pack_sha256
+            .as_deref()
+            .is_some_and(canonical_sha256)
+    {
+        return Err(format!(
+            "{SYNC_BASELINE_FILE} has an invalid durable snapshot address"
+        ));
+    }
+    if baseline.paths.len() > MAX_STORE_FILES + 100_000 {
+        return Err(format!("{SYNC_BASELINE_FILE} names too many paths"));
+    }
+    for (path, sha256) in &baseline.paths {
+        portable_export_components(path).map_err(|_| {
+            format!(
+                "{SYNC_BASELINE_FILE} contains an unsafe path: {}",
+                terminal_safe(path)
+            )
+        })?;
+        if path == SYNC_BASELINE_FILE || !canonical_sha256(sha256) {
+            return Err(format!(
+                "{SYNC_BASELINE_FILE} contains an invalid path digest"
+            ));
+        }
+    }
+    // Canonicalize empty optional strings away before later comparisons.
+    baseline.feed_hash = baseline.feed_hash.filter(|value| !value.is_empty());
+    baseline.pack_sha256 = baseline.pack_sha256.filter(|value| !value.is_empty());
+    Ok(baseline)
+}
+
+fn load_sync_baseline(root: &Path) -> Result<Option<SyncBaseline>, String> {
+    let Some(mut file) = crate::safe_path::open_regular(root, SYNC_BASELINE_FILE)
+        .map_err(|error| format!("cannot securely open {SYNC_BASELINE_FILE}: {error}"))?
+    else {
+        return Ok(None);
+    };
+    let advertised = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect {SYNC_BASELINE_FILE}: {error}"))?
+        .len();
+    if advertised > MAX_SYNC_BASELINE_BYTES {
+        return Err(format!("{SYNC_BASELINE_FILE} exceeds its 16 MiB limit"));
+    }
+    let bytes = read_bounded(&mut file, MAX_SYNC_BASELINE_BYTES)
+        .map_err(|error| format!("cannot read {SYNC_BASELINE_FILE}: {error}"))?;
+    let baseline: SyncBaseline = serde_json::from_slice(&bytes)
+        .map_err(|_| format!("{SYNC_BASELINE_FILE} is not valid baseline JSON"))?;
+    validate_sync_baseline(baseline).map(Some)
+}
+
+fn baseline_bytes(baseline: &SyncBaseline) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec_pretty(baseline).expect("baseline serializes");
+    bytes.push(b'\n');
+    bytes
+}
+
+fn write_sync_baseline(root: &Path, baseline: &SyncBaseline) -> Result<(), String> {
+    crate::safe_path::atomic_write(
+        root,
+        SYNC_BASELINE_FILE,
+        &baseline_bytes(baseline),
+        false,
+        0o600,
+    )
+    .map_err(|error| format!("could not securely update {SYNC_BASELINE_FILE}: {error}"))
+}
+
+fn store_from_entries(entries: &[(String, Vec<u8>)]) -> Result<Store, String> {
+    let mut store = Store {
+        files: Vec::new(),
+        assets: None,
+    };
+    for (path, bytes) in entries {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| format!("hub returned non-UTF-8 store content: {path}"))?;
+        if path == "assets.jsonl" {
+            store.assets = Some(text.to_string());
+        } else {
+            store.files.push(StoreFile {
+                path: path.clone(),
+                content: text.to_string(),
+            });
+        }
+    }
+    Ok(store)
+}
+
+fn entries_from_store(store: &Store) -> Vec<(String, Vec<u8>)> {
+    let mut entries: Vec<(String, Vec<u8>)> = store
+        .files
+        .iter()
+        .map(|file| (file.path.clone(), file.content.as_bytes().to_vec()))
+        .collect();
+    if let Some(assets) = &store.assets {
+        entries.push(("assets.jsonl".to_string(), assets.as_bytes().to_vec()));
+    }
+    entries
+}
+
+fn fetch_snapshot(cfg: &Config, brain: &str, exact: Option<(u64, &str)>) -> PulledSnapshot {
+    let query = match exact {
+        Some((seq, feed_hash)) => format!("?format=pack&atSeq={seq}&feedHash={}", enc(feed_hash)),
+        None => "?format=pack".to_string(),
+    };
+    let response = ensure_ok(
+        request(
+            cfg,
+            "GET",
+            &format!("/api/hub/brains/{}/export{}", enc(brain), query),
+            None,
+            true,
+        ),
+        "fetch brain snapshot",
+    );
+    let brain_id = response
+        .get("brain")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 200)
+        .unwrap_or_else(|| fail("hub returned no valid brain identity", None))
+        .to_string();
+    let brain_slug = response
+        .get("slug")
+        .and_then(Value::as_str)
+        .filter(|value| valid_brain_slug(value))
+        .unwrap_or_else(|| fail("hub returned no valid brain slug", None))
+        .to_string();
+    let head_seq = response
+        .get("headSeq")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| fail("hub returned no valid feed sequence", None));
+    let feed_hash = response
+        .get("feedHash")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if head_seq > 0 && !feed_hash.as_deref().is_some_and(canonical_sha256) {
+        fail("hub returned an invalid feed hash", None);
+    }
+    if head_seq == 0 && feed_hash.is_some() {
+        fail("hub returned a feed hash for an empty brain", None);
+    }
+    if let Some((expected_seq, expected_hash)) = exact {
+        if head_seq != expected_seq || feed_hash.as_deref() != Some(expected_hash) {
+            fail(
+                "hub returned a snapshot other than the exact requested feed head",
+                None,
+            );
+        }
+    }
+
+    let (entries, pack_sha256): (Vec<(String, Vec<u8>)>, Option<String>) =
+        if let Some(url) = response.get("url").and_then(Value::as_str) {
+            let expected = response
+                .get("sha256")
+                .and_then(Value::as_str)
+                .filter(|sha| canonical_sha256(sha))
+                .unwrap_or_else(|| fail("hub returned an invalid pack hash", None));
+            let pack = get_presigned(cfg, url, MAX_PACK_BYTES);
+            let actual = format!("{:x}", Sha256::digest(&pack));
+            if actual != expected {
+                fail("downloaded store pack failed SHA-256 verification", None);
+            }
+            (entries_from_pack(pack), Some(expected.to_string()))
+        } else {
+            let files = response
+                .get("files")
+                .and_then(Value::as_array)
+                .unwrap_or_else(|| fail("hub returned neither a store pack nor files", None));
+            let entries: Vec<(String, Vec<u8>)> = files
+                .iter()
+                .map(|file| {
+                    let path = file
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .unwrap_or_else(|| fail("refusing malformed file path from hub", None));
+                    let content = file
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or_else(|| fail("refusing malformed file content from hub", None));
+                    (path.to_string(), content.as_bytes().to_vec())
+                })
+                .collect();
+            let digest = if entries.is_empty() {
+                None
+            } else {
+                let store = store_from_entries(&entries).unwrap_or_else(|error| fail(&error, None));
+                let pack = build_pack(&store)
+                    .unwrap_or_else(|error| fail(&format!("invalid hosted store: {error}"), None));
+                Some(format!("{:x}", Sha256::digest(pack)))
+            };
+            (entries, digest)
+        };
+    if head_seq > 0 && pack_sha256.is_none() {
+        fail(
+            "hub returned a non-empty feed head without a store pack",
+            None,
+        );
+    }
+
+    let manifest = entries
+        .iter()
+        .find(|(path, _)| path == "assets.jsonl")
+        .map(|(_, bytes)| bytes.as_slice());
+    for (path, _) in &entries {
+        validate_portable_core_path(path).unwrap_or_else(|error| fail(&error, None));
+    }
+    let assets =
+        crate::assets::parse_restore_manifest(manifest).unwrap_or_else(|error| fail(&error, None));
+    validate_export_paths(
+        entries
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .chain(assets.iter().map(|asset| asset.path.as_str())),
+    )
+    .unwrap_or_else(|error| fail(&error, None));
+
+    PulledSnapshot {
+        response,
+        brain_id,
+        brain_slug,
+        head_seq,
+        feed_hash,
+        pack_sha256,
+        entries,
+        assets,
+    }
+}
 
 pub(crate) fn enc(s: &str) -> String {
     // Percent-encode a path segment for a URL (RFC 3986 unreserved kept).
@@ -1091,6 +1448,9 @@ pub fn push(
     if !Path::new(dir).exists() {
         fail(&format!("store directory not found: {dir}"), None);
     }
+    let root = std::fs::canonicalize(dir)
+        .unwrap_or_else(|error| fail(&format!("could not resolve store directory: {error}"), None));
+    let prior_baseline = load_sync_baseline(&root).unwrap_or_else(|error| fail(&error, None));
     let (store, stats) = read_store_checked(dir, true);
     if store.files.is_empty() {
         let kept = stats.kept_home + stats.catalogs_kept;
@@ -1120,11 +1480,7 @@ pub fn push(
     // Load once for both the asset secret gate and the eventual byte sync.
     // The markdown walk already validated this file; repeating the secure
     // load binds the following asset decisions to one explicit scope value.
-    let scope = if skip_assets {
-        None
-    } else {
-        local::load(Path::new(dir)).unwrap_or_else(|msg| fail(&msg, None))
-    };
+    let scope = local::load(Path::new(dir)).unwrap_or_else(|msg| fail(&msg, None));
     // The last gate before bytes leave the machine: refuse secret-shaped
     // content and file names unless the operator explicitly overrides. Asset
     // bytes are checked against their exact manifest length and digest before
@@ -1150,9 +1506,40 @@ pub fn push(
             fail_secret_hits(&hits, dir, asset_secret_scan.as_ref());
         }
     }
+    if let Some(baseline) = &prior_baseline {
+        let remote = ensure_ok(
+            request(
+                cfg,
+                "GET",
+                &format!("/api/hub/brains/{}", enc(brain)),
+                None,
+                true,
+            ),
+            "check clone identity",
+        );
+        let remote_id = remote
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| fail("hub returned no valid brain identity", None));
+        if remote_id != baseline.brain_id {
+            fail(
+                &format!(
+                    "this clone belongs to brain {}; refusing to push it to a different brain",
+                    terminal_safe(&baseline.brain_slug)
+                ),
+                Some(json!({
+                    "code": "brain_identity_mismatch",
+                    "baselineBrain": baseline.brain_id,
+                    "requestedBrain": remote_id,
+                })),
+            );
+        }
+    }
     let mut payload = serde_json::to_value(&store).unwrap();
     if force {
         payload["allow_shrink"] = json!(true);
+    } else if let Some(baseline) = &prior_baseline {
+        payload["expected_head_seq"] = json!(baseline.head_seq);
     }
     let file_count = store.files.len();
     // Everything the walk kept home — the honest count when the hub's shrink
@@ -1187,7 +1574,12 @@ pub fn push(
             );
         }
         let sha256 = format!("{:x}", Sha256::digest(&pack));
-        let meta = json!({ "sha256": sha256, "bytes": pack.len() });
+        let mut meta = json!({ "sha256": sha256, "bytes": pack.len() });
+        if !force {
+            if let Some(baseline) = &prior_baseline {
+                meta["expected_head_seq"] = json!(baseline.head_seq);
+            }
+        }
         let presigned = ensure_ok(
             request(
                 cfg,
@@ -1225,6 +1617,83 @@ pub fn push(
     );
     // What stayed home, reported alongside what rode.
     let mut data = r;
+    let brain_id = data
+        .get("brain")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 200)
+        .unwrap_or_else(|| {
+            fail(
+                "push committed but the hub returned no valid brain identity",
+                None,
+            )
+        })
+        .to_string();
+    let brain_slug = data
+        .get("slug")
+        .and_then(Value::as_str)
+        .filter(|value| valid_brain_slug(value))
+        .or_else(|| {
+            prior_baseline
+                .as_ref()
+                .map(|value| value.brain_slug.as_str())
+        })
+        .unwrap_or_else(|| {
+            fail(
+                "push committed but the hub returned no valid brain slug",
+                None,
+            )
+        })
+        .to_string();
+    let head_seq = data
+        .get("headSeq")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| fail("push committed but the hub returned no feed sequence", None));
+    let feed_hash = data
+        .get("feedHash")
+        .and_then(Value::as_str)
+        .filter(|value| canonical_sha256(value))
+        .unwrap_or_else(|| {
+            fail(
+                "push committed but the hub returned no valid feed hash",
+                None,
+            )
+        })
+        .to_string();
+    let pack_sha256 = data
+        .get("packSha256")
+        .and_then(Value::as_str)
+        .filter(|value| canonical_sha256(value))
+        .unwrap_or_else(|| {
+            fail(
+                "push committed but the hub returned no valid pack hash",
+                None,
+            )
+        })
+        .to_string();
+    let snapshot_entries = entries_from_store(&store);
+    let asset_declarations =
+        crate::assets::parse_restore_manifest(store.assets.as_deref().map(str::as_bytes))
+            .unwrap_or_else(|error| fail(&error, None));
+    let next_baseline = SyncBaseline {
+        version: 1,
+        brain_id,
+        brain_slug,
+        head_seq,
+        feed_hash: Some(feed_hash),
+        pack_sha256: Some(pack_sha256),
+        paths: expected_snapshot_hashes(&snapshot_entries, &asset_declarations, scope.as_ref()),
+    };
+    write_sync_baseline(&root, &next_baseline).unwrap_or_else(|error| {
+        fail(
+            &format!(
+                "push committed at feed sequence {head_seq}, but the local divergence baseline could not be updated: {error}"
+            ),
+            Some(json!({ "code": "baseline_write_failed", "headSeq": head_seq })),
+        )
+    });
+    if let Some(object) = data.as_object_mut() {
+        object.insert("baseline".into(), json!(SYNC_BASELINE_FILE));
+    }
     if let (Some(scan), Some(object)) = (asset_secret_scan.as_ref(), data.as_object_mut()) {
         object.insert("assetSecretScan".into(), scan.to_json());
     }
@@ -2039,9 +2508,12 @@ struct ExportFingerprint {
 }
 
 #[derive(Clone)]
-struct InstalledState {
-    fingerprint: ExportFingerprint,
-    sha256: [u8; 32],
+enum InstalledState {
+    File {
+        fingerprint: ExportFingerprint,
+        sha256: [u8; 32],
+    },
+    Missing,
 }
 
 struct ExportBackup {
@@ -2125,7 +2597,6 @@ fn parent_directories(paths: impl IntoIterator<Item = String>) -> Vec<String> {
     directories
 }
 
-#[cfg(test)]
 fn snapshot_held_destinations(
     root: &crate::safe_path::SafeDir,
     paths: &[String],
@@ -2209,7 +2680,7 @@ fn capture_installed_state(
             terminal_safe(path)
         ));
     }
-    Ok(InstalledState {
+    Ok(InstalledState::File {
         fingerprint,
         sha256: actual,
     })
@@ -2226,11 +2697,18 @@ fn rollback_held_export(
             continue;
         };
         let current = held_file_state(root, &backup.path);
-        let unchanged = match current {
-            Ok(Some((bytes, _, fingerprint))) => {
+        let unchanged = match (installed, current) {
+            (
+                InstalledState::File {
+                    fingerprint: expected_fingerprint,
+                    sha256: expected_sha256,
+                },
+                Ok(Some((bytes, _, fingerprint))),
+            ) => {
                 let sha256: [u8; 32] = Sha256::digest(&bytes).into();
-                fingerprint == installed.fingerprint && sha256 == installed.sha256
+                fingerprint == *expected_fingerprint && sha256 == *expected_sha256
             }
+            (InstalledState::Missing, Ok(None)) => true,
             _ => false,
         };
         if !unchanged {
@@ -2296,6 +2774,8 @@ fn install_complete_export(
     prepared: &mut crate::assets::PreparedRestore,
     mut backups: Vec<ExportBackup>,
     created_directories: Vec<String>,
+    remove_paths: &[String],
+    final_entry: Option<&(String, Vec<u8>)>,
 ) -> Result<Vec<ExportBackup>, String> {
     verify_export_snapshot(root, &backups)?;
     let mut completed = 0usize;
@@ -2387,7 +2867,7 @@ fn install_complete_export(
         let digest = Sha256::digest(&installed.0);
         let actual_sha256 = format!("{digest:x}");
         let sha256: [u8; 32] = digest.into();
-        backups[completed].installed = Some(InstalledState {
+        backups[completed].installed = Some(InstalledState::File {
             fingerprint: installed.2,
             sha256,
         });
@@ -2405,6 +2885,75 @@ fn install_complete_export(
             };
         }
         completed += 1;
+    }
+    for path in remove_paths {
+        let removed = root.remove_regular(path).map_err(|error| {
+            format!(
+                "secure pull removal failed for {}: {error}",
+                terminal_safe(path)
+            )
+        });
+        match removed {
+            Ok(true) => backups[completed].installed = Some(InstalledState::Missing),
+            Ok(false) => {
+                let error = format!(
+                    "pull destination disappeared during replacement: {}",
+                    terminal_safe(path)
+                );
+                let rollback =
+                    rollback_held_export(root, &backups[..completed], &created_directories);
+                return match rollback {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => {
+                        Err(format!("{error}; rollback also failed: {rollback_error}"))
+                    }
+                };
+            }
+            Err(error) => {
+                let rollback =
+                    rollback_held_export(root, &backups[..completed], &created_directories);
+                return match rollback {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => {
+                        Err(format!("{error}; rollback also failed: {rollback_error}"))
+                    }
+                };
+            }
+        }
+        completed += 1;
+    }
+    if let Some((path, content)) = final_entry {
+        let expected_missing = backups[completed].bytes.is_none();
+        let write = if expected_missing {
+            root.atomic_create(path, content, true, 0o600)
+        } else {
+            root.atomic_write(path, content, true, 0o600)
+        };
+        if let Err(error) = write {
+            let rollback = rollback_held_export(root, &backups[..completed], &created_directories);
+            return match rollback {
+                Ok(()) => Err(format!(
+                    "secure baseline write failed: {error}; all store changes were rolled back"
+                )),
+                Err(rollback_error) => Err(format!(
+                    "secure baseline write failed: {error}; rollback also failed: {rollback_error}"
+                )),
+            };
+        }
+        let sha256: [u8; 32] = Sha256::digest(content).into();
+        match capture_installed_state(root, path, sha256) {
+            Ok(installed) => backups[completed].installed = Some(installed),
+            Err(error) => {
+                let rollback =
+                    rollback_held_export(root, &backups[..completed], &created_directories);
+                return match rollback {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => {
+                        Err(format!("{error}; rollback also failed: {rollback_error}"))
+                    }
+                };
+            }
+        }
     }
     Ok(backups)
 }
@@ -2735,6 +3284,8 @@ pub fn export(cfg: &Config, brain: &str, dir: Option<String>, skip_assets: bool)
         &mut prepared,
         backups,
         created_directories.clone(),
+        &[],
+        None,
     ) {
         Ok(completed) => completed,
         Err(error) => {
@@ -2802,6 +3353,368 @@ pub fn export(cfg: &Config, brain: &str, dir: Option<String>, skip_assets: bool)
             human.push_str(&format!("\nassets: all {} present", restore.present));
         }
         data.insert("assetRestore".into(), restore.to_json());
+    }
+    out_layout(&human, Some(Value::Object(data)));
+}
+
+pub fn clone_brain(cfg: &Config, brain: &str, dir: Option<String>) {
+    let snapshot = fetch_snapshot(cfg, brain, None);
+    let dir = dir.unwrap_or_else(|| format!("./{}", snapshot.brain_slug));
+    let root = normalize(
+        &std::fs::canonicalize(".")
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(&dir),
+    );
+    match std::fs::symlink_metadata(&root) {
+        Ok(_) => fail(
+            "clone destination already exists; choose a fresh directory",
+            None,
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => fail(&format!("cannot inspect clone destination: {error}"), None),
+    }
+    for (path, _) in &snapshot.entries {
+        if contained(&root, path).is_none() {
+            fail(
+                &format!("refusing unsafe clone path: {}", terminal_safe(path)),
+                None,
+            );
+        }
+    }
+    let baseline = SyncBaseline {
+        version: 1,
+        brain_id: snapshot.brain_id.clone(),
+        brain_slug: snapshot.brain_slug.clone(),
+        head_seq: snapshot.head_seq,
+        feed_hash: snapshot.feed_hash.clone(),
+        pack_sha256: snapshot.pack_sha256.clone(),
+        paths: expected_snapshot_hashes(&snapshot.entries, &snapshot.assets, None),
+    };
+    validate_sync_baseline(baseline.clone())
+        .unwrap_or_else(|error| fail(&format!("cannot record clone baseline: {error}"), None));
+    let entries = snapshot.entries;
+    let baseline_entry = (SYNC_BASELINE_FILE.to_string(), baseline_bytes(&baseline));
+    let mut prepared = crate::assets::prepare_restore(cfg, brain, None, &snapshot.assets)
+        .unwrap_or_else(|error| fail(&error, None));
+
+    let parent_path = root
+        .parent()
+        .unwrap_or_else(|| fail("clone destination has no parent directory", None));
+    let target_name = root
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or_else(|| fail("clone destination name is not portable UTF-8", None));
+    crate::safe_path::ensure_dir(parent_path, 0o755).unwrap_or_else(|error| {
+        fail(
+            &format!("cannot securely create clone parent without following links: {error}"),
+            None,
+        )
+    });
+    let parent = crate::safe_path::SafeDir::open(parent_path)
+        .unwrap_or_else(|error| fail(&format!("cannot securely hold clone parent: {error}"), None));
+    let mut random = [0_u8; 16];
+    getrandom::getrandom(&mut random)
+        .unwrap_or_else(|_| fail("operating-system randomness unavailable", None));
+    let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+    let stage_name = format!(".sevra-clone-{suffix}");
+    let stage = parent
+        .create_dir(&stage_name, 0o700)
+        .unwrap_or_else(|error| fail(&format!("cannot create private clone stage: {error}"), None));
+    let paths: Vec<String> = entries
+        .iter()
+        .map(|(path, _)| path.clone())
+        .chain(snapshot.assets.iter().map(|asset| asset.path.clone()))
+        .chain(std::iter::once(baseline_entry.0.clone()))
+        .collect();
+    let backups = snapshot_missing_destinations(&paths);
+    let created_directories = parent_directories(paths.iter().cloned());
+    let completed = match install_complete_export(
+        &stage,
+        &entries,
+        &mut prepared,
+        backups,
+        created_directories.clone(),
+        &[],
+        Some(&baseline_entry),
+    ) {
+        Ok(completed) => completed,
+        Err(error) => {
+            drop(stage);
+            match parent.remove_empty_dir(&stage_name) {
+                Ok(_) => fail(&error, None),
+                Err(cleanup_error) => fail(
+                    &format!("{error}; private stage cleanup also failed: {cleanup_error}"),
+                    None,
+                ),
+            }
+        }
+    };
+    drop(stage);
+    if let Err(error) = parent.publish_dir_no_replace(&stage_name, target_name) {
+        let rollback = parent
+            .open_dir(std::ffi::OsStr::new(&stage_name))
+            .map_err(|open_error| open_error.to_string())
+            .and_then(|stage| {
+                rollback_held_export(&stage, &completed, &created_directories)
+                    .map_err(|rollback_error| rollback_error.to_string())
+            })
+            .and_then(|()| {
+                parent
+                    .remove_empty_dir(&stage_name)
+                    .map(|_| ())
+                    .map_err(|remove_error| remove_error.to_string())
+            });
+        match rollback {
+            Ok(()) => fail(
+                &format!(
+                    "clone destination appeared before atomic publish: {error}; private stage was removed"
+                ),
+                None,
+            ),
+            Err(rollback_error) => fail(
+                &format!(
+                    "clone destination appeared before atomic publish: {error}; stage cleanup also failed: {rollback_error}"
+                ),
+                None,
+            ),
+        }
+    }
+
+    let restore = prepared.report();
+    let mut data = snapshot.response.as_object().cloned().unwrap_or_default();
+    data.remove("files");
+    data.remove("url");
+    data.insert("dir".into(), json!(dir));
+    data.insert("baseline".into(), json!(SYNC_BASELINE_FILE));
+    data.insert("fileCount".into(), json!(baseline.paths.len()));
+    data.insert("assetRestore".into(), restore.to_json());
+    let mut human = format!(
+        "cloned {} file(s) at feed sequence {} → {}",
+        baseline.paths.len(),
+        baseline.head_seq,
+        terminal_safe(&dir)
+    );
+    if restore.restored > 0 {
+        human.push_str(&format!(
+            "\nassets: {} restored ({})",
+            restore.restored,
+            human_size(restore.restored_bytes)
+        ));
+    }
+    out_layout(&human, Some(Value::Object(data)));
+}
+
+fn divergence_paths(
+    baseline: &SyncBaseline,
+    current: &BTreeMap<String, String>,
+    scope: Option<&local::LocalScope>,
+) -> Vec<String> {
+    let keys: BTreeSet<String> = baseline
+        .paths
+        .keys()
+        .filter(|path| path_rides(scope, path))
+        .cloned()
+        .chain(current.keys().cloned())
+        .collect();
+    keys.into_iter()
+        .filter(|path| baseline.paths.get(path) != current.get(path))
+        .collect()
+}
+
+fn fail_local_divergence(paths: &[String], dir: &str) -> ! {
+    let shown = paths.len().min(20);
+    let mut message = format!(
+        "pull refused: the local store diverged from its clone baseline in {} path(s):",
+        paths.len()
+    );
+    for path in &paths[..shown] {
+        message.push_str(&format!("\n  {}", terminal_safe(path)));
+    }
+    if paths.len() > shown {
+        message.push_str(&format!("\n  … and {} more", paths.len() - shown));
+    }
+    message.push_str(&format!(
+        "\npush the local work first, reconcile it, or retry `sevra pull {dir} --force` only to discard it"
+    ));
+    fail(
+        &message,
+        Some(json!({ "code": "local_divergence", "paths": paths })),
+    );
+}
+
+pub fn pull(cfg: &Config, dir: Option<String>, force: bool) {
+    let dir = dir.unwrap_or_else(|| ".".to_string());
+    let root = std::fs::canonicalize(&dir)
+        .unwrap_or_else(|error| fail(&format!("cannot open pull directory {dir}: {error}"), None));
+    let baseline = load_sync_baseline(&root)
+        .unwrap_or_else(|error| fail(&error, None))
+        .unwrap_or_else(|| {
+            fail(
+                &format!(
+                    "{dir} is not a Sevra clone ({SYNC_BASELINE_FILE} is missing); use `sevra clone <brain> [dir]` first"
+                ),
+                None,
+            )
+        });
+    let scope = local::load(&root).unwrap_or_else(|error| fail(&error, None));
+    let current = current_store_hashes(&root).unwrap_or_else(|error| fail(&error, None));
+    let divergent = divergence_paths(&baseline, &current, scope.as_ref());
+    if !divergent.is_empty() && !force {
+        fail_local_divergence(&divergent, &dir);
+    }
+
+    let remote = ensure_ok(
+        request(
+            cfg,
+            "GET",
+            &format!("/api/hub/brains/{}", enc(&baseline.brain_id)),
+            None,
+            true,
+        ),
+        "check brain head",
+    );
+    let remote_id = remote
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| fail("hub returned no valid brain identity", None));
+    if remote_id != baseline.brain_id {
+        fail("hub resolved the clone baseline to a different brain", None);
+    }
+    let remote_seq = remote
+        .get("headSeq")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| fail("hub returned no valid feed sequence", None));
+    let remote_hash = remote.get("feedHash").and_then(Value::as_str);
+    if remote_seq > 0 && !remote_hash.is_some_and(canonical_sha256) {
+        fail("hub returned an invalid feed hash", None);
+    }
+    if remote_seq < baseline.head_seq {
+        fail(
+            "hub feed sequence moved backwards; refusing to replace the clone",
+            None,
+        );
+    }
+    if !force && remote_seq == baseline.head_seq && remote_hash == baseline.feed_hash.as_deref() {
+        out(
+            &format!("already current at feed sequence {remote_seq}"),
+            Some(json!({
+                "brain": baseline.brain_id,
+                "slug": baseline.brain_slug,
+                "headSeq": remote_seq,
+                "changed": false,
+                "dir": dir,
+            })),
+        );
+        return;
+    }
+    let exact_hash = remote_hash.unwrap_or_else(|| {
+        fail(
+            "the hosted brain has no durable snapshot to pull",
+            Some(json!({ "headSeq": remote_seq })),
+        )
+    });
+    let snapshot = fetch_snapshot(cfg, &baseline.brain_id, Some((remote_seq, exact_hash)));
+    if snapshot.brain_id != baseline.brain_id {
+        fail("exact snapshot belongs to a different brain", None);
+    }
+
+    let new_hashes = expected_snapshot_hashes(&snapshot.entries, &snapshot.assets, scope.as_ref());
+    let next_baseline = SyncBaseline {
+        version: 1,
+        brain_id: snapshot.brain_id.clone(),
+        brain_slug: snapshot.brain_slug.clone(),
+        head_seq: snapshot.head_seq,
+        feed_hash: snapshot.feed_hash.clone(),
+        pack_sha256: snapshot.pack_sha256.clone(),
+        paths: new_hashes.clone(),
+    };
+    validate_sync_baseline(next_baseline.clone())
+        .unwrap_or_else(|error| fail(&format!("cannot record pull baseline: {error}"), None));
+
+    let entries: Vec<(String, Vec<u8>)> = snapshot
+        .entries
+        .into_iter()
+        .filter(|(path, _)| path_rides(scope.as_ref(), path))
+        .collect();
+    let baseline_entry = (
+        SYNC_BASELINE_FILE.to_string(),
+        baseline_bytes(&next_baseline),
+    );
+    let riding_assets: Vec<_> = snapshot
+        .assets
+        .into_iter()
+        .filter(|asset| path_rides(scope.as_ref(), &asset.path))
+        .collect();
+    let held_root = crate::safe_path::SafeDir::open(&root).unwrap_or_else(|error| {
+        fail(
+            &format!("cannot securely hold pull directory: {error}"),
+            None,
+        )
+    });
+    let mut prepared =
+        crate::assets::prepare_restore(cfg, &baseline.brain_id, Some(&held_root), &riding_assets)
+            .unwrap_or_else(|error| fail(&error, None));
+    let pending_assets: Vec<String> = prepared.pending_paths().map(str::to_string).collect();
+    let new_paths: BTreeSet<&str> = new_hashes.keys().map(String::as_str).collect();
+    let remove_paths: Vec<String> = current
+        .keys()
+        .filter(|path| !new_paths.contains(path.as_str()) && path_rides(scope.as_ref(), path))
+        .cloned()
+        .collect();
+    let mut mutation_paths: Vec<String> = entries.iter().map(|(path, _)| path.clone()).collect();
+    mutation_paths.extend(pending_assets.iter().cloned());
+    mutation_paths.extend(remove_paths.iter().cloned());
+    mutation_paths.push(baseline_entry.0.clone());
+    preflight_export_paths(
+        &root,
+        mutation_paths
+            .iter()
+            .filter(|path| path.as_str() != SYNC_BASELINE_FILE)
+            .map(String::as_str),
+    )
+    .unwrap_or_else(|error| fail(&error, None));
+    let backups = snapshot_held_destinations(&held_root, &mutation_paths)
+        .unwrap_or_else(|error| fail(&error, None));
+    install_complete_export(
+        &held_root,
+        &entries,
+        &mut prepared,
+        backups,
+        Vec::new(),
+        &remove_paths,
+        Some(&baseline_entry),
+    )
+    .unwrap_or_else(|error| fail(&error, None));
+
+    let restore = prepared.report();
+    let mut data = snapshot.response.as_object().cloned().unwrap_or_default();
+    data.remove("files");
+    data.remove("url");
+    data.insert("dir".into(), json!(dir));
+    data.insert("changed".into(), json!(true));
+    data.insert(
+        "discardedLocalDivergence".into(),
+        json!(force && !divergent.is_empty()),
+    );
+    data.insert("removed".into(), json!(remove_paths));
+    data.insert("assetRestore".into(), restore.to_json());
+    let mut human = format!(
+        "pulled feed sequence {} → {} file(s) current",
+        next_baseline.head_seq,
+        next_baseline.paths.len()
+    );
+    if force && !divergent.is_empty() {
+        human.push_str(&format!(
+            "\nforce: discarded local divergence in {} path(s)",
+            divergent.len()
+        ));
+    }
+    if restore.restored > 0 {
+        human.push_str(&format!(
+            "\nassets: {} restored ({})",
+            restore.restored,
+            human_size(restore.restored_bytes)
+        ));
     }
     out_layout(&human, Some(Value::Object(data)));
 }
@@ -3735,6 +4648,37 @@ mod tests {
             );
         }
         assert!(!root_path.join("new").exists());
+    }
+
+    #[test]
+    fn held_pull_rollback_restores_a_removed_riding_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = std::fs::canonicalize(temp.path()).unwrap();
+        std::fs::write(root_path.join("removed.md"), b"ORIGINAL").unwrap();
+        let held = crate::safe_path::SafeDir::open(&root_path).unwrap();
+        let mut backups = snapshot_held_destinations(&held, &["removed.md".to_string()]).unwrap();
+        assert!(held.remove_regular("removed.md").unwrap());
+        backups[0].installed = Some(InstalledState::Missing);
+
+        rollback_held_export(&held, &backups, &[]).unwrap();
+        assert_eq!(
+            std::fs::read(root_path.join("removed.md")).unwrap(),
+            b"ORIGINAL"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_baseline_loader_never_follows_a_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let outside = root.join("outside.json");
+        std::fs::write(&outside, b"secret").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(SYNC_BASELINE_FILE)).unwrap();
+
+        let error = load_sync_baseline(&root).unwrap_err();
+        assert!(error.contains("securely open"), "{error}");
+        assert_eq!(std::fs::read(outside).unwrap(), b"secret");
     }
 
     #[test]

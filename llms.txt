@@ -34,6 +34,12 @@ Commands:
     delete <brain> [--confirm <slug>]     # PERMANENT, owner-only. Non-TTY/scripted runs
                                           # must pass --confirm with the brain's exact slug;
                                           # interactive runs are prompted for it.
+    clone <brain> [dir]                   # first sync on a machine: verified records +
+                                          # declared assets into a fresh directory, plus
+                                          # .sevra-sync.json (brain/feed/pack/path baseline)
+    pull [dir] [--force]                  # refresh that clone. Refuses and names local
+                                          # divergence before network access; --force is
+                                          # the explicit discard-local-work path.
     push <dir> --brain <id|slug> [--force] [--allow-secrets]
                                           # REPLACES the hosted store with <dir> (files absent
                                           # locally are removed); --force allows a shrinking
@@ -50,7 +56,10 @@ Commands:
                                           # uploads either, and while it has entries derived
                                           # index.md catalogs stay home too. DB.md and
                                           # assets.jsonl must always ride (a list covering
-                                          # them is refused).
+                                          # them is refused). Successful push records the
+                                          # local baseline; later pushes are refused if the
+                                          # durable hub feed advanced. --force explicitly
+                                          # replaces that newer state.
     query <brain|--brain <ref>> [text] [--type --layer --meta-type --tag --where k=v --limit N]
     get <brain> <id|path> | graph <brain> <path> [--dir in|out|both]
     mcp                                   # stdio MCP server over the read surface

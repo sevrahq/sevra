@@ -96,7 +96,9 @@ enum Commands {
     /// Push a local db.md store (index-on-push). Push REPLACES the brain's
     /// whole hosted store with <DIR>: files absent locally are removed from
     /// the hub. A push that would shrink the brain's document count is
-    /// refused unless --force is given. Before anything uploads, the store is
+    /// refused unless --force is given. A cloned/pushed store also refuses if
+    /// the hosted feed advanced past its local baseline; --force explicitly
+    /// replaces that newer state. Before anything uploads, the store is
     /// checked against the hub's snapshot limits and scanned for
     /// secret-shaped markdown, asset contents, and names (--allow-secrets
     /// overrides). Bounded asset inspection reports anything it skips.
@@ -111,7 +113,7 @@ enum Commands {
         dir: String,
         #[arg(long)]
         brain: String,
-        /// Allow a shrinking replacement (fewer documents than the hub holds)
+        /// Allow a shrinking or stale-baseline replacement
         #[arg(long)]
         force: bool,
         /// Push even when the secret scan finds matches
@@ -121,6 +123,18 @@ enum Commands {
         /// blobs the hub reports missing upload by default)
         #[arg(long)]
         skip_assets: bool,
+    },
+    /// Bring a hosted brain onto this machine for the first time. Records,
+    /// declared assets, and a divergence baseline land atomically in a fresh
+    /// directory.
+    Clone { brain: String, dir: Option<String> },
+    /// Refresh a cloned brain in place. Refuses local divergence unless
+    /// --force is explicit.
+    Pull {
+        dir: Option<String>,
+        /// Discard local divergence and replace riding paths from the hub
+        #[arg(long)]
+        force: bool,
     },
     /// Query a brain by text + frontmatter filters
     Query {
@@ -402,6 +416,8 @@ fn main() {
             allow_secrets,
             skip_assets,
         } => commands::push(&cfg, &dir, &brain, force, allow_secrets, skip_assets),
+        Commands::Clone { brain, dir } => commands::clone_brain(&cfg, &brain, dir),
+        Commands::Pull { dir, force } => commands::pull(&cfg, dir, force),
         Commands::Query {
             brain,
             text,

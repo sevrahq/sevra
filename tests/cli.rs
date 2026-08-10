@@ -1029,8 +1029,9 @@ fn query_with_two_differing_brains_is_a_usage_error() {
 fn push_force_sends_allow_shrink_and_plain_push_does_not() {
     let t = store_dir(&[("a.md", "alpha")]);
     let (base, log, handle) = mock_hub(vec![
-        (200, r#"{"indexed":{"documents":1}}"#.to_string()),
-        (200, r#"{"indexed":{"documents":1}}"#.to_string()),
+        (200, push_response(1, 0, 1)),
+        (200, r#"{"id":"brain-1"}"#.to_string()),
+        (200, push_response(1, 0, 2)),
     ]);
     sevra()
         .args(["push", t.path().to_str().unwrap(), "--brain", "b"])
@@ -1052,7 +1053,7 @@ fn push_force_sends_allow_shrink_and_plain_push_does_not() {
         .success();
     handle.join().unwrap();
     let reqs = log.lock().unwrap();
-    assert_eq!(reqs.len(), 2);
+    assert_eq!(reqs.len(), 3);
     assert_eq!(reqs[0].path, "/api/hub/brains/b/push");
     assert!(
         !reqs[0].body.contains("allow_shrink"),
@@ -1060,9 +1061,9 @@ fn push_force_sends_allow_shrink_and_plain_push_does_not() {
         reqs[0].body
     );
     assert!(
-        reqs[1].body.contains(r#""allow_shrink":true"#),
+        reqs[2].body.contains(r#""allow_shrink":true"#),
         "--force rides as allow_shrink: {}",
-        reqs[1].body
+        reqs[2].body
     );
 }
 
@@ -1362,8 +1363,9 @@ fn push_keeps_sevralocal_files_home_and_reports_it() {
         (".sevralocal", "private.md\n"),
     ]);
     let (base, log, handle) = mock_hub(vec![
-        (200, r#"{"indexed":{"documents":1}}"#.to_string()),
-        (200, r#"{"indexed":{"documents":1}}"#.to_string()),
+        (200, push_response(1, 0, 1)),
+        (200, r#"{"id":"brain-1"}"#.to_string()),
+        (200, push_response(1, 0, 1)),
     ]);
     sevra()
         .args(["push", t.path().to_str().unwrap(), "--brain", "b"])
@@ -1386,8 +1388,8 @@ fn push_keeps_sevralocal_files_home_and_reports_it() {
         .stdout(predicate::str::contains("\"keptHome\": 1"));
     handle.join().unwrap();
     let reqs = log.lock().unwrap();
-    assert_eq!(reqs.len(), 2);
-    for req in reqs.iter() {
+    assert_eq!(reqs.len(), 3);
+    for req in [0, 2].map(|index| &reqs[index]) {
         assert!(req.body.contains("a.md"), "the riding file: {}", req.body);
         assert!(
             !req.body.contains("private.md") && !req.body.contains("stays-home"),
@@ -1415,8 +1417,8 @@ fn push_with_an_active_sevralocal_keeps_derived_catalogs_home() {
     ]);
     let without = store_dir(&[("a.md", "rides"), ("index.md", "catalog")]);
     let (base, log, handle) = mock_hub(vec![
-        (200, r#"{"indexed":{"documents":1}}"#.to_string()),
-        (200, r#"{"indexed":{"documents":2}}"#.to_string()),
+        (200, push_response(1, 0, 1)),
+        (200, push_response(2, 0, 2)),
     ]);
     sevra()
         .args(["push", with.path().to_str().unwrap(), "--brain", "b"])
@@ -1930,6 +1932,260 @@ fn mcp_without_a_credential_serves_public_reads_unauthenticated() {
 // client contract, loopback-only, zero new dev-deps.
 
 const BLOB_SHA: &str = "671a0d168d8e3d31819402ac7c3a3cc0abedebbf6a4cda26deacd89724bd6bdc";
+const FEED_ONE: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+const FEED_TWO: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+fn clone_snapshot(seq: u64, feed: &str, content: &str) -> String {
+    serde_json::json!({
+        "brain": "brain-1",
+        "slug": "b",
+        "headSeq": seq,
+        "feedHash": feed,
+        "files": [{ "path": "a.md", "content": content }],
+    })
+    .to_string()
+}
+
+fn push_response(documents: u64, assets: u64, seq: u64) -> String {
+    let feed = if seq == 1 { FEED_ONE } else { FEED_TWO };
+    serde_json::json!({
+        "brain": "brain-1",
+        "slug": "b",
+        "headSeq": seq,
+        "feedHash": feed,
+        "packSha256": "a".repeat(64),
+        "indexed": { "documents": documents, "assets": assets },
+    })
+    .to_string()
+}
+
+#[test]
+fn clone_records_a_baseline_and_clean_pull_is_a_noop() {
+    let work = tempfile::tempdir().unwrap();
+    let (base, log, handle) = mock_hub(vec![
+        (200, clone_snapshot(1, FEED_ONE, "alpha")),
+        (
+            200,
+            format!(r#"{{"id":"brain-1","slug":"b","headSeq":1,"feedHash":"{FEED_ONE}"}}"#),
+        ),
+    ]);
+    let clone = sevra()
+        .args(["clone", "b", "brain"])
+        .current_dir(work.path())
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(clone.status.success(), "{}", all_output(&clone));
+    let baseline: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(work.path().join("brain/.sevra-sync.json")).unwrap())
+            .unwrap();
+    assert_eq!(baseline["brainId"], "brain-1");
+    assert_eq!(baseline["headSeq"], 1);
+    assert!(
+        baseline["packSha256"]
+            .as_str()
+            .is_some_and(|value| value.len() == 64),
+        "baseline binds the canonical pack: {baseline}"
+    );
+    let pull = sevra()
+        .args(["pull", "brain"])
+        .current_dir(work.path())
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(pull.status.success(), "{}", all_output(&pull));
+    assert!(all_output(&pull).contains("already current"));
+    handle.join().unwrap();
+    let requests = log.lock().unwrap();
+    assert_eq!(requests.len(), 2, "clone export + cheap head check only");
+    assert_eq!(requests[0].path, "/api/hub/brains/b/export?format=pack");
+    assert_eq!(requests[1].path, "/api/hub/brains/brain-1");
+}
+
+#[test]
+fn clone_restores_declared_assets_only_after_exact_sha_verification() {
+    let work = tempfile::tempdir().unwrap();
+    let manifest = format!("{{\"path\":\"_files/x.bin\",\"sha256\":\"{BLOB_SHA}\",\"bytes\":4}}\n");
+    let snapshot = serde_json::json!({
+        "brain": "brain-1",
+        "slug": "b",
+        "headSeq": 1,
+        "feedHash": FEED_ONE,
+        "files": [
+            { "path": "a.md", "content": "alpha" },
+            { "path": "assets.jsonl", "content": manifest },
+        ],
+    })
+    .to_string();
+    let (base, log, handle) = mock_hub(vec![
+        (200, snapshot),
+        (200, r#"{"url":"{BASE}/blob-get"}"#.to_string()),
+        (200, "BLOB".to_string()),
+    ]);
+    let clone = sevra()
+        .args(["clone", "b", "brain"])
+        .current_dir(work.path())
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(clone.status.success(), "{}", all_output(&clone));
+    assert_eq!(
+        std::fs::read(work.path().join("brain/_files/x.bin")).unwrap(),
+        b"BLOB"
+    );
+    let baseline: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(work.path().join("brain/.sevra-sync.json")).unwrap())
+            .unwrap();
+    assert_eq!(baseline["paths"]["_files/x.bin"], BLOB_SHA);
+    handle.join().unwrap();
+    let requests = log.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[1].path,
+        format!("/api/hub/brains/b/assets/presign?sha256={BLOB_SHA}&action=get")
+    );
+}
+
+#[test]
+fn clone_edit_pull_refuses_locally_before_any_head_request() {
+    let work = tempfile::tempdir().unwrap();
+    let (base, _, handle) = mock_hub(vec![(200, clone_snapshot(1, FEED_ONE, "alpha"))]);
+    sevra()
+        .args(["clone", "b", "brain"])
+        .current_dir(work.path())
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .assert()
+        .success();
+    handle.join().unwrap();
+    std::fs::write(work.path().join("brain/a.md"), "local edit").unwrap();
+    let pull = sevra()
+        .args(["pull", "brain"])
+        .current_dir(work.path())
+        .env("SEVRA_HUB_URL", "http://127.0.0.1:9")
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(!pull.status.success());
+    let output = all_output(&pull);
+    assert!(output.contains("local store diverged") && output.contains("a.md"));
+    assert!(
+        !output.contains("hub unreachable"),
+        "local refusal is first: {output}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(work.path().join("brain/a.md")).unwrap(),
+        "local edit"
+    );
+}
+
+#[test]
+fn pull_fetches_the_exact_advanced_snapshot_and_force_discards_local_edits() {
+    for force in [false, true] {
+        let work = tempfile::tempdir().unwrap();
+        let (base, log, handle) = mock_hub(vec![
+            (200, clone_snapshot(1, FEED_ONE, "alpha")),
+            (
+                200,
+                format!(r#"{{"id":"brain-1","slug":"b","headSeq":2,"feedHash":"{FEED_TWO}"}}"#),
+            ),
+            (200, clone_snapshot(2, FEED_TWO, "remote beta")),
+        ]);
+        sevra()
+            .args(["clone", "b", "brain"])
+            .current_dir(work.path())
+            .env("SEVRA_HUB_URL", &base)
+            .env("SEVRA_API_KEY", "x")
+            .assert()
+            .success();
+        if force {
+            std::fs::write(work.path().join("brain/a.md"), "discard me").unwrap();
+        }
+        let mut command = sevra();
+        command.args(["pull", "brain"]);
+        if force {
+            command.arg("--force");
+        }
+        let pull = command
+            .current_dir(work.path())
+            .env("SEVRA_HUB_URL", &base)
+            .env("SEVRA_API_KEY", "x")
+            .output()
+            .unwrap();
+        assert!(pull.status.success(), "{}", all_output(&pull));
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("brain/a.md")).unwrap(),
+            "remote beta"
+        );
+        let baseline: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(work.path().join("brain/.sevra-sync.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(baseline["headSeq"], 2);
+        handle.join().unwrap();
+        let requests = log.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests[2].path,
+            format!("/api/hub/brains/brain-1/export?format=pack&atSeq=2&feedHash={FEED_TWO}")
+        );
+    }
+}
+
+#[test]
+fn cloned_push_sends_the_baseline_and_force_is_the_explicit_bypass() {
+    for force in [false, true] {
+        let work = tempfile::tempdir().unwrap();
+        let final_response = if force {
+            format!(
+                r#"{{"brain":"brain-1","slug":"b","headSeq":2,"feedHash":"{FEED_TWO}","packSha256":"{}","indexed":{{"documents":1,"assets":0}}}}"#,
+                "a".repeat(64)
+            )
+        } else {
+            r#"{"error":"This brain advanced from baseline sequence 1 to 2. Pull before pushing.","code":"stale_baseline","expectedHeadSeq":1,"currentHeadSeq":2}"#.to_string()
+        };
+        let (base, log, handle) = mock_hub(vec![
+            (200, clone_snapshot(1, FEED_ONE, "alpha")),
+            (200, r#"{"id":"brain-1"}"#.to_string()),
+            (if force { 200 } else { 409 }, final_response),
+        ]);
+        sevra()
+            .args(["clone", "b", "brain"])
+            .current_dir(work.path())
+            .env("SEVRA_HUB_URL", &base)
+            .env("SEVRA_API_KEY", "x")
+            .assert()
+            .success();
+        std::fs::write(work.path().join("brain/a.md"), "local beta").unwrap();
+        let mut command = sevra();
+        command.args(["push", "brain", "--brain", "b", "--skip-assets"]);
+        if force {
+            command.arg("--force");
+        }
+        let push = command
+            .current_dir(work.path())
+            .env("SEVRA_HUB_URL", &base)
+            .env("SEVRA_API_KEY", "x")
+            .output()
+            .unwrap();
+        assert_eq!(push.status.success(), force, "{}", all_output(&push));
+        if !force {
+            assert!(all_output(&push).contains("Pull before pushing"));
+        }
+        handle.join().unwrap();
+        let requests = log.lock().unwrap();
+        let body: serde_json::Value = serde_json::from_str(&requests[2].body).unwrap();
+        if force {
+            assert!(body.get("expected_head_seq").is_none());
+            assert_eq!(body["allow_shrink"], true);
+        } else {
+            assert_eq!(body["expected_head_seq"], 1);
+        }
+    }
+}
 
 fn asset_store() -> tempfile::TempDir {
     store_dir(&[
@@ -2061,10 +2317,7 @@ fn kept_home_asset_is_neither_scanned_nor_uploaded_but_quarantine_can_see_it() {
         r#"{{"assets":[{{"path":"{path}","sha256":"{sha}","bytes":{},"required":true,"presentInR2":false}}],"truncated":false}}"#,
         body.len()
     );
-    let (base, log, handle) = mock_hub(vec![
-        (200, r#"{"indexed":{"documents":1,"assets":1}}"#.to_string()),
-        (200, missing),
-    ]);
+    let (base, log, handle) = mock_hub(vec![(200, push_response(1, 1, 1)), (200, missing)]);
     let out = sevra()
         .args(["push", t.path().to_str().unwrap(), "--brain", "b"])
         .env("SEVRA_HUB_URL", &base)
@@ -2108,7 +2361,7 @@ fn push_syncs_missing_assets_after_commit() {
     let presigned =
         r#"{"url":"{BASE}/blob-put","method":"PUT","reservationId":"01hzy3v7q8r9s0t1v2w3x4y5z7"}"#;
     let (base, log, handle) = mock_hub(vec![
-        (200, r#"{"indexed":{"documents":1,"assets":1}}"#.to_string()),
+        (200, push_response(1, 1, 1)),
         (200, missing),
         (200, presigned.to_string()),
         (200, "{}".to_string()), // the presigned PUT itself
@@ -2148,10 +2401,7 @@ fn push_syncs_missing_assets_after_commit() {
 #[test]
 fn push_skip_assets_makes_no_asset_requests() {
     let t = asset_store();
-    let (base, log, handle) = mock_hub(vec![(
-        200,
-        r#"{"indexed":{"documents":1,"assets":1}}"#.to_string(),
-    )]);
+    let (base, log, handle) = mock_hub(vec![(200, push_response(1, 1, 1))]);
     sevra()
         .args([
             "push",
@@ -2181,10 +2431,7 @@ fn push_refuses_sparse_oversize_asset_before_read_or_presign() {
     let missing = format!(
         r#"{{"assets":[{{"path":"_files/x.bin","sha256":"{BLOB_SHA}","bytes":4,"required":true,"presentInR2":false}}],"truncated":false}}"#
     );
-    let (base, log, handle) = mock_hub(vec![
-        (200, r#"{"indexed":{"documents":1,"assets":1}}"#.to_string()),
-        (200, missing),
-    ]);
+    let (base, log, handle) = mock_hub(vec![(200, push_response(1, 1, 1)), (200, missing)]);
     let out = sevra()
         .args(["push", t.path().to_str().unwrap(), "--brain", "b"])
         .env("SEVRA_HUB_URL", &base)

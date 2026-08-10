@@ -1,6 +1,19 @@
 # Changelog
 
-## 0.2.8 — 2026-07-30
+## 0.2.8 — 2026-08-10
+
+- New: `sevra clone <brain> [dir]` restores verified records and declared
+  assets into a fresh directory and records a dot-prefixed local baseline.
+  `sevra pull [dir]` names and refuses local divergence before its first
+  request, makes an existing brain-head check a cheap no-op, and fetches the
+  exact advanced feed snapshot when needed. `--force` explicitly discards
+  local work. Kept-home paths remain local.
+- Integrity: every successful push records the brain identity, feed address,
+  pack digest, and per-path digests in `.sevra-sync.json`. Later JSON and pack
+  pushes send the expected feed sequence; the hub checks the signed R2 pointer
+  inside the same write lease as the commit and returns typed
+  `stale_baseline` before any durable mutation. `--force` is the explicit
+  overwrite-newer-hosted-state path.
 
 - Security: the pre-upload secret gate now scans the exact manifest-bound
   bytes of declared assets up to an independent 8 MiB per-asset and 64 MiB
