@@ -296,6 +296,17 @@ if [ "$tag" = "v0.2.8" ]; then
   original_signer=1
 fi
 
+release_git_dir="$(git rev-parse --absolute-git-dir)"
+[ -d "$release_git_dir" ] ||
+  die "could not resolve the private Git directory for release scratch space"
+make_release_tmp() {
+  scratch_name="$1"
+  # Colima shares the repository's /Users path with its Linux VM, not the
+  # host's /tmp. Keeping scratch space under .git makes exact source/output
+  # mounts available to Cross while remaining private and worktree-invisible.
+  mktemp -d "$release_git_dir/$scratch_name.XXXXXX"
+}
+
 remote_tag_sha="$(
   git ls-remote origin "refs/tags/$tag" 2>/dev/null |
     awk 'NR == 1 { print $1 }'
@@ -575,7 +586,7 @@ if [ "$original_signer" -eq 1 ]; then
   ephemeral_secrets_present=0
 
   [ -n "$tmp_dir" ] ||
-    tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/sevra-release-checkpoint.XXXXXX")"
+    tmp_dir="$(make_release_tmp sevra-release-checkpoint)"
   checkpoint_dir="$tmp_dir/transitional-checkpoint"
   poll=0
   completed_grace=0
@@ -666,7 +677,7 @@ if [ "$original_signer" -eq 0 ]; then
     grep -Eq '^cross 0\.2\.5 ' ||
     die "cross 0.2.5 is required for Linux reproduction"
 
-  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/sevra-release.XXXXXX")"
+  tmp_dir="$(make_release_tmp sevra-release)"
   unsigned_dir="$tmp_dir/unsigned"
   release_dir="$tmp_dir/release"
   xwin_dir="$tmp_dir/cargo-xwin"
@@ -861,7 +872,7 @@ actual_assets="$(
   die "published release asset set is not exact"
 
 if [ -z "$tmp_dir" ]; then
-  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/sevra-release-verify.XXXXXX")"
+  tmp_dir="$(make_release_tmp sevra-release-verify)"
 fi
 verify_dir="$tmp_dir/final-verify"
 mkdir -p "$verify_dir"

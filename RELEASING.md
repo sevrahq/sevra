@@ -29,7 +29,9 @@ the hub's `/api/hub/versions`.
    and Windows through a SHA-256-pinned cargo-xwin binary with fixed SDK/CRT
    versions. The rebuild source is a private, read-only archive materialized
    from the exact authorized Git object, never the operator checkout after the
-   workflow wait. Every downloaded byte must match its independent rebuild.
+   workflow wait. Its scratch tree lives under the repository's private `.git`
+   directory so Colima can mount it into the Linux builders without exposing
+   it to the worktree. Every downloaded byte must match its independent rebuild.
    Canonical path remapping and `SOURCE_DATE_EPOCH` remove host-path/time
    variance. The Windows link also uses `/Brepro` and omits the otherwise
    random CodeView/PDB identifier.

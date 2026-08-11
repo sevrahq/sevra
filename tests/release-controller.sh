@@ -23,6 +23,7 @@ case "$1 $2" in
   "remote get-url") printf '%s\n' git@github.com:sevrahq/sevra.git ;;
   "fetch --quiet") ;;
   "rev-parse HEAD"|"rev-parse origin/main") printf '%s\n' "$SEVRA_TEST_SHA" ;;
+  "rev-parse --absolute-git-dir") printf '%s\n' "$SEVRA_TEST_STATE" ;;
   "ls-remote origin")
     if [ "$SEVRA_TEST_MODE" = resume ] || [ "$SEVRA_TEST_MODE" = partial_resume ]; then
       printf '%s\trefs/tags/v0.2.8\n' "$SEVRA_TEST_SHA"
@@ -409,6 +410,7 @@ case "$1 $2" in
   "remote get-url") printf '%s\n' git@github.com:sevrahq/sevra.git ;;
   "fetch --quiet") ;;
   "rev-parse HEAD"|"rev-parse origin/main") printf '%s\n' "$SEVRA_TEST_SHA" ;;
+  "rev-parse --absolute-git-dir") printf '%s\n' "$SEVRA_TEST_STATE" ;;
   "ls-remote origin") printf '%s\trefs/tags/v0.2.9\n' "$SEVRA_TEST_SHA" ;;
   "show-ref --verify") exit 0 ;;
   "rev-list -n") printf '%s\n' "$SEVRA_TEST_SHA" ;;
@@ -693,9 +695,10 @@ real_tar="$(command -v tar)"
 if ! (
   cd "$successor_root"
   SEVRA_TEST_MODE=successor_final \
-    SEVRA_SUCCESSOR_ROOT="$successor_root" \
-    SEVRA_SUCCESSOR_SOURCE="$successor_source" \
-    SEVRA_REAL_TAR="$real_tar" \
+  SEVRA_SUCCESSOR_ROOT="$successor_root" \
+  SEVRA_SUCCESSOR_SOURCE="$successor_source" \
+  SEVRA_TEST_STATE="$fixture/state" \
+  SEVRA_REAL_TAR="$real_tar" \
     PATH="$successor_bin:$PATH" \
     sh scripts/release.sh --resume v0.2.9
 ) >"$fixture/successor.out" 2>&1

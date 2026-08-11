@@ -123,6 +123,8 @@ mod tests {
             "git status --porcelain=v1",
             "HEAD is not the exact commit currently at origin/main",
             "--workflow ci.yml --commit \"$release_sha\"",
+            "release_git_dir=\"$(git rev-parse --absolute-git-dir)\"",
+            "mktemp -d \"$release_git_dir/$scratch_name.XXXXXX\"",
             "repos/$repo/immutable-releases",
             "immutable GitHub Releases must be enabled before tagging",
             "openssl rand -hex 32",
@@ -161,6 +163,10 @@ mod tests {
         assert!(
             !wrapper.contains("gh secret set SEVRA_CLI_SIGNING_KEY"),
             "the successor private key must never be uploaded to Actions"
+        );
+        assert!(
+            !wrapper.contains("${TMPDIR:-/tmp}/sevra-release"),
+            "Cross-visible release scratch space must stay beneath the repository"
         );
         assert_eq!(
             wrapper.matches("\n  cmp \"$").count(),
