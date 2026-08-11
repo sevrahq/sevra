@@ -3092,10 +3092,110 @@ fn load_pull_journal(root: &crate::safe_path::SafeDir) -> Result<Option<PullJour
     validate_pull_journal(journal).map(Some)
 }
 
+fn is_atomic_stage_name(name: &str) -> bool {
+    name.strip_prefix(".sevra-new-").is_some_and(|suffix| {
+        suffix.len() == 32
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    })
+}
+
+fn cleanup_atomic_stages_in(
+    directory: &crate::safe_path::SafeDir,
+    label: &str,
+) -> Result<(), String> {
+    for entry in directory
+        .entries()
+        .map_err(|error| format!("cannot inspect {label} for interrupted atomic writes: {error}"))?
+    {
+        let Some(name) = entry.name.to_str() else {
+            continue;
+        };
+        if !is_atomic_stage_name(name) {
+            continue;
+        }
+        if entry.kind != crate::safe_path::EntryKind::File {
+            return Err(format!(
+                "interrupted atomic stage in {label} is not a regular file; refusing cleanup"
+            ));
+        }
+        directory.remove_regular(name).map_err(|error| {
+            format!("cannot remove interrupted atomic stage in {label}: {error}")
+        })?;
+    }
+    Ok(())
+}
+
+fn open_pull_directory(
+    root: &crate::safe_path::SafeDir,
+    path: &str,
+) -> Result<Option<crate::safe_path::SafeDir>, String> {
+    let mut components = path.split('/');
+    let Some(first) = components.next().filter(|component| !component.is_empty()) else {
+        return Err("pull recovery directory is empty".to_string());
+    };
+    let mut directory = match root.open_dir(std::ffi::OsStr::new(first)) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "cannot securely open pull recovery directory {}: {error}",
+                terminal_safe(path)
+            ))
+        }
+    };
+    for component in components {
+        if component.is_empty() || component == "." || component == ".." {
+            return Err("pull recovery directory is not normalized".to_string());
+        }
+        directory = match directory.open_dir(std::ffi::OsStr::new(component)) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(format!(
+                    "cannot securely open pull recovery directory {}: {error}",
+                    terminal_safe(path)
+                ))
+            }
+        };
+    }
+    Ok(Some(directory))
+}
+
+fn cleanup_pull_atomic_stages(
+    root: &crate::safe_path::SafeDir,
+    journal: Option<&PullJournal>,
+) -> Result<(), String> {
+    cleanup_atomic_stages_in(root, "the store root")?;
+    let Some(journal) = journal else {
+        return Ok(());
+    };
+
+    let mut directories = BTreeSet::new();
+    directories.insert(journal.backup_dir.clone());
+    for entry in &journal.entries {
+        if let Some((parent, _)) = entry.path.rsplit_once('/') {
+            directories.insert(parent.to_string());
+        }
+    }
+    for path in directories {
+        let Some(directory) = open_pull_directory(root, &path)? else {
+            continue;
+        };
+        cleanup_atomic_stages_in(
+            &directory,
+            &format!("pull recovery directory {}", terminal_safe(&path)),
+        )?;
+    }
+    Ok(())
+}
+
 fn cleanup_pull_transaction(
     root: &crate::safe_path::SafeDir,
     journal: &PullJournal,
 ) -> Result<(), String> {
+    cleanup_pull_atomic_stages(root, Some(journal))?;
     let expected: BTreeSet<&str> = journal
         .entries
         .iter()
@@ -3152,6 +3252,8 @@ fn recover_ready_pull(
         },
         Remove(String),
     }
+
+    cleanup_pull_atomic_stages(root, Some(journal))?;
 
     let mut actions = Vec::new();
     let mut backup_bytes = 0u64;
@@ -3263,6 +3365,10 @@ fn recover_ready_pull(
 }
 
 fn recover_pull_transaction(root: &crate::safe_path::SafeDir) -> Result<bool, String> {
+    // An atomic journal create can be killed before the journal itself is
+    // renamed into place. The store lock is held by every caller, so no live
+    // Sevra writer can own one of these exact reserved staging names now.
+    cleanup_pull_atomic_stages(root, None)?;
     let Some(journal) = load_pull_journal(root)? else {
         return Ok(false);
     };
@@ -6381,6 +6487,72 @@ mod tests {
             "recovery never clobbers a post-crash edit"
         );
         assert!(root_path.join(PULL_JOURNAL_FILE).exists());
+    }
+
+    #[test]
+    fn durable_pull_recovery_removes_only_exact_internal_atomic_stages() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = std::fs::canonicalize(temp.path()).unwrap();
+        std::fs::write(root_path.join(SYNC_BASELINE_FILE), b"OLD-BASELINE").unwrap();
+        let held = crate::safe_path::SafeDir::open(&root_path).unwrap();
+        let paths = vec!["records/new.md".to_string(), SYNC_BASELINE_FILE.to_string()];
+        let backups = snapshot_held_destinations(&held, &paths).unwrap();
+        let next = vec![
+            Some(format!("{:x}", Sha256::digest(b"NEW"))),
+            Some(format!("{:x}", Sha256::digest(b"NEW-BASELINE"))),
+        ];
+        let journal =
+            prepare_pull_transaction(&held, &backups, &next, vec!["records".to_string()]).unwrap();
+
+        std::fs::create_dir(root_path.join("records")).unwrap();
+        let exact = format!(".sevra-new-{}", "a".repeat(32));
+        std::fs::write(
+            root_path.join("records").join(&exact),
+            b"partial staged bytes",
+        )
+        .unwrap();
+        std::fs::write(root_path.join(&exact), b"partial journal bytes").unwrap();
+        std::fs::write(root_path.join(".sevra-new-not-an-internal-stage"), b"keep").unwrap();
+        std::fs::write(
+            root_path.join(&journal.backup_dir).join(&exact),
+            b"partial backup bytes",
+        )
+        .unwrap();
+
+        assert!(recover_pull_transaction(&held).unwrap());
+        assert!(!root_path.join("records").exists());
+        assert!(!root_path.join(&exact).exists());
+        assert_eq!(
+            std::fs::read(root_path.join(".sevra-new-not-an-internal-stage")).unwrap(),
+            b"keep"
+        );
+        assert!(!root_path.join(PULL_JOURNAL_FILE).exists());
+        assert!(!root_path.join(&journal.backup_dir).exists());
+    }
+
+    #[test]
+    fn atomic_stage_cleanup_without_a_journal_removes_an_exact_orphan() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = std::fs::canonicalize(temp.path()).unwrap();
+        let held = crate::safe_path::SafeDir::open(&root_path).unwrap();
+        let exact_file = format!(".sevra-new-{}", "b".repeat(32));
+        std::fs::write(root_path.join(&exact_file), b"orphan").unwrap();
+
+        assert!(!recover_pull_transaction(&held).unwrap());
+        assert!(!root_path.join(exact_file).exists());
+    }
+
+    #[test]
+    fn atomic_stage_cleanup_refuses_a_non_file_plant() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = std::fs::canonicalize(temp.path()).unwrap();
+        let held = crate::safe_path::SafeDir::open(&root_path).unwrap();
+        let exact_directory = format!(".sevra-new-{}", "c".repeat(32));
+        std::fs::create_dir(root_path.join(&exact_directory)).unwrap();
+
+        let error = recover_pull_transaction(&held).unwrap_err();
+        assert!(error.contains("not a regular file"), "{error}");
+        assert!(root_path.join(exact_directory).is_dir());
     }
 
     #[test]
