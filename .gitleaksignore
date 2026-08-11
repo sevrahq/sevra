@@ -1,0 +1,6 @@
+# Exact historical false positives reviewed 2026-08-11. These are hostile
+# scanner/CLI fixtures, not credentials. Fingerprints are intentionally precise
+# so no future private-key or generic-key match is suppressed.
+02e709a3d1c0fb1c53fe9b247351d08c790765dc:src/scan.rs:private-key:420
+046f191e6e48d68b3c81b54d721e43bc9f9a551a:tests/cli.rs:generic-api-key:293
+707fa0610dcfc71d397ce0f7825e24b4aa180af2:src/scan.rs:private-key:154
