@@ -197,7 +197,7 @@ cleanup() {
     fi
     if [ "$original_signer" -eq 1 ]; then
       printf '%s\n' \
-        "release: failed; one-run environment-secret removal was attempted; use --cleanup-ephemeral-secrets if GitHub was unreachable" >&2
+        "release: failed; verify the one-run environment secrets are absent; use --cleanup-ephemeral-secrets if GitHub was unreachable" >&2
     else
       printf '%s\n' \
         "release: failed; the successor signer was not sent to GitHub; inspect any draft release and pushed tag before retrying" >&2
@@ -292,6 +292,9 @@ printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' ||
   die "tag must be a SemVer release beginning with v"
 [ "$tag" = "v$cargo_version" ] ||
   die "$tag does not equal Cargo.toml version v$cargo_version"
+if [ "$tag" = "v0.2.8" ]; then
+  original_signer=1
+fi
 
 remote_tag_sha="$(
   git ls-remote origin "refs/tags/$tag" 2>/dev/null |
@@ -335,7 +338,6 @@ immutable_releases_enabled="$(
   die "immutable GitHub Releases must be enabled before tagging"
 
 if [ "$tag" = "v0.2.8" ]; then
-  original_signer=1
   if have_secret environment SEVRA_RELEASE_AUTHORIZATION ||
     have_secret environment SEVRA_CLI_SIGNING_KEY
   then
