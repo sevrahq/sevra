@@ -102,6 +102,8 @@ mod tests {
         assert!(workflow.contains("fields[1] !== process.env.GITHUB_SHA"));
         assert!(workflow.contains("fields[0] !== process.env.GITHUB_REF_NAME"));
         assert!(workflow.contains("release artifact set does not contain exactly five files"));
+        assert!(workflow.contains("retention-days: 90"));
+        assert!(!workflow.contains("retention-days: 7"));
         assert!(workflow.contains("cargo-xwin-v0.23.0.universal2-apple-darwin.tar.gz"));
         assert!(
             workflow.contains("d78a88f43247a6298d8888dc4c44a8af92801fdf4e5374cc5a359a1e53770993")
@@ -121,6 +123,8 @@ mod tests {
             "git status --porcelain=v1",
             "HEAD is not the exact commit currently at origin/main",
             "--workflow ci.yml --commit \"$release_sha\"",
+            "repos/$repo/immutable-releases",
+            "immutable GitHub Releases must be enabled before tagging",
             "openssl rand -hex 32",
             "$tag:$release_sha:$release_run_id.$attempt:$auth_nonce",
             "op read \"$signing_key_ref\"",

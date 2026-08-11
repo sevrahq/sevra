@@ -2,6 +2,12 @@
 
 ## 0.2.8 — 2026-08-10
 
+- Security: the release controller now proves repository-level immutable
+  GitHub Releases are enabled before it creates a protected version tag. The
+  one-time signed recovery checkpoint is retained for the maximum 90-day
+  public-repository window, reducing the chance that an interrupted v0.2.8
+  draft could outlive its only recovery source after the original signer is
+  retired.
 - Integrity: push now distinguishes a wiki-link intentionally withheld by
   `.sevralocal` from a genuinely broken link. It uses `dbmd emit` locally and
   declares only kept-home paths already named by riding content. Unlinked

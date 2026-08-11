@@ -20,7 +20,8 @@ the hub's `/api/hub/versions`.
 
    The wrapper refuses a dirty/non-main worktree, a non-canonical origin, a
    commit other than the exact `origin/main`, or a commit without a successful
-   main-push `ci.yml` run. It creates the tag and waits for Actions to produce
+   main-push `ci.yml` run. It also proves repository-level immutable Releases
+   are enabled before creating the tag. It then waits for Actions to produce
    exactly five unsigned, tag/SHA-attested binaries. Before reading the
    successor key, the wrapper verifies every attestation and rebuilds all five
    with the same Rust 1.96.0 compiler and locked dependencies: both Darwin
@@ -54,7 +55,8 @@ the hub's `/api/hub/versions`.
    v0.2.8 is the one compatibility exception: run
    `scripts/release.sh v0.2.8`. It consumes the already-present original
    repository signer. The protected job signs and persists an immutable
-   11-file Actions checkpoint, then attests every byte to the exact tag and
+   11-file Actions checkpoint with the maximum 90-day recovery retention,
+   then attests every byte to the exact tag and
    SHA. The controller verifies that checkpoint's shape, checksums, Ed25519
    signatures, and provenance before deleting the signer. It still injects
    and checks the one-run authorization.

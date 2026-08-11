@@ -322,6 +322,18 @@ ci_run_id="$(
 [ -n "$ci_run_id" ] ||
   die "the exact release commit does not have a successful main-push ci.yml run"
 
+# Publishing a public release is one-way only when repository immutability is
+# enabled. Prove that repository control before creating the tag, rather than
+# discovering a mutable release after the protected signer has already run.
+immutable_releases_enabled="$(
+  gh api \
+    -H 'Accept: application/vnd.github+json' \
+    -H 'X-GitHub-Api-Version: 2026-03-10' \
+    "repos/$repo/immutable-releases" --jq .enabled
+)" || die "could not verify immutable GitHub Releases for $repo"
+[ "$immutable_releases_enabled" = true ] ||
+  die "immutable GitHub Releases must be enabled before tagging"
+
 if [ "$tag" = "v0.2.8" ]; then
   original_signer=1
   if have_secret environment SEVRA_RELEASE_AUTHORIZATION ||

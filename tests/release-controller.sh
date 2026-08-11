@@ -189,6 +189,7 @@ case "$command_name" in
     ;;
   api)
     case "$*" in
+      *"immutable-releases"*) printf '%s\n' true ;;
       *"pending_deployments"*)
         if [ "$SEVRA_TEST_MODE" = interrupt ]; then
           printf '%s\n' 77
@@ -279,6 +280,20 @@ grep -Fq \
 grep -Fq \
   "gh secret delete SEVRA_CLI_SIGNING_KEY --repo sevrahq/sevra --env release-signing" \
   "$SEVRA_TEST_LOG"
+immutable_line="$(
+  grep -nF 'gh api -H Accept: application/vnd.github+json -H X-GitHub-Api-Version: 2026-03-10 repos/sevrahq/sevra/immutable-releases --jq .enabled' \
+    "$SEVRA_TEST_LOG" | sed -n '1s/:.*//p'
+)"
+tag_push_line="$(
+  grep -nF 'git push origin refs/tags/v0.2.8' "$SEVRA_TEST_LOG" |
+    sed -n '1s/:.*//p'
+)"
+if [ -z "$immutable_line" ] || [ -z "$tag_push_line" ] ||
+  [ "$immutable_line" -ge "$tag_push_line" ]; then
+  printf '%s\n' "immutable-release enforcement was not proved before tag creation" >&2
+  cat "$SEVRA_TEST_LOG" >&2
+  exit 1
+fi
 
 # A protected job that starts but fails before the signed checkpoint must keep
 # the repository signer. Starting the job alone is never a retirement gate.
@@ -518,6 +533,7 @@ MUTATED
     ;;
   api)
     case "$*" in
+      *"immutable-releases"*) printf '%s\n' true ;;
       *"releases/tags/v0.2.9"*".assets"*)
         printf '%s\n' \
           SHA256SUMS \

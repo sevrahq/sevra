@@ -298,7 +298,11 @@ jobs:
           name: transitional-signed-v0.2.8
           path: dist/*
           if-no-files-found: error
-          retention-days: 7
+          # This is the only recovery source after the controller verifies the
+          # checkpoint and deletes the transitional repository signer. Keep the
+          # maximum public-repository window so an interrupted draft remains
+          # recoverable without restoring retired key material.
+          retention-days: 90
       # Keyless GitHub/Sigstore provenance is independent of the long-lived
       # Ed25519 publisher key. Attest the checkpoint before release assembly:
       # if draft creation or upload fails later, the exact signed bytes remain
