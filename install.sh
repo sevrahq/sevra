@@ -24,7 +24,7 @@ BASE="${SEVRA_INSTALL_BASE:-https://github.com/$REPO/releases/download}"
 API="https://www.sevrahq.com/api/hub/versions"
 TRUSTED_MANIFEST_BASE="${SEVRA_TRUSTED_MANIFEST_BASE:-https://www.sevrahq.com/api/hub/releases/sevra}"
 
-# The pinned publisher keys (Ed25519 SPKI). v0.2.8 is signed by the original
+# The pinned publisher keys (Ed25519 SPKI). v0.2.9 is signed by the original
 # key while trusting both it and its successor, so clients can cross the
 # rotation without a flag day.
 PUBKEY_OLD_PEM='-----BEGIN PUBLIC KEY-----

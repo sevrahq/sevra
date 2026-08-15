@@ -11,7 +11,7 @@ reproduce and the version (`sevra version`).
   (`sevra-<target>.sig`, base64 of 64 raw bytes) and covered by a
   `SHA256SUMS` manifest. The publisher public key is pinned in the binary
   (`src/signing.rs`), pinned in `install.sh`, committed as `sevra.pub`, and
-  served at https://www.sevrahq.com/install/sevra.pub. v0.2.8 is the sole
+  served at https://www.sevrahq.com/install/sevra.pub. v0.2.9 is the sole
   compatibility release signed by the original key on a protected runner.
   Successor keys never enter GitHub: Actions produces exact unsigned,
   tag/SHA-attested binaries, then the local controller independently rebuilds

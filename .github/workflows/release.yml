@@ -2,7 +2,7 @@
 #
 # Five targets: four BARE unix binaries `sevra-<target>` plus the Windows
 # `sevra-windows-x86_64.exe`, each with a detached Ed25519 signature
-# `<asset>.sig` (base64 of 64 raw bytes). v0.2.8 is the one compatibility
+# `<asset>.sig` (base64 of 64 raw bytes). v0.2.9 is the one compatibility
 # release signed on a protected GitHub runner with the original key; its
 # authorization is bound to one exact attempt. The repository key is deleted
 # only after the signed bytes are durable as an immutable Actions artifact and
@@ -19,7 +19,7 @@
 # SemVer tag whose version equals Cargo.toml after the exact main commit has
 # passed CI.
 #
-# Key custody after v0.2.8: no Actions secret, environment, runner, workflow,
+# Key custody after v0.2.9: no Actions secret, environment, runner, workflow,
 # artifact, or log ever receives the successor private key. The local
 # controller reads it into one Node process over stdin only after exact
 # provenance and independent Linux reproduction succeed.
@@ -152,6 +152,13 @@ jobs:
             shasum -a 256 -c -
           mkdir -p "$tool_dir"
           tar -xzf "$archive" -C "$tool_dir"
+      - name: Install digest-verified LLVM archiver (Windows)
+        if: matrix.use_xwin
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/install-pinned-llvm.sh "$RUNNER_TEMP/llvm-mingw"
+          printf '%s\n' "$RUNNER_TEMP/llvm-mingw/bin" >> "$GITHUB_PATH"
       - name: Build
         shell: bash
         run: |
@@ -196,7 +203,7 @@ jobs:
   publish:
     needs: [version, build]
     name: sign + publish release
-    if: needs.version.outputs.version == '0.2.8'
+    if: needs.version.outputs.version == '0.2.9'
     runs-on: ubuntu-24.04
     # Protected approval boundary for the ephemeral publisher key and
     # per-attempt authorization. Repo write access and a release tag are
@@ -216,7 +223,7 @@ jobs:
           SEVRA_CLI_SIGNING_KEY: ${{ secrets.SEVRA_CLI_SIGNING_KEY }}
           SEVRA_RELEASE_AUTHORIZATION: ${{ secrets.SEVRA_RELEASE_AUTHORIZATION }}
           VERSION: ${{ needs.version.outputs.version }}
-          # This runner-signing path exists for v0.2.8 only.
+          # This runner-signing path exists for v0.2.9 only.
           SEVRA_ORIGINAL_SIGNER_SPKI: MCowBQYDK2VwAyEA+v5mafEPcIwKAU/DO/z8MM/cT9ndgE1saSUfvcrzLKA=
         run: |
           set -euo pipefail
@@ -239,7 +246,7 @@ jobs:
             const key = createPrivateKey(Buffer.from(process.env.SEVRA_CLI_SIGNING_KEY, "base64"));
             const actual = createPublicKey(key).export({ type: "spki", format: "der" }).toString("base64");
             if (actual !== process.env.SEVRA_ORIGINAL_SIGNER_SPKI) {
-              throw new Error("v0.2.8 is configured with the wrong release signer");
+              throw new Error("v0.2.9 is configured with the wrong release signer");
             }
           '
           mkdir -p dist
@@ -295,7 +302,7 @@ jobs:
       - name: Persist immutable signed checkpoint
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: transitional-signed-v0.2.8
+          name: transitional-signed-v0.2.9
           path: dist/*
           if-no-files-found: error
           # This is the only recovery source after the controller verifies the
@@ -373,7 +380,7 @@ jobs:
   prepare-successor:
     needs: [version, build]
     name: attest unsigned successor assets
-    if: needs.version.outputs.version != '0.2.8'
+    if: needs.version.outputs.version != '0.2.9'
     runs-on: ubuntu-24.04
     permissions:
       contents: read

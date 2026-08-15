@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# Release one exact, already-green commit. v0.2.8 consumes the transitional
+# Release one exact, already-green commit. v0.2.9 consumes the transitional
 # original signer on one protected GitHub Actions attempt. Every successor
 # release keeps the Ed25519 private key local: Actions returns only unsigned,
 # tag/SHA-attested binaries; this controller independently reproduces the
@@ -18,7 +18,7 @@ publish_started=0
 original_signer=0
 original_signer_deleted=0
 checkpoint_ready=0
-checkpoint_name="transitional-signed-v0.2.8"
+checkpoint_name="transitional-signed-v0.2.9"
 checkpoint_dir=""
 preexisting_final=0
 tmp_dir=""
@@ -45,7 +45,7 @@ Usage:
   scripts/release.sh [--resume] [--signing-key-ref op://VAULT/ITEM/FIELD] [vX.Y.Z]
   scripts/release.sh --cleanup-ephemeral-secrets
 
-For v0.2.8 only, the wrapper consumes the transitional repository-scoped
+For v0.2.9 only, the wrapper consumes the transitional repository-scoped
 SEVRA_CLI_SIGNING_KEY. It deletes that signer only after the exact signed set
 is durable in an immutable Actions artifact and every byte's tag/SHA
 provenance, checksum, and Ed25519 signature verify locally. Later releases
@@ -292,7 +292,7 @@ printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' ||
   die "tag must be a SemVer release beginning with v"
 [ "$tag" = "v$cargo_version" ] ||
   die "$tag does not equal Cargo.toml version v$cargo_version"
-if [ "$tag" = "v0.2.8" ]; then
+if [ "$tag" = "v0.2.9" ]; then
   original_signer=1
 fi
 
@@ -348,7 +348,7 @@ immutable_releases_enabled="$(
 [ "$immutable_releases_enabled" = true ] ||
   die "immutable GitHub Releases must be enabled before tagging"
 
-if [ "$tag" = "v0.2.8" ]; then
+if [ "$tag" = "v0.2.9" ]; then
   if have_secret environment SEVRA_RELEASE_AUTHORIZATION ||
     have_secret environment SEVRA_CLI_SIGNING_KEY
   then
@@ -364,7 +364,7 @@ if [ "$tag" = "v0.2.8" ]; then
   fi
   if [ "$resume" -eq 0 ]; then
     have_secret repository SEVRA_CLI_SIGNING_KEY ||
-      die "v0.2.8 requires the transitional original repository signer"
+      die "v0.2.9 requires the transitional original repository signer"
   fi
 else
   if have_secret repository SEVRA_CLI_SIGNING_KEY; then
@@ -488,7 +488,7 @@ if [ "$original_signer" -eq 1 ]; then
     [ "$run_failed" -eq 0 ] ||
       die "release run failed before the transitional signer job started ($run_state)"
     have_secret repository SEVRA_CLI_SIGNING_KEY ||
-      die "the pending v0.2.8 run still needs the transitional repository signer"
+      die "the pending v0.2.9 run still needs the transitional repository signer"
     poll=0
     while [ "$poll" -lt 1800 ]; do
       run_state="$(
@@ -652,15 +652,15 @@ fi
 
 if [ "$original_signer" -eq 1 ] && [ "$already_final" -eq 0 ]; then
   [ "$checkpoint_ready" -eq 1 ] ||
-    die "cannot assemble v0.2.8 without the verified signed checkpoint"
+    die "cannot assemble v0.2.9 without the verified signed checkpoint"
   if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
     existing_draft="$(
       gh api "repos/$repo/releases/tags/$tag" --jq '.draft'
     )"
     [ "$existing_draft" = "true" ] ||
-      die "refusing to replace a non-draft v0.2.8 release"
+      die "refusing to replace a non-draft v0.2.9 release"
     gh release delete "$tag" --repo "$repo" --yes ||
-      die "could not replace the interrupted v0.2.8 draft"
+      die "could not replace the interrupted v0.2.9 draft"
   fi
   gh release create "$tag" \
     --repo "$repo" \
@@ -681,6 +681,7 @@ if [ "$original_signer" -eq 0 ]; then
   unsigned_dir="$tmp_dir/unsigned"
   release_dir="$tmp_dir/release"
   xwin_dir="$tmp_dir/cargo-xwin"
+  llvm_dir="$tmp_dir/llvm-mingw"
   darwin_arm_dir="$tmp_dir/reproduce-darwin-aarch64"
   darwin_x86_dir="$tmp_dir/reproduce-darwin-x86_64"
   linux_arm_dir="$tmp_dir/reproduce-linux-aarch64-musl"
@@ -726,6 +727,9 @@ if [ "$original_signer" -eq 0 ]; then
   tar -xzf "$xwin_archive" -C "$xwin_dir"
   [ "$("$xwin_dir/cargo-xwin" --version)" = "cargo-xwin 0.23.0" ] ||
     die "digest-verified cargo-xwin reported an unexpected version"
+  "$source_dir/scripts/install-pinned-llvm.sh" "$llvm_dir" >/dev/null
+  PATH="$llvm_dir/bin:$PATH"
+  export PATH
 
   # Rebuild all five targets independently before the successor key is read.
   # Any platform/toolchain nondeterminism is fail-closed: a mismatch leaves
@@ -890,7 +894,7 @@ mkdir -p "$verify_dir"
   if [ "$original_signer" -eq 1 ]; then
     for asset in $expected_release_assets; do
       cmp "$checkpoint_dir/$asset" "$verify_dir/$asset" >/dev/null ||
-        die "published v0.2.8 asset differs from the durable signed checkpoint: $asset"
+        die "published v0.2.9 asset differs from the durable signed checkpoint: $asset"
     done
   elif [ "$already_final" -eq 0 ]; then
     for asset in $expected_release_assets; do

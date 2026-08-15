@@ -10,7 +10,7 @@ use ed25519_dalek::{Signature, VerifyingKey};
 
 /// SPKI PEMs of the accepted publisher keys.
 ///
-/// v0.2.8 is the compatibility release for the publisher-key rotation: it is
+/// v0.2.9 is the compatibility release for the publisher-key rotation: it is
 /// signed by the original key while pinning both the original and successor
 /// keys. Keep the original first until every supported install path has
 /// traversed this release and a successor-key release has been proven live.
@@ -90,8 +90,10 @@ mod tests {
         assert!(workflow.contains(
             "SEVRA_ORIGINAL_SIGNER_SPKI: MCowBQYDK2VwAyEA+v5mafEPcIwKAU/DO/z8MM/cT9ndgE1saSUfvcrzLKA="
         ));
-        assert!(workflow.contains("if: needs.version.outputs.version == '0.2.8'"));
-        assert!(workflow.contains("if: needs.version.outputs.version != '0.2.8'"));
+        assert!(workflow.contains("if: needs.version.outputs.version == '0.2.9'"));
+        assert!(workflow.contains("if: needs.version.outputs.version != '0.2.9'"));
+        assert!(workflow.contains("scripts/install-pinned-llvm.sh"));
+        assert!(workflow.contains("$RUNNER_TEMP/llvm-mingw/bin"));
         assert!(workflow.contains("name: successor-unsigned"));
         assert!(!workflow.contains("SEVRA_SUCCESSOR_SIGNER_SPKI"));
         assert!(workflow
@@ -137,6 +139,8 @@ mod tests {
             "cargo +1.96.0 build --release --locked --target aarch64-apple-darwin",
             "cargo +1.96.0 build --release --locked --target x86_64-apple-darwin",
             "\"$xwin_dir/cargo-xwin\" xwin build",
+            "\"$source_dir/scripts/install-pinned-llvm.sh\" \"$llvm_dir\"",
+            "PATH=\"$llvm_dir/bin:$PATH\"",
             "git archive --format=tar --output=\"$source_archive\" \"$release_sha\"",
             "chmod -R a-w \"$source_dir\"",
             "source_canonical=\"$(CDPATH='' cd -- \"$source_dir\" && pwd -P)\"",
@@ -173,6 +177,20 @@ mod tests {
             5,
             "all five attested binaries must reproduce before local signing"
         );
+    }
+
+    #[test]
+    fn windows_llvm_archiver_is_digest_pinned_and_https_only() {
+        let installer = include_str!("../scripts/install-pinned-llvm.sh");
+        assert!(installer.contains(
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/20260616/llvm-mingw-20260616-ucrt-macos-universal.tar.xz"
+        ));
+        assert!(
+            installer.contains("2cab02a2e964bd4aae981150a45985d07c657cfa8d244959eb9e2dcc5eedd7b1")
+        );
+        assert!(installer.contains("--proto '=https'"));
+        assert!(installer.contains("--proto-redir '=https'"));
+        assert!(installer.contains("LLVM version 22.1.8"));
     }
 
     #[test]

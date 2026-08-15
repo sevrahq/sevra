@@ -47,8 +47,8 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
-      - run: sh -n install.sh tests/installers.sh tests/release-controller.sh tests/workflow-shell.sh scripts/release.sh
-      - run: shellcheck install.sh tests/installers.sh tests/release-controller.sh tests/workflow-shell.sh scripts/release.sh
+      - run: sh -n install.sh tests/installers.sh tests/release-controller.sh tests/workflow-shell.sh scripts/install-pinned-llvm.sh scripts/release.sh
+      - run: shellcheck install.sh tests/installers.sh tests/release-controller.sh tests/workflow-shell.sh scripts/install-pinned-llvm.sh scripts/release.sh
       - run: sh tests/installers.sh
       - run: sh tests/release-controller.sh
       - run: sh tests/workflow-shell.sh

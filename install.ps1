@@ -25,7 +25,7 @@ $Base = if ($env:SEVRA_INSTALL_BASE) { $env:SEVRA_INSTALL_BASE } else { "https:/
 $Api = 'https://www.sevrahq.com/api/hub/versions'
 $ManifestBase = if ($env:SEVRA_TRUSTED_MANIFEST_BASE) { $env:SEVRA_TRUSTED_MANIFEST_BASE } else { 'https://www.sevrahq.com/api/hub/releases/sevra' }
 
-# The pinned publisher keys (Ed25519 SPKI). v0.2.8 is signed by the original
+# The pinned publisher keys (Ed25519 SPKI). v0.2.9 is signed by the original
 # key while trusting both it and its successor, so clients can cross the
 # rotation without a flag day.
 $PubkeyOldPem = @'

@@ -26,8 +26,8 @@ the hub's `/api/hub/versions`.
    successor key, the wrapper verifies every attestation and rebuilds all five
    with the same Rust 1.96.0 compiler and locked dependencies: both Darwin
    targets locally, both Linux targets through digest-pinned Cross images,
-   and Windows through a SHA-256-pinned cargo-xwin binary with fixed SDK/CRT
-   versions. The rebuild source is a private, read-only archive materialized
+   and Windows through SHA-256-pinned cargo-xwin and LLVM tool archives with
+   fixed SDK/CRT versions. The rebuild source is a private, read-only archive materialized
    from the exact authorized Git object, never the operator checkout after the
    workflow wait. Its scratch tree lives under the repository's private `.git`
    directory so Colima can mount it into the Linux builders without exposing
@@ -54,8 +54,8 @@ the hub's `/api/hub/versions`.
    toolchain nondeterminism is also fail-closed and must be investigated; the
    release controller never substitutes a merely similar local binary.
 
-   v0.2.8 is the one compatibility exception: run
-   `scripts/release.sh v0.2.8`. It consumes the already-present original
+   v0.2.9 is the one compatibility exception: run
+   `scripts/release.sh v0.2.9`. It consumes the already-present original
    repository signer. The protected job signs and persists an immutable
    11-file Actions checkpoint with the maximum 90-day recovery retention,
    then attests every byte to the exact tag and
@@ -68,7 +68,7 @@ the hub's `/api/hub/versions`.
    exact authorized SHA and one unique release workflow run names that tag and
    SHA. A completed immutable release is mutation-free but still performs the
    complete exact-source five-target reproduction, signature/checksum checks,
-   and final byte comparisons. An interrupted v0.2.8 draft is discarded and
+   and final byte comparisons. An interrupted v0.2.9 draft is discarded and
    rebuilt from its verified signed checkpoint; an interrupted successor draft
    is discarded and rebuilt from the complete locally reproduced, signed asset
    set.
@@ -89,7 +89,7 @@ the hub's `/api/hub/versions`.
    not trust the checksum served beside the GitHub binary.
 7. After that deployment is live, manually dispatch `smoke.yml` with the
    concrete version. It first proves production still routes `sevra/0.2.7`
-   and older through the old-signed v0.2.8 bridge while v0.2.8 and newer see
+   and older through the old-signed v0.2.9 bridge while v0.2.9 and newer see
    the true latest. It then installs from the release on macOS + Linux
    (install.sh) and Windows (install.ps1), proving both production installer
    scripts are byte-identical to this repository before it runs
@@ -109,12 +109,12 @@ shell-profile secret. The referenced 1Password field contains the **base64 of
 the PKCS#8 PEM**. A raw PEM, base64-of-DER, or key with the wrong SPKI fails
 before any signature is written.
 
-The environment authorization exists only for the one-time v0.2.8 transition.
+The environment authorization exists only for the one-time v0.2.9 transition.
 Its exact shape is `tag:sha:run_id.run_attempt:nonce`, where the SHA is 40
 lowercase hex and the nonce is 64 lowercase hex. A different tag, commit, run,
 or rerun cannot consume it. If that compatibility wrapper is interrupted
 after injection, its exit trap deletes the environment authorization. If the
-process was forcibly killed, first inspect that no v0.2.8 job is
+process was forcibly killed, first inspect that no v0.2.9 job is
 waiting/running, then run the cleanup command before `--resume`:
 
 ```sh
@@ -126,13 +126,13 @@ Rotation is additive and order-sensitive:
 1. Pin the new public key alongside the old one in `src/signing.rs`,
    `install.sh`, `install.ps1`, and `sevra.pub`.
 2. Confirm the successor private key is recoverable from 1Password Recovery.
-   Release v0.2.8 with `scripts/release.sh v0.2.8` while the original
+   Release v0.2.9 with `scripts/release.sh v0.2.9` while the original
    repository secret still exists. The wrapper deletes that original secret
    only after the durable signed checkpoint and all exact-tag/SHA attestations
    verify locally.
-3. Deploy the v0.2.8 digest manifest and byte-identical installers. Run the
+3. Deploy the v0.2.9 digest manifest and byte-identical installers. Run the
    protected smoke workflow, then prove an installed v0.2.7 CLI can
-   self-update to v0.2.8. These are the authoritative checks that the original
+   self-update to v0.2.9. These are the authoritative checks that the original
    key still crosses every installer/updater path.
 4. Delete the legacy `SEVRA_CLI_SIGNING_KEY_NEXT` environment secret:
 
@@ -141,17 +141,17 @@ Rotation is additive and order-sensitive:
      --repo sevrahq/sevra --env release-signing
    ```
 
-   Release v0.2.9 through the wrapper's local `op://` path, still pinning both
+   Release v0.2.10 through the wrapper's local `op://` path, still pinning both
    public keys. The controller requires the successor SPKI for every release
-   after v0.2.8; no GitHub runner receives the key. Deploy its reviewed digest
+   after v0.2.9; no GitHub runner receives the key. Deploy its reviewed digest
    manifest and byte-identical installers, then run the protected smoke. Prove
-   both a fresh install and a v0.2.8 self-update to v0.2.9.
-5. Only after v0.2.9 proves the successor signing path, remove the original
+   both a fresh install and a v0.2.9 self-update to v0.2.10.
+5. Only after v0.2.10 proves the successor signing path, remove the original
    public-key pin from the updater, both installers, and `sevra.pub`; release
-   that successor-only trust set as v0.2.10 through the same local controller.
-   Deploy and smoke it in the same order. Keep v0.2.8's manifest entries and
+   that successor-only trust set as v0.2.11 through the same local controller.
+   Deploy and smoke it in the same order. Keep v0.2.9's manifest entries and
    the production User-Agent bridge: clients at v0.2.7 or older must still be
-   offered old-signed v0.2.8 first, then they can safely advance to the true
+   offered old-signed v0.2.9 first, then they can safely advance to the true
    successor-signed latest on their next run.
 
 Full notes: the platform repo's `infra/README.md`.

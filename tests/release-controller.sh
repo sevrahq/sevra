@@ -26,14 +26,14 @@ case "$1 $2" in
   "rev-parse --absolute-git-dir") printf '%s\n' "$SEVRA_TEST_STATE" ;;
   "ls-remote origin")
     if [ "$SEVRA_TEST_MODE" = resume ] || [ "$SEVRA_TEST_MODE" = partial_resume ]; then
-      printf '%s\trefs/tags/v0.2.8\n' "$SEVRA_TEST_SHA"
+      printf '%s\trefs/tags/v0.2.9\n' "$SEVRA_TEST_SHA"
     fi
     ;;
   "show-ref --verify")
     [ "$SEVRA_TEST_MODE" = resume ] || [ "$SEVRA_TEST_MODE" = partial_resume ]
     ;;
   "rev-list -n") printf '%s\n' "$SEVRA_TEST_SHA" ;;
-  "tag v0.2.8") ;;
+  "tag v0.2.9") ;;
   "push origin") ;;
   *) printf 'unexpected fake git invocation: %s\n' "$*" >&2; exit 98 ;;
 esac
@@ -196,7 +196,7 @@ case "$command_name" in
           printf '%s\n' 77
         fi
         ;;
-      *"releases/tags/v0.2.8"*)
+      *"releases/tags/v0.2.9"*)
         case "$*" in
           *".assets"*)
             printf '%s\n' \
@@ -238,7 +238,7 @@ case "$command_name" in
           *) printf '%s\n' true ;;
         esac
         ;;
-      *"git/ref/tags/v0.2.8"*) printf '%s\n' "$SEVRA_TEST_SHA" ;;
+      *"git/ref/tags/v0.2.9"*) printf '%s\n' "$SEVRA_TEST_SHA" ;;
       *) exit 98 ;;
     esac
     ;;
@@ -266,9 +266,9 @@ run_controller() {
     sh "$repo_root/scripts/release.sh" "$@"
 }
 
-# Fresh v0.2.8 reaches the protected environment, then the secret-injection
+# Fresh v0.2.9 reaches the protected environment, then the secret-injection
 # process is interrupted. Both environment secrets must be deleted by EXIT.
-if run_controller interrupt v0.2.8 >"$fixture/interrupt.out" 2>&1; then
+if run_controller interrupt v0.2.9 >"$fixture/interrupt.out" 2>&1; then
   printf '%s\n' "expected interrupted injection to fail" >&2
   exit 1
 fi
@@ -286,7 +286,7 @@ immutable_line="$(
     "$SEVRA_TEST_LOG" | sed -n '1s/:.*//p'
 )"
 tag_push_line="$(
-  grep -nF 'git push origin refs/tags/v0.2.8' "$SEVRA_TEST_LOG" |
+  grep -nF 'git push origin refs/tags/v0.2.9' "$SEVRA_TEST_LOG" |
     sed -n '1s/:.*//p'
 )"
 if [ -z "$immutable_line" ] || [ -z "$tag_push_line" ] ||
@@ -298,7 +298,7 @@ fi
 
 # A protected job that starts but fails before the signed checkpoint must keep
 # the repository signer. Starting the job alone is never a retirement gate.
-if run_controller after_start v0.2.8 >"$fixture/after-start.out" 2>&1; then
+if run_controller after_start v0.2.9 >"$fixture/after-start.out" 2>&1; then
   printf '%s\n' "expected pre-checkpoint workflow failure to fail closed" >&2
   exit 1
 fi
@@ -315,13 +315,13 @@ fi
 # Once the signed checkpoint and attestations verify, the signer is removed.
 # The call order is part of the security property: download/verification must
 # precede repository-secret deletion.
-if ! run_controller checkpoint_success v0.2.8 >"$fixture/checkpoint.out" 2>&1; then
+if ! run_controller checkpoint_success v0.2.9 >"$fixture/checkpoint.out" 2>&1; then
   cat "$fixture/checkpoint.out" >&2
   cat "$SEVRA_TEST_LOG" >&2
   exit 1
 fi
 checkpoint_line="$(
-  grep -nF "gh run download 222 --repo sevrahq/sevra --name transitional-signed-v0.2.8" \
+  grep -nF "gh run download 222 --repo sevrahq/sevra --name transitional-signed-v0.2.9" \
     "$SEVRA_TEST_LOG" | sed -n '1s/:.*//p'
 )"
 delete_line="$(
@@ -340,16 +340,16 @@ grep -Fq "verified durable signed checkpoint; deleted the transitional repositor
 # Exact-SHA resume needs no signer. Model a failed workflow with an existing
 # partial draft and a durable checkpoint: the controller discards the partial
 # draft, recreates it from the checkpoint, and publishes the exact set.
-if ! run_controller partial_resume --resume v0.2.8 >"$fixture/partial.out" 2>&1; then
+if ! run_controller partial_resume --resume v0.2.9 >"$fixture/partial.out" 2>&1; then
   cat "$fixture/partial.out" >&2
   cat "$SEVRA_TEST_LOG" >&2
   exit 1
 fi
 for expected_call in \
-  "gh release delete v0.2.8 --repo sevrahq/sevra --yes" \
-  "gh release create v0.2.8 --repo sevrahq/sevra --verify-tag --draft --title sevra v0.2.8 --generate-notes" \
-  "gh release upload v0.2.8" \
-  "gh release edit v0.2.8 --repo sevrahq/sevra --draft=false"
+  "gh release delete v0.2.9 --repo sevrahq/sevra --yes" \
+  "gh release create v0.2.9 --repo sevrahq/sevra --verify-tag --draft --title sevra v0.2.9 --generate-notes" \
+  "gh release upload v0.2.9" \
+  "gh release edit v0.2.9 --repo sevrahq/sevra --draft=false"
 do
   grep -Fq "$expected_call" "$SEVRA_TEST_LOG" || {
     printf 'missing resumable draft call: %s\n' "$expected_call" >&2
@@ -366,7 +366,7 @@ fi
 
 # Resume after the exact run succeeded and the one-time repository signer was
 # already deleted. It must not push, authorize, or mutate the immutable release.
-if ! run_controller resume --resume v0.2.8 >"$fixture/resume.out" 2>&1; then
+if ! run_controller resume --resume v0.2.9 >"$fixture/resume.out" 2>&1; then
   cat "$fixture/resume.out" >&2
   cat "$SEVRA_TEST_LOG" >&2
   exit 1
@@ -380,7 +380,7 @@ then
 fi
 grep -Fq "gh run watch 222 --repo sevrahq/sevra --exit-status --compact" \
   "$SEVRA_TEST_LOG"
-grep -Fq "gh api repos/sevrahq/sevra/git/ref/tags/v0.2.8 --jq .object.sha" \
+grep -Fq "gh api repos/sevrahq/sevra/git/ref/tags/v0.2.9 --jq .object.sha" \
   "$SEVRA_TEST_LOG"
 
 # A successor resume must independently rebuild all five targets even when the
@@ -390,12 +390,14 @@ grep -Fq "gh api repos/sevrahq/sevra/git/ref/tags/v0.2.8 --jq .object.sha" \
 successor_root="$fixture/successor-repo"
 successor_bin="$fixture/successor-bin"
 successor_source="$fixture/successor-source"
-mkdir -p "$successor_root/scripts" "$successor_bin" "$successor_source"
+mkdir -p "$successor_root/scripts" "$successor_bin" "$successor_source/scripts"
 cp "$repo_root/scripts/release.sh" "$successor_root/scripts/release.sh"
+cp "$repo_root/scripts/install-pinned-llvm.sh" \
+  "$successor_source/scripts/install-pinned-llvm.sh"
 cat >"$successor_root/Cargo.toml" <<'EOF'
 [package]
 name = "sevra"
-version = "0.2.9"
+version = "0.2.10"
 build-marker = "trusted"
 EOF
 cp "$successor_root/Cargo.toml" "$successor_source/Cargo.toml"
@@ -411,7 +413,7 @@ case "$1 $2" in
   "fetch --quiet") ;;
   "rev-parse HEAD"|"rev-parse origin/main") printf '%s\n' "$SEVRA_TEST_SHA" ;;
   "rev-parse --absolute-git-dir") printf '%s\n' "$SEVRA_TEST_STATE" ;;
-  "ls-remote origin") printf '%s\trefs/tags/v0.2.9\n' "$SEVRA_TEST_SHA" ;;
+  "ls-remote origin") printf '%s\trefs/tags/v0.2.10\n' "$SEVRA_TEST_SHA" ;;
   "show-ref --verify") exit 0 ;;
   "rev-list -n") printf '%s\n' "$SEVRA_TEST_SHA" ;;
   "show -s") printf '%s\n' 1700000000 ;;
@@ -514,7 +516,7 @@ case "$command_name" in
         cat >"$SEVRA_SUCCESSOR_ROOT/Cargo.toml" <<'MUTATED'
 [package]
 name = "sevra"
-version = "0.2.9"
+version = "0.2.10"
 build-marker = "mutated"
 MUTATED
         ;;
@@ -536,7 +538,7 @@ MUTATED
   api)
     case "$*" in
       *"immutable-releases"*) printf '%s\n' true ;;
-      *"releases/tags/v0.2.9"*".assets"*)
+      *"releases/tags/v0.2.10"*".assets"*)
         printf '%s\n' \
           SHA256SUMS \
           sevra-darwin-aarch64 \
@@ -550,8 +552,8 @@ MUTATED
           sevra-windows-x86_64.exe \
           sevra-windows-x86_64.exe.sig
         ;;
-      *"releases/tags/v0.2.9"*) printf '%s\n' true ;;
-      *"git/ref/tags/v0.2.9"*) printf '%s\n' "$SEVRA_TEST_SHA" ;;
+      *"releases/tags/v0.2.10"*) printf '%s\n' true ;;
+      *"git/ref/tags/v0.2.10"*) printf '%s\n' "$SEVRA_TEST_SHA" ;;
       *) exit 98 ;;
     esac
     ;;
@@ -594,7 +596,7 @@ cat >"$successor_bin/curl" <<'EOF'
 #!/bin/sh
 output=""
 while [ "$#" -gt 0 ]; do
-  if [ "$1" = -o ]; then
+  if [ "$1" = -o ] || [ "$1" = --output ]; then
     output="$2"
     break
   fi
@@ -605,7 +607,25 @@ done
 EOF
 cat >"$successor_bin/tar" <<'EOF'
 #!/bin/sh
-if [ "$1" = -xzf ]; then
+if [ "$1" = -xJf ]; then
+  destination=""
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = -C ]; then
+      destination="$2"
+      break
+    fi
+    shift
+  done
+  [ -n "$destination" ] || exit 98
+  mkdir -p "$destination/bin" "$destination/lib"
+  cat >"$destination/bin/llvm-ar" <<'LLVM_AR'
+#!/bin/sh
+printf '%s\n' 'LLVM version 22.1.8'
+LLVM_AR
+  chmod +x "$destination/bin/llvm-ar"
+  ln -s llvm-ar "$destination/bin/llvm-lib"
+  : >"$destination/lib/libLLVM.dylib"
+elif [ "$1" = -xzf ]; then
   destination=""
   while [ "$#" -gt 0 ]; do
     if [ "$1" = -C ]; then
@@ -700,7 +720,7 @@ if ! (
   SEVRA_TEST_STATE="$fixture/state" \
   SEVRA_REAL_TAR="$real_tar" \
     PATH="$successor_bin:$PATH" \
-    sh scripts/release.sh --resume v0.2.9
+    sh scripts/release.sh --resume v0.2.10
 ) >"$fixture/successor.out" 2>&1
 then
   cat "$fixture/successor.out" >&2

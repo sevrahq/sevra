@@ -1,11 +1,16 @@
 # Changelog
 
-## 0.2.8 — 2026-08-10
+## 0.2.9 — 2026-08-15
 
+- Move the old-key compatibility bridge from the protected but unpublished
+  v0.2.8 tag to v0.2.9. The v0.2.8 run failed before signing because its
+  macOS cargo-xwin builder lacked `llvm-lib`; no v0.2.8 release exists.
+- Pin the exact macOS LLVM archiver by upstream asset digest and use it in
+  both CI and the independent local successor-release controller.
 - Security: the release controller now proves repository-level immutable
   GitHub Releases are enabled before it creates a protected version tag. The
   one-time signed recovery checkpoint is retained for the maximum 90-day
-  public-repository window, reducing the chance that an interrupted v0.2.8
+  public-repository window, reducing the chance that an interrupted v0.2.9
   draft could outlive its only recovery source after the original signer is
   retired. Exact-source scratch trees now live privately under `.git`, keeping
   successor Cross mounts inside Colima's shared host path. Pre-tag failures
@@ -66,7 +71,7 @@
   already reached retained packs, R2, and retention-locked backups.
 - Security: publisher-key rotation starts with an additive compatibility
   release. The updater and both installers trust the original and successor
-  Ed25519 keys, while v0.2.8 remains signed by the original key. The
+  Ed25519 keys, while v0.2.9 remains signed by the original key. The
   independently deployed SHA-256 manifest is still mandatory, so accepting
   either publisher key does not collapse the second trust root.
 - Security: `secrets quarantine` refuses a symlinked `.sevralocal`, opens an
@@ -126,7 +131,7 @@
   in addition to the Ed25519 signature. An unavailable or malformed second
   root refuses the update instead of silently falling back to one key.
 - Supply chain: release tags must point to `main`; a guarded wrapper requires
-  clean `main`, exact `origin/main`, and green CI before tagging. v0.2.8 alone
+  clean `main`, exact `origin/main`, and green CI before tagging. v0.2.9 alone
   uses a protected runner authorization bound to its exact tag, commit,
   workflow attempt, and nonce, then deletes the transitional signer.
   Successor signing moves entirely off hosted runners: Actions emits five
@@ -156,7 +161,7 @@
   Windows. Post-manifest smoke also proves the production installers remain
   byte-identical to this repository.
 - Supply chain: post-manifest smoke proves production still routes legacy
-  old-key-only CLIs through v0.2.8 before offering successor-signed releases,
+  old-key-only CLIs through v0.2.9 before offering successor-signed releases,
   and the release runbook deploys changed installer snapshots before the
   byte-identity smoke gate.
 
