@@ -60,11 +60,11 @@ tar -xJf "$archive" -C "$destination" --strip-components=1 \
   printf '%s\n' "pinned LLVM archive did not contain executable llvm-ar" >&2
   exit 1
 }
-[ -L "$destination/bin/llvm-lib" ] &&
-  [ "$(readlink "$destination/bin/llvm-lib")" = llvm-ar ] || {
+if [ ! -L "$destination/bin/llvm-lib" ] ||
+  [ "$(readlink "$destination/bin/llvm-lib")" != llvm-ar ]; then
     printf '%s\n' "pinned LLVM archive exposed an unexpected llvm-lib" >&2
     exit 1
-  }
+fi
 "$destination/bin/llvm-ar" --version | grep -Fq 'LLVM version 22.1.8' || {
   printf '%s\n' "pinned LLVM archive reported an unexpected version" >&2
   exit 1
