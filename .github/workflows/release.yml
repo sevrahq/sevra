@@ -2,13 +2,13 @@
 #
 # Five targets: four BARE unix binaries `sevra-<target>` plus the Windows
 # `sevra-windows-x86_64.exe`, each with a detached Ed25519 signature
-# `<asset>.sig` (base64 of 64 raw bytes). v0.2.9 is the one compatibility
-# release signed on a protected GitHub runner with the original key; its
-# authorization is bound to one exact attempt. The repository key is deleted
-# only after the signed bytes are durable as an immutable Actions artifact and
-# every byte has exact-tag/SHA provenance, so a failed draft can be resumed
-# without restoring the signer. Every successor release ends this
-# runner-key exposure: Actions produces and attests exactly five unsigned
+# `<asset>.sig` (base64 of 64 raw bytes). v0.2.9 and v0.2.10 are the two
+# compatibility bridges: the original key introduced compatibility signer A,
+# then A introduces offline signer B. Each protected-runner authorization is
+# bound to one exact attempt, and each retired key is deleted only after the
+# signed bytes are durable as an immutable Actions artifact with exact-tag/SHA
+# provenance. Every later release ends runner-key exposure: Actions produces
+# and attests exactly five unsigned
 # binaries, then scripts/release.sh verifies them, reproducibly rebuilds the
 # Linux pair, signs locally from 1Password, uploads the complete draft, and
 # publishes it immutable. A single SHA256SUMS covers every binary. install.sh /
@@ -19,8 +19,8 @@
 # SemVer tag whose version equals Cargo.toml after the exact main commit has
 # passed CI.
 #
-# Key custody after v0.2.9: no Actions secret, environment, runner, workflow,
-# artifact, or log ever receives the successor private key. The local
+# Key custody after v0.2.10: no Actions secret, environment, runner, workflow,
+# artifact, or log ever receives offline signer B. The local
 # controller reads it into one Node process over stdin only after exact
 # provenance and independent Linux reproduction succeed.
 name: release
@@ -203,7 +203,7 @@ jobs:
   publish:
     needs: [version, build]
     name: sign + publish release
-    if: needs.version.outputs.version == '0.2.9'
+    if: needs.version.outputs.version == '0.2.9' || needs.version.outputs.version == '0.2.10'
     runs-on: ubuntu-24.04
     # Protected approval boundary for the ephemeral publisher key and
     # per-attempt authorization. Repo write access and a release tag are
@@ -220,13 +220,28 @@ jobs:
       - name: Collect, sign, checksum
         shell: bash
         env:
-          SEVRA_CLI_SIGNING_KEY: ${{ secrets.SEVRA_CLI_SIGNING_KEY }}
+          SEVRA_CLI_SIGNING_KEY_ORIGINAL: ${{ secrets.SEVRA_CLI_SIGNING_KEY }}
+          SEVRA_CLI_SIGNING_KEY_BRIDGE: ${{ secrets.SEVRA_CLI_SIGNING_KEY_NEXT }}
           SEVRA_RELEASE_AUTHORIZATION: ${{ secrets.SEVRA_RELEASE_AUTHORIZATION }}
           VERSION: ${{ needs.version.outputs.version }}
-          # This runner-signing path exists for v0.2.9 only.
-          SEVRA_ORIGINAL_SIGNER_SPKI: MCowBQYDK2VwAyEA+v5mafEPcIwKAU/DO/z8MM/cT9ndgE1saSUfvcrzLKA=
         run: |
           set -euo pipefail
+          case "$VERSION" in
+            0.2.9)
+              SEVRA_CLI_SIGNING_KEY="$SEVRA_CLI_SIGNING_KEY_ORIGINAL"
+              SEVRA_EXPECTED_SIGNER_SPKI='MCowBQYDK2VwAyEA+v5mafEPcIwKAU/DO/z8MM/cT9ndgE1saSUfvcrzLKA='
+              ;;
+            0.2.10)
+              SEVRA_CLI_SIGNING_KEY="$SEVRA_CLI_SIGNING_KEY_BRIDGE"
+              SEVRA_EXPECTED_SIGNER_SPKI='MCowBQYDK2VwAyEAasunxAjcJp8W30eF0ndPlLXqwSjZ/u5raivn3QmaKcc='
+              ;;
+            *)
+              echo "::error::protected runner signing is not authorized for v$VERSION"
+              exit 1
+              ;;
+          esac
+          export SEVRA_CLI_SIGNING_KEY SEVRA_EXPECTED_SIGNER_SPKI
+          unset SEVRA_CLI_SIGNING_KEY_ORIGINAL SEVRA_CLI_SIGNING_KEY_BRIDGE
           [ -n "$SEVRA_CLI_SIGNING_KEY" ] || { echo "::error::SEVRA_CLI_SIGNING_KEY secret is empty"; exit 1; }
           [ -n "$SEVRA_RELEASE_AUTHORIZATION" ] || { echo "::error::SEVRA_RELEASE_AUTHORIZATION secret is empty"; exit 1; }
           node -e '
@@ -245,8 +260,8 @@ jobs:
             }
             const key = createPrivateKey(Buffer.from(process.env.SEVRA_CLI_SIGNING_KEY, "base64"));
             const actual = createPublicKey(key).export({ type: "spki", format: "der" }).toString("base64");
-            if (actual !== process.env.SEVRA_ORIGINAL_SIGNER_SPKI) {
-              throw new Error("v0.2.9 is configured with the wrong release signer");
+            if (actual !== process.env.SEVRA_EXPECTED_SIGNER_SPKI) {
+              throw new Error("compatibility release is configured with the wrong release signer");
             }
           '
           mkdir -p dist
@@ -298,11 +313,11 @@ jobs:
       # upload-artifact v4 artifacts are immutable after creation. This is the
       # signer-retirement checkpoint: the local controller verifies its exact
       # 11-file shape, Ed25519 signatures, checksums, and provenance before it
-      # deletes the one-time repository signer.
+      # deletes the one-time compatibility signer.
       - name: Persist immutable signed checkpoint
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: transitional-signed-v0.2.9
+          name: compatibility-signed-v${{ needs.version.outputs.version }}
           path: dist/*
           if-no-files-found: error
           # This is the only recovery source after the controller verifies the
@@ -380,7 +395,7 @@ jobs:
   prepare-successor:
     needs: [version, build]
     name: attest unsigned successor assets
-    if: needs.version.outputs.version != '0.2.9'
+    if: needs.version.outputs.version != '0.2.9' && needs.version.outputs.version != '0.2.10'
     runs-on: ubuntu-24.04
     permissions:
       contents: read

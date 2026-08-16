@@ -347,21 +347,98 @@ fn entries_from_store(store: &Store) -> Vec<(String, Vec<u8>)> {
     entries
 }
 
-fn fetch_snapshot(cfg: &Config, brain: &str, exact: Option<(u64, &str)>) -> PulledSnapshot {
-    let query = match exact {
-        Some((seq, feed_hash)) => format!("?format=pack&atSeq={seq}&feedHash={}", enc(feed_hash)),
-        None => "?format=pack".to_string(),
-    };
-    let response = ensure_ok(
+fn current_snapshot_address(cfg: &Config, brain: &str) -> (u64, Option<String>) {
+    let head = ensure_ok(
         request(
             cfg,
             "GET",
-            &format!("/api/hub/brains/{}/export{}", enc(brain), query),
+            &format!("/api/hub/brains/{}", enc(brain)),
             None,
             true,
         ),
-        "fetch brain snapshot",
+        "resolve current brain snapshot",
     );
+    let seq = head
+        .get("headSeq")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| fail("hub returned no valid feed sequence", None));
+    let feed_hash = head
+        .get("feedHash")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if (seq > 0 && !feed_hash.as_deref().is_some_and(canonical_sha256))
+        || (seq == 0 && feed_hash.is_some())
+    {
+        fail("hub returned an invalid current snapshot address", None);
+    }
+    (seq, feed_hash)
+}
+
+fn snapshot_query(address: Option<(u64, Option<&str>)>, include_vault_names: bool) -> String {
+    let mut query = match address {
+        Some((seq, feed_hash)) => format!(
+            "?format=pack&atSeq={seq}&feedHash={}",
+            enc(feed_hash.unwrap_or("none"))
+        ),
+        None => "?format=pack".to_string(),
+    };
+    if include_vault_names {
+        query.push_str("&includeVaultNames=1");
+    }
+    query
+}
+
+fn request_snapshot(
+    cfg: &Config,
+    brain: &str,
+    exact: Option<(u64, &str)>,
+    include_vault_names: bool,
+) -> (Value, Option<(u64, Option<String>)>) {
+    let requested = exact.map(|(seq, hash)| (seq, Some(hash.to_string())));
+    let first = request(
+        cfg,
+        "GET",
+        &format!(
+            "/api/hub/brains/{}/export{}",
+            enc(brain),
+            snapshot_query(
+                exact.map(|(seq, hash)| (seq, Some(hash))),
+                include_vault_names,
+            )
+        ),
+        None,
+        true,
+    );
+    if exact.is_none()
+        && first.status == 400
+        && body_code(&first) == Some("snapshot_address_required")
+    {
+        // Current hubs reject an unpinned pack read. Resolve the signed feed
+        // head, then ask for exactly that immutable address. If it advances in
+        // between, the hub returns snapshot_not_current instead of silently
+        // exporting different bytes; the caller can retry from a fresh head.
+        let address = current_snapshot_address(cfg, brain);
+        let response = ensure_ok(
+            request(
+                cfg,
+                "GET",
+                &format!(
+                    "/api/hub/brains/{}/export{}",
+                    enc(brain),
+                    snapshot_query(Some((address.0, address.1.as_deref())), include_vault_names,)
+                ),
+                None,
+                true,
+            ),
+            "fetch exact brain snapshot",
+        );
+        return (response, Some(address));
+    }
+    (ensure_ok(first, "fetch brain snapshot"), requested)
+}
+
+fn fetch_snapshot(cfg: &Config, brain: &str, exact: Option<(u64, &str)>) -> PulledSnapshot {
+    let (response, requested) = request_snapshot(cfg, brain, exact, false);
     let brain_id = response
         .get("brain")
         .and_then(Value::as_str)
@@ -388,8 +465,8 @@ fn fetch_snapshot(cfg: &Config, brain: &str, exact: Option<(u64, &str)>) -> Pull
     if head_seq == 0 && feed_hash.is_some() {
         fail("hub returned a feed hash for an empty brain", None);
     }
-    if let Some((expected_seq, expected_hash)) = exact {
-        if head_seq != expected_seq || feed_hash.as_deref() != Some(expected_hash) {
+    if let Some((expected_seq, expected_hash)) = requested {
+        if head_seq != expected_seq || feed_hash != expected_hash {
             fail(
                 "hub returned a snapshot other than the exact requested feed head",
                 None,
@@ -3950,19 +4027,17 @@ pub fn export(
     skip_assets: bool,
     with_secrets: bool,
 ) {
-    let r = ensure_ok(
-        request(
-            cfg,
-            "GET",
-            &format!(
-                "/api/hub/brains/{}/export?format=pack&includeVaultNames=1",
-                enc(brain)
-            ),
-            None,
-            true,
-        ),
-        "export",
-    );
+    let (r, requested) = request_snapshot(cfg, brain, None, true);
+    if let Some((expected_seq, expected_hash)) = requested {
+        let actual_seq = r.get("headSeq").and_then(Value::as_u64);
+        let actual_hash = r.get("feedHash").and_then(Value::as_str);
+        if actual_seq != Some(expected_seq) || actual_hash != expected_hash.as_deref() {
+            fail(
+                "hub returned an export other than the exact requested feed head",
+                None,
+            );
+        }
+    }
     // The default dir name comes from the hub's slug — validate it before it
     // becomes a path (don't trust the hub response).
     let remote_slug = r.get("slug").and_then(|s| s.as_str()).filter(|s| {

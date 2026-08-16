@@ -1,8 +1,8 @@
 #!/bin/sh
 #
-# Release one exact, already-green commit. v0.2.9 consumes the transitional
-# original signer on one protected GitHub Actions attempt. Every successor
-# release keeps the Ed25519 private key local: Actions returns only unsigned,
+# Release one exact, already-green commit. v0.2.9 consumed the original signer
+# and v0.2.10 is the one-time protected bridge from signer A to offline signer
+# B. Every later release keeps the Ed25519 private key local: Actions returns only unsigned,
 # tag/SHA-attested binaries; this controller independently reproduces the
 # five binaries, signs them from 1Password over stdin, then publishes.
 set -eu
@@ -16,9 +16,12 @@ resume=0
 ephemeral_secrets_present=0
 publish_started=0
 original_signer=0
+bridge_signer=0
+protected_signer=0
 original_signer_deleted=0
 checkpoint_ready=0
-checkpoint_name="transitional-signed-v0.2.9"
+checkpoint_name=""
+protected_signer_spki=""
 checkpoint_dir=""
 preexisting_final=0
 tmp_dir=""
@@ -45,14 +48,15 @@ Usage:
   scripts/release.sh [--resume] [--signing-key-ref op://VAULT/ITEM/FIELD] [vX.Y.Z]
   scripts/release.sh --cleanup-ephemeral-secrets
 
-For v0.2.9 only, the wrapper consumes the transitional repository-scoped
-SEVRA_CLI_SIGNING_KEY. It deletes that signer only after the exact signed set
-is durable in an immutable Actions artifact and every byte's tag/SHA
-provenance, checksum, and Ed25519 signature verify locally. Later releases
-require a 1Password secret reference whose value is the base64 of the signer's
-PKCS#8 PEM. The value is read only after unsigned artifact provenance and all
-five independent reproductions succeed, passed directly to one local Node
-process over stdin, and never sent to GitHub or written to disk.
+v0.2.9 consumes the transitional repository-scoped SEVRA_CLI_SIGNING_KEY.
+v0.2.10 consumes the protected-environment SEVRA_CLI_SIGNING_KEY_NEXT bridge.
+Each signer is deleted only after the exact signed set is durable in an
+immutable Actions artifact and every byte's tag/SHA provenance, checksum, and
+Ed25519 signature verify locally. Later releases require a 1Password secret
+reference whose value is the base64 of offline signer B's PKCS#8 PEM. The value
+is read only after unsigned artifact provenance and all five independent
+reproductions succeed, passed directly to one local Node process over stdin,
+and never sent to GitHub or written to disk.
 EOF
 }
 
@@ -155,11 +159,10 @@ verify_signed_release_set() {
   ' "$signed_dir" "$signer_spki" || return 1
 }
 
-verify_transitional_checkpoint() {
+verify_protected_checkpoint() {
   checkpoint="$1"
-  verify_signed_release_set \
-    "$checkpoint" \
-    "MCowBQYDK2VwAyEA+v5mafEPcIwKAU/DO/z8MM/cT9ndgE1saSUfvcrzLKA=" ||
+  signer_spki="$2"
+  verify_signed_release_set "$checkpoint" "$signer_spki" ||
     return 1
 
   for checkpoint_asset in $expected_release_assets; do
@@ -185,17 +188,27 @@ cleanup() {
     rm -rf -- "$tmp_dir"
   fi
   if [ "$status" -ne 0 ]; then
-    if [ "$original_signer" -eq 1 ] && [ "$publish_started" -eq 0 ]; then
+    if [ "$protected_signer" -eq 1 ] && [ "$publish_started" -eq 0 ]; then
+      if [ "$original_signer" -eq 1 ]; then
+        printf '%s\n' \
+          "release: the transitional repository signer was retained because the publish job never started" >&2
+      else
+        printf '%s\n' \
+          "release: the compatibility bridge signer was retained because the publish job never started" >&2
+      fi
+    elif [ "$protected_signer" -eq 1 ] && [ "$checkpoint_ready" -eq 0 ]; then
+      if [ "$original_signer" -eq 1 ]; then
+        printf '%s\n' \
+          "release: the transitional repository signer was retained because no durable verified signed checkpoint exists" >&2
+      else
+        printf '%s\n' \
+          "release: the compatibility bridge signer was retained because no durable verified signed checkpoint exists" >&2
+      fi
+    elif [ "$protected_signer" -eq 1 ] && [ "$original_signer_deleted" -eq 0 ]; then
       printf '%s\n' \
-        "release: the transitional repository signer was retained because the publish job never started" >&2
-    elif [ "$original_signer" -eq 1 ] && [ "$checkpoint_ready" -eq 0 ]; then
-      printf '%s\n' \
-        "release: the transitional repository signer was retained because no durable verified signed checkpoint exists" >&2
-    elif [ "$original_signer" -eq 1 ] && [ "$original_signer_deleted" -eq 0 ]; then
-      printf '%s\n' \
-        "release: URGENT: verify and delete the transitional repository signer" >&2
+        "release: URGENT: verify and delete the protected compatibility signer" >&2
     fi
-    if [ "$original_signer" -eq 1 ]; then
+    if [ "$protected_signer" -eq 1 ]; then
       printf '%s\n' \
         "release: failed; verify the one-run environment secrets are absent; use --cleanup-ephemeral-secrets if GitHub was unreachable" >&2
     else
@@ -292,9 +305,20 @@ printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' ||
   die "tag must be a SemVer release beginning with v"
 [ "$tag" = "v$cargo_version" ] ||
   die "$tag does not equal Cargo.toml version v$cargo_version"
-if [ "$tag" = "v0.2.9" ]; then
-  original_signer=1
-fi
+case "$tag" in
+  v0.2.9)
+    original_signer=1
+    protected_signer=1
+    checkpoint_name="transitional-signed-v0.2.9"
+    protected_signer_spki="MCowBQYDK2VwAyEA+v5mafEPcIwKAU/DO/z8MM/cT9ndgE1saSUfvcrzLKA="
+    ;;
+  v0.2.10)
+    bridge_signer=1
+    protected_signer=1
+    checkpoint_name="compatibility-signed-v0.2.10"
+    protected_signer_spki="MCowBQYDK2VwAyEAasunxAjcJp8W30eF0ndPlLXqwSjZ/u5raivn3QmaKcc="
+    ;;
+esac
 
 release_git_dir="$(git rev-parse --absolute-git-dir)"
 [ -d "$release_git_dir" ] ||
@@ -348,7 +372,7 @@ immutable_releases_enabled="$(
 [ "$immutable_releases_enabled" = true ] ||
   die "immutable GitHub Releases must be enabled before tagging"
 
-if [ "$tag" = "v0.2.9" ]; then
+if [ "$protected_signer" -eq 1 ]; then
   if have_secret environment SEVRA_RELEASE_AUTHORIZATION ||
     have_secret environment SEVRA_CLI_SIGNING_KEY
   then
@@ -362,9 +386,18 @@ if [ "$tag" = "v0.2.9" ]; then
       die "could not clear stale ephemeral environment secrets before resume"
     fi
   fi
-  if [ "$resume" -eq 0 ]; then
+  if [ "$original_signer" -eq 1 ] && [ "$resume" -eq 0 ]; then
     have_secret repository SEVRA_CLI_SIGNING_KEY ||
       die "v0.2.9 requires the transitional original repository signer"
+  fi
+  if [ "$bridge_signer" -eq 1 ]; then
+    if have_secret repository SEVRA_CLI_SIGNING_KEY; then
+      die "the original repository signer still exists before the v0.2.10 bridge"
+    fi
+    if [ "$resume" -eq 0 ]; then
+      have_secret environment SEVRA_CLI_SIGNING_KEY_NEXT ||
+        die "v0.2.10 requires compatibility signer A in the protected environment"
+    fi
   fi
 else
   if have_secret repository SEVRA_CLI_SIGNING_KEY; then
@@ -453,7 +486,7 @@ if [ -z "$release_run_id" ] || [ -z "$attempt" ]; then
   die "could not resolve one unique release workflow run for exact tag $tag and SHA $release_sha"
 fi
 
-if [ "$original_signer" -eq 1 ]; then
+if [ "$protected_signer" -eq 1 ]; then
   pending_environment_id=""
   run_failed=0
   run_state="$(
@@ -486,9 +519,14 @@ if [ "$original_signer" -eq 1 ]; then
 
   if [ "$publish_started" -eq 0 ]; then
     [ "$run_failed" -eq 0 ] ||
-      die "release run failed before the transitional signer job started ($run_state)"
-    have_secret repository SEVRA_CLI_SIGNING_KEY ||
-      die "the pending v0.2.9 run still needs the transitional repository signer"
+      die "release run failed before the protected signer job started ($run_state)"
+    if [ "$original_signer" -eq 1 ]; then
+      have_secret repository SEVRA_CLI_SIGNING_KEY ||
+        die "the pending v0.2.9 run still needs the transitional repository signer"
+    else
+      have_secret environment SEVRA_CLI_SIGNING_KEY_NEXT ||
+        die "the pending v0.2.10 run still needs compatibility signer A"
+    fi
     poll=0
     while [ "$poll" -lt 1800 ]; do
       run_state="$(
@@ -595,7 +633,7 @@ if [ "$original_signer" -eq 1 ]; then
     mkdir -p "$checkpoint_dir"
     if gh run download "$release_run_id" --repo "$repo" \
       --name "$checkpoint_name" --dir "$checkpoint_dir" >/dev/null 2>&1 &&
-      verify_transitional_checkpoint "$checkpoint_dir"
+      verify_protected_checkpoint "$checkpoint_dir" "$protected_signer_spki"
     then
       checkpoint_ready=1
       break
@@ -617,20 +655,36 @@ if [ "$original_signer" -eq 1 ]; then
   [ "$checkpoint_ready" -eq 1 ] ||
     die "release run ended before a durable, exact-SHA signed checkpoint was verified"
 
-  if have_secret repository SEVRA_CLI_SIGNING_KEY; then
-    gh secret delete SEVRA_CLI_SIGNING_KEY --repo "$repo" ||
-      die "failed to delete the transitional repository signer"
-  fi
-  if have_secret repository SEVRA_CLI_SIGNING_KEY; then
-    die "GitHub still reports the transitional repository signer after deletion"
+  if [ "$original_signer" -eq 1 ]; then
+    if have_secret repository SEVRA_CLI_SIGNING_KEY; then
+      gh secret delete SEVRA_CLI_SIGNING_KEY --repo "$repo" ||
+        die "failed to delete the transitional repository signer"
+    fi
+    if have_secret repository SEVRA_CLI_SIGNING_KEY; then
+      die "GitHub still reports the transitional repository signer after deletion"
+    fi
+  else
+    if have_secret environment SEVRA_CLI_SIGNING_KEY_NEXT; then
+      gh secret delete SEVRA_CLI_SIGNING_KEY_NEXT \
+        --repo "$repo" --env "$environment" ||
+        die "failed to delete compatibility signer A"
+    fi
+    if have_secret environment SEVRA_CLI_SIGNING_KEY_NEXT; then
+      die "GitHub still reports compatibility signer A after deletion"
+    fi
   fi
   original_signer_deleted=1
-  printf '%s\n' \
-    "release: verified durable signed checkpoint; deleted the transitional repository signer"
+  if [ "$original_signer" -eq 1 ]; then
+    printf '%s\n' \
+      "release: verified durable signed checkpoint; deleted the transitional repository signer"
+  else
+    printf '%s\n' \
+      "release: verified durable signed checkpoint; deleted compatibility signer A"
+  fi
 fi
 
 if ! gh run watch "$release_run_id" --repo "$repo" --exit-status --compact; then
-  if [ "$original_signer" -eq 0 ] || [ "$checkpoint_ready" -eq 0 ]; then
+  if [ "$protected_signer" -eq 0 ] || [ "$checkpoint_ready" -eq 0 ]; then
     die "release workflow failed without a resumable signed checkpoint"
   fi
   printf '%s\n' \
@@ -650,17 +704,17 @@ if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
   fi
 fi
 
-if [ "$original_signer" -eq 1 ] && [ "$already_final" -eq 0 ]; then
+if [ "$protected_signer" -eq 1 ] && [ "$already_final" -eq 0 ]; then
   [ "$checkpoint_ready" -eq 1 ] ||
-    die "cannot assemble v0.2.9 without the verified signed checkpoint"
+    die "cannot assemble a compatibility release without the verified signed checkpoint"
   if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
     existing_draft="$(
       gh api "repos/$repo/releases/tags/$tag" --jq '.draft'
     )"
     [ "$existing_draft" = "true" ] ||
-      die "refusing to replace a non-draft v0.2.9 release"
+      die "refusing to replace a non-draft compatibility release"
     gh release delete "$tag" --repo "$repo" --yes ||
-      die "could not replace the interrupted v0.2.9 draft"
+      die "could not replace the interrupted compatibility draft"
   fi
   gh release create "$tag" \
     --repo "$repo" \
@@ -672,7 +726,7 @@ if [ "$original_signer" -eq 1 ] && [ "$already_final" -eq 0 ]; then
   gh release edit "$tag" --repo "$repo" --draft=false
 fi
 
-if [ "$original_signer" -eq 0 ]; then
+if [ "$protected_signer" -eq 0 ]; then
   cross --version 2>/dev/null | sed -n '1p' |
     grep -Eq '^cross 0\.2\.5 ' ||
     die "cross 0.2.5 is required for Linux reproduction"
@@ -787,7 +841,7 @@ if [ "$original_signer" -eq 0 ]; then
     op read "$signing_key_ref" | node -e '
     const { createPrivateKey, createPublicKey, sign, verify } = require("node:crypto");
     const { readFileSync, writeFileSync } = require("node:fs");
-    const expectedSpki = "MCowBQYDK2VwAyEAasunxAjcJp8W30eF0ndPlLXqwSjZ/u5raivn3QmaKcc=";
+    const expectedSpki = "MCowBQYDK2VwAyEAzOIUB6eaOlwx1PqHCUBDF2+F3FLa5VK1u6QoFOVyXME=";
     const encoded = readFileSync(0, "utf8").trim();
     if (!/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) {
       throw new Error("the 1Password signing-key field is not one base64 value");
@@ -883,18 +937,18 @@ mkdir -p "$verify_dir"
 (
   cd "$verify_dir"
   gh release download "$tag" --repo "$repo"
-  if [ "$original_signer" -eq 1 ]; then
-    final_signer_spki="MCowBQYDK2VwAyEA+v5mafEPcIwKAU/DO/z8MM/cT9ndgE1saSUfvcrzLKA="
+  if [ "$protected_signer" -eq 1 ]; then
+    final_signer_spki="$protected_signer_spki"
   else
-    final_signer_spki="MCowBQYDK2VwAyEAasunxAjcJp8W30eF0ndPlLXqwSjZ/u5raivn3QmaKcc="
+    final_signer_spki="MCowBQYDK2VwAyEAzOIUB6eaOlwx1PqHCUBDF2+F3FLa5VK1u6QoFOVyXME="
   fi
   verify_signed_release_set "$verify_dir" "$final_signer_spki" ||
     die "published release signatures or checksums do not match the expected signer"
 
-  if [ "$original_signer" -eq 1 ]; then
+  if [ "$protected_signer" -eq 1 ]; then
     for asset in $expected_release_assets; do
       cmp "$checkpoint_dir/$asset" "$verify_dir/$asset" >/dev/null ||
-        die "published v0.2.9 asset differs from the durable signed checkpoint: $asset"
+        die "published compatibility asset differs from the durable signed checkpoint: $asset"
     done
   elif [ "$already_final" -eq 0 ]; then
     for asset in $expected_release_assets; do
@@ -909,7 +963,7 @@ mkdir -p "$verify_dir"
   fi
 
   attest_assets="$binary_assets"
-  if [ "$original_signer" -eq 1 ]; then
+  if [ "$protected_signer" -eq 1 ]; then
     attest_assets="$(printf '%s\n' *)"
   fi
   for asset in $attest_assets; do

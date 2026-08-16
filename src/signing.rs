@@ -10,13 +10,14 @@ use ed25519_dalek::{Signature, VerifyingKey};
 
 /// SPKI PEMs of the accepted publisher keys.
 ///
-/// v0.2.9 is the compatibility release for the publisher-key rotation: it is
-/// signed by the original key while pinning both the original and successor
-/// keys. Keep the original first until every supported install path has
-/// traversed this release and a successor-key release has been proven live.
+/// v0.2.9 introduced compatibility signer A. v0.2.10 is the final protected
+/// bridge: signer A signs a build that additionally pins offline signer B.
+/// Keeping all three public keys is harmless and preserves direct upgrades
+/// from every prior signed release while private-key custody moves offline.
 const PUBKEYS_PEM: &[&str] = &[
     "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA+v5mafEPcIwKAU/DO/z8MM/cT9ndgE1saSUfvcrzLKA=\n-----END PUBLIC KEY-----",
     "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAasunxAjcJp8W30eF0ndPlLXqwSjZ/u5raivn3QmaKcc=\n-----END PUBLIC KEY-----",
+    "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAzOIUB6eaOlwx1PqHCUBDF2+F3FLa5VK1u6QoFOVyXME=\n-----END PUBLIC KEY-----",
 ];
 
 /// Extract the raw 32-byte Ed25519 key from an SPKI PEM. Ed25519 SPKI is a
@@ -70,8 +71,8 @@ mod tests {
     }
 
     #[test]
-    fn both_pinned_keys_parse_and_are_distinct() {
-        assert_eq!(PUBKEYS_PEM.len(), 2, "rotation release must trust two keys");
+    fn all_pinned_keys_parse_and_are_distinct() {
+        assert_eq!(PUBKEYS_PEM.len(), 3, "bridge release must trust three keys");
         let keys: Vec<_> = PUBKEYS_PEM
             .iter()
             .map(|pem| {
@@ -79,7 +80,11 @@ mod tests {
                 VerifyingKey::from_bytes(&raw).expect("pinned Ed25519 key is valid")
             })
             .collect();
-        assert_ne!(keys[0].as_bytes(), keys[1].as_bytes());
+        for left in 0..keys.len() {
+            for right in (left + 1)..keys.len() {
+                assert_ne!(keys[left].as_bytes(), keys[right].as_bytes());
+            }
+        }
     }
 
     #[test]
@@ -88,10 +93,16 @@ mod tests {
         // inspect the workflow's tokens, not its platform line endings.
         let workflow = include_str!("../.github/workflows/release.yml").replace("\r\n", "\n");
         assert!(workflow.contains(
-            "SEVRA_ORIGINAL_SIGNER_SPKI: MCowBQYDK2VwAyEA+v5mafEPcIwKAU/DO/z8MM/cT9ndgE1saSUfvcrzLKA="
+            "if: needs.version.outputs.version == '0.2.9' || needs.version.outputs.version == '0.2.10'"
         ));
-        assert!(workflow.contains("if: needs.version.outputs.version == '0.2.9'"));
-        assert!(workflow.contains("if: needs.version.outputs.version != '0.2.9'"));
+        assert!(workflow.contains(
+            "if: needs.version.outputs.version != '0.2.9' && needs.version.outputs.version != '0.2.10'"
+        ));
+        assert!(workflow
+            .contains("SEVRA_CLI_SIGNING_KEY_BRIDGE: ${{ secrets.SEVRA_CLI_SIGNING_KEY_NEXT }}"));
+        assert!(workflow.contains(
+            "SEVRA_EXPECTED_SIGNER_SPKI='MCowBQYDK2VwAyEAasunxAjcJp8W30eF0ndPlLXqwSjZ/u5raivn3QmaKcc='"
+        ));
         assert!(workflow.contains("scripts/install-pinned-llvm.sh"));
         assert!(workflow.contains("$RUNNER_TEMP/llvm-mingw/bin"));
         assert!(workflow.contains("name: successor-unsigned"));
@@ -158,7 +169,7 @@ mod tests {
             "RUSTFLAGS=\"--remap-path-prefix=$source_canonical=/workspace",
             "export RUSTFLAGS SOURCE_DATE_EPOCH",
             "RUSTFLAGS=\"$RUSTFLAGS -C link-arg=/Brepro -C link-arg=/debug:none\"",
-            "const expectedSpki = \"MCowBQYDK2VwAyEAasunxAjcJp8W30eF0ndPlLXqwSjZ/u5raivn3QmaKcc=\"",
+            "const expectedSpki = \"MCowBQYDK2VwAyEAzOIUB6eaOlwx1PqHCUBDF2+F3FLa5VK1u6QoFOVyXME=\"",
             "no byte is written to disk or argv",
             "(.immutable == true)",
             "gh attestation verify \"$asset\"",

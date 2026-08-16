@@ -9,6 +9,19 @@ fixture="$(mktemp -d "${TMPDIR:-/tmp}/sevra-release-controller.XXXXXX")"
 trap 'rm -rf -- "$fixture"' EXIT HUP INT TERM
 mkdir -p "$fixture/bin"
 
+# The first half exercises the immutable historical v0.2.9 controller even
+# after Cargo.toml advances. Run it from a minimal exact-version checkout so a
+# current package bump cannot silently turn these retirement tests into early
+# version-mismatch exits.
+original_root="$fixture/original-repo"
+mkdir -p "$original_root/scripts"
+cp "$repo_root/scripts/release.sh" "$original_root/scripts/release.sh"
+cat >"$original_root/Cargo.toml" <<'EOF'
+[package]
+name = "sevra"
+version = "0.2.9"
+EOF
+
 sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 export SEVRA_TEST_SHA="$sha"
 export SEVRA_TEST_LOG="$fixture/calls.log"
@@ -26,14 +39,14 @@ case "$1 $2" in
   "rev-parse --absolute-git-dir") printf '%s\n' "$SEVRA_TEST_STATE" ;;
   "ls-remote origin")
     if [ "$SEVRA_TEST_MODE" = resume ] || [ "$SEVRA_TEST_MODE" = partial_resume ]; then
-      printf '%s\trefs/tags/v0.2.9\n' "$SEVRA_TEST_SHA"
+      printf '%s\trefs/tags/%s\n' "$SEVRA_TEST_SHA" "${SEVRA_TEST_TAG:-v0.2.9}"
     fi
     ;;
   "show-ref --verify")
     [ "$SEVRA_TEST_MODE" = resume ] || [ "$SEVRA_TEST_MODE" = partial_resume ]
     ;;
   "rev-list -n") printf '%s\n' "$SEVRA_TEST_SHA" ;;
-  "tag v0.2.9") ;;
+  "tag v0.2.9"|"tag v0.2.10") ;;
   "push origin") ;;
   *) printf 'unexpected fake git invocation: %s\n' "$*" >&2; exit 98 ;;
 esac
@@ -106,9 +119,16 @@ case "$command_name" in
     case "$subcommand" in
       list)
         case "$*" in
-          *"--env release-signing"*) ;;
+          *"--env release-signing"*)
+            if [ "${SEVRA_TEST_BRIDGE:-0}" = 1 ] &&
+              [ ! -e "$SEVRA_TEST_STATE/signer_deleted" ]
+            then
+              printf '%s\n' SEVRA_CLI_SIGNING_KEY_NEXT
+            fi
+            ;;
           *)
-            if { [ "$SEVRA_TEST_MODE" = interrupt ] ||
+            if [ "${SEVRA_TEST_BRIDGE:-0}" != 1 ] &&
+              { [ "$SEVRA_TEST_MODE" = interrupt ] ||
               [ "$SEVRA_TEST_MODE" = after_start ] ||
               [ "$SEVRA_TEST_MODE" = checkpoint_success ]; } &&
               [ ! -e "$SEVRA_TEST_STATE/signer_deleted" ]
@@ -125,6 +145,9 @@ case "$command_name" in
         ;;
       delete)
         case "$*" in
+          *"SEVRA_CLI_SIGNING_KEY_NEXT"*"--env release-signing"*)
+            : >"$SEVRA_TEST_STATE/signer_deleted"
+            ;;
           *"--env release-signing"*) ;;
           *"SEVRA_CLI_SIGNING_KEY"*) : >"$SEVRA_TEST_STATE/signer_deleted" ;;
         esac
@@ -196,7 +219,7 @@ case "$command_name" in
           printf '%s\n' 77
         fi
         ;;
-      *"releases/tags/v0.2.9"*)
+      *"releases/tags/v0.2."*)
         case "$*" in
           *".assets"*)
             printf '%s\n' \
@@ -238,7 +261,7 @@ case "$command_name" in
           *) printf '%s\n' true ;;
         esac
         ;;
-      *"git/ref/tags/v0.2.9"*) printf '%s\n' "$SEVRA_TEST_SHA" ;;
+      *"git/ref/tags/v0.2."*) printf '%s\n' "$SEVRA_TEST_SHA" ;;
       *) exit 98 ;;
     esac
     ;;
@@ -263,7 +286,8 @@ run_controller() {
   mkdir -p "$fixture/state"
   SEVRA_TEST_MODE="$mode" PATH="$fixture/bin:$PATH" \
     SEVRA_TEST_STATE="$fixture/state" \
-    sh "$repo_root/scripts/release.sh" "$@"
+    sh -c 'cd "$1" && shift && sh scripts/release.sh "$@"' \
+      sh "$original_root" "$@"
 }
 
 # Fresh v0.2.9 reaches the protected environment, then the secret-injection
@@ -337,6 +361,50 @@ fi
 grep -Fq "verified durable signed checkpoint; deleted the transitional repository signer" \
   "$fixture/checkpoint.out"
 
+# The v0.2.10 bridge uses signer A from the protected environment, verifies a
+# distinct exact-version checkpoint, and only then deletes that environment
+# signer. This is the final Actions-held private-key transition.
+bridge_root="$fixture/bridge-repo"
+mkdir -p "$bridge_root/scripts"
+cp "$repo_root/scripts/release.sh" "$bridge_root/scripts/release.sh"
+cat >"$bridge_root/Cargo.toml" <<'EOF'
+[package]
+name = "sevra"
+version = "0.2.10"
+EOF
+: >"$SEVRA_TEST_LOG"
+rm -rf "$fixture/state"
+mkdir -p "$fixture/state"
+if ! SEVRA_TEST_MODE=checkpoint_success \
+  SEVRA_TEST_BRIDGE=1 \
+  SEVRA_TEST_TAG=v0.2.10 \
+  PATH="$fixture/bin:$PATH" \
+  SEVRA_TEST_STATE="$fixture/state" \
+  sh -c 'cd "$1" && sh scripts/release.sh v0.2.10' sh "$bridge_root" \
+  >"$fixture/bridge.out" 2>&1
+then
+  cat "$fixture/bridge.out" >&2
+  cat "$SEVRA_TEST_LOG" >&2
+  exit 1
+fi
+bridge_checkpoint_line="$(
+  grep -nF "gh run download 222 --repo sevrahq/sevra --name compatibility-signed-v0.2.10" \
+    "$SEVRA_TEST_LOG" | sed -n '1s/:.*//p'
+)"
+bridge_delete_line="$(
+  grep -nF "gh secret delete SEVRA_CLI_SIGNING_KEY_NEXT --repo sevrahq/sevra --env release-signing" \
+    "$SEVRA_TEST_LOG" | sed -n '1s/:.*//p'
+)"
+if [ -z "$bridge_checkpoint_line" ] || [ -z "$bridge_delete_line" ] ||
+  [ "$bridge_checkpoint_line" -ge "$bridge_delete_line" ]
+then
+  printf '%s\n' "bridge signer deletion did not follow checkpoint verification" >&2
+  cat "$SEVRA_TEST_LOG" >&2
+  exit 1
+fi
+grep -Fq "verified durable signed checkpoint; deleted compatibility signer A" \
+  "$fixture/bridge.out"
+
 # Exact-SHA resume needs no signer. Model a failed workflow with an existing
 # partial draft and a durable checkpoint: the controller discards the partial
 # draft, recreates it from the checkpoint, and publishes the exact set.
@@ -397,7 +465,7 @@ cp "$repo_root/scripts/install-pinned-llvm.sh" \
 cat >"$successor_root/Cargo.toml" <<'EOF'
 [package]
 name = "sevra"
-version = "0.2.10"
+version = "0.2.11"
 build-marker = "trusted"
 EOF
 cp "$successor_root/Cargo.toml" "$successor_source/Cargo.toml"
@@ -413,7 +481,7 @@ case "$1 $2" in
   "fetch --quiet") ;;
   "rev-parse HEAD"|"rev-parse origin/main") printf '%s\n' "$SEVRA_TEST_SHA" ;;
   "rev-parse --absolute-git-dir") printf '%s\n' "$SEVRA_TEST_STATE" ;;
-  "ls-remote origin") printf '%s\trefs/tags/v0.2.10\n' "$SEVRA_TEST_SHA" ;;
+  "ls-remote origin") printf '%s\trefs/tags/v0.2.11\n' "$SEVRA_TEST_SHA" ;;
   "show-ref --verify") exit 0 ;;
   "rev-list -n") printf '%s\n' "$SEVRA_TEST_SHA" ;;
   "show -s") printf '%s\n' 1700000000 ;;
@@ -516,7 +584,7 @@ case "$command_name" in
         cat >"$SEVRA_SUCCESSOR_ROOT/Cargo.toml" <<'MUTATED'
 [package]
 name = "sevra"
-version = "0.2.10"
+version = "0.2.11"
 build-marker = "mutated"
 MUTATED
         ;;
@@ -538,7 +606,7 @@ MUTATED
   api)
     case "$*" in
       *"immutable-releases"*) printf '%s\n' true ;;
-      *"releases/tags/v0.2.10"*".assets"*)
+      *"releases/tags/v0.2.11"*".assets"*)
         printf '%s\n' \
           SHA256SUMS \
           sevra-darwin-aarch64 \
@@ -552,8 +620,8 @@ MUTATED
           sevra-windows-x86_64.exe \
           sevra-windows-x86_64.exe.sig
         ;;
-      *"releases/tags/v0.2.10"*) printf '%s\n' true ;;
-      *"git/ref/tags/v0.2.10"*) printf '%s\n' "$SEVRA_TEST_SHA" ;;
+      *"releases/tags/v0.2.11"*) printf '%s\n' true ;;
+      *"git/ref/tags/v0.2.11"*) printf '%s\n' "$SEVRA_TEST_SHA" ;;
       *) exit 98 ;;
     esac
     ;;
@@ -720,7 +788,7 @@ if ! (
   SEVRA_TEST_STATE="$fixture/state" \
   SEVRA_REAL_TAR="$real_tar" \
     PATH="$successor_bin:$PATH" \
-    sh scripts/release.sh --resume v0.2.10
+    sh scripts/release.sh --resume v0.2.11
 ) >"$fixture/successor.out" 2>&1
 then
   cat "$fixture/successor.out" >&2

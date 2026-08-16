@@ -896,7 +896,7 @@ dependencies = [
 
 [[package]]
 name = "sevra"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "assert_cmd",
  "base64",

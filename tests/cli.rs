@@ -3304,6 +3304,93 @@ fn export_always_writes_a_private_vault_name_manifest_without_values() {
 }
 
 #[test]
+fn export_recovers_from_the_hardened_hub_by_pinning_the_verified_feed_head() {
+    let export_body = serde_json::json!({
+        "brain": "brain-1",
+        "slug": "b",
+        "headSeq": 1,
+        "feedHash": FEED_ONE,
+        "vaultItems": [],
+        "files": [{"path": "DB.md", "content": "---\ntype: db-md\nscope: test\n---\n"}],
+    })
+    .to_string();
+    let (base, log, handle) = mock_hub(vec![
+        (
+            400,
+            r#"{"error":"format=pack requires canonical atSeq and feedHash parameters from the verified feed.","code":"snapshot_address_required"}"#.to_string(),
+        ),
+        (
+            200,
+            format!(r#"{{"id":"brain-1","slug":"b","headSeq":1,"feedHash":"{FEED_ONE}"}}"#),
+        ),
+        (200, export_body),
+    ]);
+    let work = tempfile::tempdir().unwrap();
+    let out = sevra()
+        .args(["export", "b", "out", "--json"])
+        .current_dir(work.path())
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", MOCK_KEY)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "export failed: {}", all_output(&out));
+    assert!(work.path().join("out/DB.md").is_file());
+
+    handle.join().unwrap();
+    let requests = log.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[0].path,
+        "/api/hub/brains/b/export?format=pack&includeVaultNames=1"
+    );
+    assert_eq!(requests[1].path, "/api/hub/brains/b");
+    assert_eq!(
+        requests[2].path,
+        format!(
+            "/api/hub/brains/b/export?format=pack&atSeq=1&feedHash={FEED_ONE}&includeVaultNames=1"
+        )
+    );
+}
+
+#[test]
+fn clone_recovers_from_the_hardened_hub_by_pinning_the_verified_feed_head() {
+    let (base, log, handle) = mock_hub(vec![
+        (
+            400,
+            r#"{"error":"format=pack requires canonical atSeq and feedHash parameters from the verified feed.","code":"snapshot_address_required"}"#.to_string(),
+        ),
+        (
+            200,
+            format!(r#"{{"id":"brain-1","slug":"b","headSeq":1,"feedHash":"{FEED_ONE}"}}"#),
+        ),
+        (200, clone_snapshot(1, FEED_ONE, "alpha")),
+    ]);
+    let work = tempfile::tempdir().unwrap();
+    let out = sevra()
+        .args(["clone", "b", "brain"])
+        .current_dir(work.path())
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", MOCK_KEY)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "clone failed: {}", all_output(&out));
+    assert_eq!(
+        std::fs::read(work.path().join("brain/a.md")).unwrap(),
+        b"alpha"
+    );
+
+    handle.join().unwrap();
+    let requests = log.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].path, "/api/hub/brains/b/export?format=pack");
+    assert_eq!(requests[1].path, "/api/hub/brains/b");
+    assert_eq!(
+        requests[2].path,
+        format!("/api/hub/brains/b/export?format=pack&atSeq=1&feedHash={FEED_ONE}")
+    );
+}
+
+#[test]
 fn export_with_secrets_reads_each_value_and_warns_without_echoing_it() {
     let export_body = r#"{
         "brain":"brain-id",

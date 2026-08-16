@@ -25,9 +25,8 @@ $Base = if ($env:SEVRA_INSTALL_BASE) { $env:SEVRA_INSTALL_BASE } else { "https:/
 $Api = 'https://www.sevrahq.com/api/hub/versions'
 $ManifestBase = if ($env:SEVRA_TRUSTED_MANIFEST_BASE) { $env:SEVRA_TRUSTED_MANIFEST_BASE } else { 'https://www.sevrahq.com/api/hub/releases/sevra' }
 
-# The pinned publisher keys (Ed25519 SPKI). v0.2.9 is signed by the original
-# key while trusting both it and its successor, so clients can cross the
-# rotation without a flag day.
+# The pinned publisher keys (Ed25519 SPKI). v0.2.9 introduced compatibility
+# signer A; v0.2.10 is signed by A while introducing offline signer B.
 $PubkeyOldPem = @'
 -----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEA+v5mafEPcIwKAU/DO/z8MM/cT9ndgE1saSUfvcrzLKA=
@@ -38,7 +37,12 @@ $PubkeyNextPem = @'
 MCowBQYDK2VwAyEAasunxAjcJp8W30eF0ndPlLXqwSjZ/u5raivn3QmaKcc=
 -----END PUBLIC KEY-----
 '@
-$PubkeyPems = @($PubkeyOldPem, $PubkeyNextPem)
+$PubkeyOfflinePem = @'
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAzOIUB6eaOlwx1PqHCUBDF2+F3FLa5VK1u6QoFOVyXME=
+-----END PUBLIC KEY-----
+'@
+$PubkeyPems = @($PubkeyOldPem, $PubkeyNextPem, $PubkeyOfflinePem)
 
 function Fail([string]$Msg) { Write-Error "sevra install: $Msg" -ErrorAction Stop }
 function Info([string]$Msg) { Write-Host $Msg }
@@ -272,12 +276,13 @@ function Invoke-Main {
       $verifierAvailable = $true
       $env:SEVRA_PUBKEY_OLD = $PubkeyPems[0]
       $env:SEVRA_PUBKEY_NEXT = $PubkeyPems[1]
+      $env:SEVRA_PUBKEY_OFFLINE = $PubkeyPems[2]
       $nodeScript = @'
 const { createPublicKey, verify } = require("node:crypto");
 const { readFileSync } = require("node:fs");
 const message = readFileSync(process.argv[1]);
 const signature = Buffer.from(readFileSync(process.argv[2], "utf8").trim(), "base64");
-const keys = [process.env.SEVRA_PUBKEY_OLD, process.env.SEVRA_PUBKEY_NEXT];
+const keys = [process.env.SEVRA_PUBKEY_OLD, process.env.SEVRA_PUBKEY_NEXT, process.env.SEVRA_PUBKEY_OFFLINE];
 const ok = keys.some((pem) =>
   verify(null, message, createPublicKey(pem), signature));
 process.exit(ok ? 0 : 1);
@@ -286,6 +291,7 @@ process.exit(ok ? 0 : 1);
       if ($LASTEXITCODE -eq 0) { $verifiedSig = $true }
       Remove-Item Env:SEVRA_PUBKEY_OLD -ErrorAction SilentlyContinue
       Remove-Item Env:SEVRA_PUBKEY_NEXT -ErrorAction SilentlyContinue
+      Remove-Item Env:SEVRA_PUBKEY_OFFLINE -ErrorAction SilentlyContinue
     }
     if (-not $verifiedSig -and (Have 'openssl')) {
       $pubPem = Join-Path $tmp 'pub.pem'

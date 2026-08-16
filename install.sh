@@ -24,14 +24,16 @@ BASE="${SEVRA_INSTALL_BASE:-https://github.com/$REPO/releases/download}"
 API="https://www.sevrahq.com/api/hub/versions"
 TRUSTED_MANIFEST_BASE="${SEVRA_TRUSTED_MANIFEST_BASE:-https://www.sevrahq.com/api/hub/releases/sevra}"
 
-# The pinned publisher keys (Ed25519 SPKI). v0.2.9 is signed by the original
-# key while trusting both it and its successor, so clients can cross the
-# rotation without a flag day.
+# The pinned publisher keys (Ed25519 SPKI). v0.2.9 introduced compatibility
+# signer A; v0.2.10 is signed by A while introducing offline signer B.
 PUBKEY_OLD_PEM='-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEA+v5mafEPcIwKAU/DO/z8MM/cT9ndgE1saSUfvcrzLKA=
 -----END PUBLIC KEY-----'
 PUBKEY_NEXT_PEM='-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEAasunxAjcJp8W30eF0ndPlLXqwSjZ/u5raivn3QmaKcc=
+-----END PUBLIC KEY-----'
+PUBKEY_OFFLINE_PEM='-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAzOIUB6eaOlwx1PqHCUBDF2+F3FLa5VK1u6QoFOVyXME=
 -----END PUBLIC KEY-----'
 
 err() { printf 'sevra install: %s\n' "$*" >&2; exit 1; }
@@ -130,19 +132,19 @@ verified_sig=0
 verifier_available=0
 if have node; then
   verifier_available=1
-  if SEVRA_PUBKEY_OLD="$PUBKEY_OLD_PEM" SEVRA_PUBKEY_NEXT="$PUBKEY_NEXT_PEM" node -e '
+  if SEVRA_PUBKEY_OLD="$PUBKEY_OLD_PEM" SEVRA_PUBKEY_NEXT="$PUBKEY_NEXT_PEM" SEVRA_PUBKEY_OFFLINE="$PUBKEY_OFFLINE_PEM" node -e '
     const { createPublicKey, verify } = require("node:crypto");
     const { readFileSync } = require("node:fs");
     const message = readFileSync(process.argv[1]);
     const signature = Buffer.from(readFileSync(process.argv[2], "utf8").trim(), "base64");
-    const keys = [process.env.SEVRA_PUBKEY_OLD, process.env.SEVRA_PUBKEY_NEXT];
+    const keys = [process.env.SEVRA_PUBKEY_OLD, process.env.SEVRA_PUBKEY_NEXT, process.env.SEVRA_PUBKEY_OFFLINE];
     const ok = keys.some((pem) =>
       verify(null, message, createPublicKey(pem), signature));
     process.exit(ok ? 0 : 1);
   ' "$tmp/sevra" "$tmp/sevra.sig" >/dev/null 2>&1; then verified_sig=1; fi
 fi
 if [ "$verified_sig" -eq 0 ] && have openssl; then
-  for pubkey_pem in "$PUBKEY_OLD_PEM" "$PUBKEY_NEXT_PEM"; do
+  for pubkey_pem in "$PUBKEY_OLD_PEM" "$PUBKEY_NEXT_PEM" "$PUBKEY_OFFLINE_PEM"; do
     printf '%s' "$pubkey_pem" > "$tmp/pub.pem"
     # Capability probe, NOT mere presence: only OpenSSL 3+ can do Ed25519, and
     # stock macOS ships LibreSSL (which cannot even load this key). Gating on
