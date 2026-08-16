@@ -28,15 +28,32 @@ jobs:
           set -euo pipefail
           version="${SEVRA_VERSION#v}"
           echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
-          endpoint="https://www.sevrahq.com/api/hub/releases/sevra/latest?smoke=${GITHUB_RUN_ID}"
-          read_latest() {
+          releases_endpoint="https://www.sevrahq.com/api/hub/releases/sevra/latest?smoke=${GITHUB_RUN_ID}"
+          versions_endpoint="https://www.sevrahq.com/api/hub/versions?smoke=${GITHUB_RUN_ID}"
+          read_release_latest() {
             curl -fsSL \
               -H 'Cache-Control: no-cache, no-store' \
               -A "$1" \
-              "$endpoint" | tr -d '\r\n'
+              "$releases_endpoint" | tr -d '\r\n'
           }
-          legacy_latest="$(read_latest 'sevra/0.2.7')"
-          bridge_client_latest="$(read_latest 'sevra/0.2.9')"
+          read_versions_latest() {
+            curl -fsSL \
+              -H 'Cache-Control: no-cache, no-store' \
+              -A "$1" \
+              "$versions_endpoint" |
+              node -e '
+                let body = "";
+                process.stdin.setEncoding("utf8");
+                process.stdin.on("data", (chunk) => body += chunk);
+                process.stdin.on("end", () => {
+                  const latest = JSON.parse(body)?.sevra?.latest;
+                  if (typeof latest !== "string") {
+                    throw new Error("versions response has no sevra.latest");
+                  }
+                  process.stdout.write(latest);
+                });
+              '
+          }
           legacy_expected="$(
             node -e '
               const current = process.argv[1].split("-", 1)[0].split(".").map(Number);
@@ -49,14 +66,27 @@ jobs:
               process.stdout.write(newer ? "0.2.9" : process.argv[1]);
             ' "$version"
           )"
-          [ "$legacy_latest" = "$legacy_expected" ] || {
-            echo "legacy sevra/0.2.7 was offered $legacy_latest, expected $legacy_expected" >&2
-            exit 1
+          assert_route() {
+            user_agent="$1"
+            expected="$2"
+            release_latest="$(read_release_latest "$user_agent")"
+            versions_latest="$(read_versions_latest "$user_agent")"
+            [ "$release_latest" = "$expected" ] || {
+              echo "$user_agent release endpoint offered $release_latest, expected $expected" >&2
+              exit 1
+            }
+            [ "$versions_latest" = "$expected" ] || {
+              echo "$user_agent updater endpoint offered $versions_latest, expected $expected" >&2
+              exit 1
+            }
+            [ "$release_latest" = "$versions_latest" ] || {
+              echo "$user_agent endpoints disagree: $release_latest vs $versions_latest" >&2
+              exit 1
+            }
           }
-          [ "$bridge_client_latest" = "$version" ] || {
-            echo "sevra/0.2.9 was offered $bridge_client_latest, expected $version" >&2
-            exit 1
-          }
+          assert_route 'sevra/0.2.7' "$legacy_expected"
+          assert_route 'sevra/0.2.9' "$version"
+          assert_route "sevra/$version" "$version"
 
   install:
     name: install (${{ matrix.os }})

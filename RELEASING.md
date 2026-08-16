@@ -2,7 +2,9 @@
 
 The deploy model: release-versioned static binaries; installed CLIs
 signed-self-update from GitHub Releases, discovering the latest version via
-the hub's `/api/hub/versions`.
+the hub's user-agent-aware `/api/hub/versions` endpoint. Installers use the
+parallel `/api/hub/releases/sevra/latest` endpoint; post-manifest smoke requires
+both routes to agree for every compatibility generation.
 
 ## Cut a release
 
@@ -36,16 +38,15 @@ the hub's `/api/hub/versions`.
    variance. The Windows link also uses `/Brepro` and omits the otherwise
    random CodeView/PDB identifier.
 
-   Only after those five byte comparisons pass does the wrapper read the
-   successor key from 1Password Recovery over memory, pass it to one local
-   Node process over stdin, check its pinned SPKI, sign, create checksums,
-   upload the complete draft, and publish it immutable. The successor private
-   key is never a GitHub secret or exposed to a hosted runner. The wrapper then
+   For releases after v0.2.10, only after those five byte comparisons pass does
+   the wrapper read offline signer B from 1Password Recovery over memory, pass
+   it to one local Node process over stdin, check its pinned SPKI, sign, create
+   checksums, upload the complete draft, and publish it immutable. Signer B is
+   never a GitHub secret or exposed to a hosted runner. The wrapper then
    verifies the exact 11-asset set, checksums, every Ed25519 signature,
    immutability, tag target, and binary provenance, then byte-compares the
-   published set to the locally signed set. It refuses while the transitional
-   repository signer or legacy `SEVRA_CLI_SIGNING_KEY_NEXT` environment secret
-   still exists.
+   published set to the locally signed set. It refuses while either retired
+   compatibility signer remains in GitHub.
 
    GitHub-hosted runner labels identify maintained images, not immutable image
    digests. They therefore remain an availability/input source, not the
@@ -54,14 +55,14 @@ the hub's `/api/hub/versions`.
    toolchain nondeterminism is also fail-closed and must be investigated; the
    release controller never substitutes a merely similar local binary.
 
-   v0.2.9 is the one compatibility exception: run
-   `scripts/release.sh v0.2.9`. It consumes the already-present original
-   repository signer. The protected job signs and persists an immutable
-   11-file Actions checkpoint with the maximum 90-day recovery retention,
-   then attests every byte to the exact tag and
-   SHA. The controller verifies that checkpoint's shape, checksums, Ed25519
-   signatures, and provenance before deleting the signer. It still injects
-   and checks the one-run authorization.
+   v0.2.9 and v0.2.10 were the two completed compatibility exceptions. v0.2.9
+   consumed the original repository signer and introduced compatibility signer
+   A. v0.2.10 consumed A from the protected environment and introduced offline
+   signer B. In both cases the protected job persisted an immutable 11-file
+   Actions checkpoint with the maximum 90-day recovery retention and attested
+   every byte to the exact tag and SHA. The controller verified the
+   checkpoint's shape, checksums, Ed25519 signatures, and provenance before
+   deleting the signer. Both compatibility signers are now absent from GitHub.
 
    If the controller stops after the tag is pushed, rerun the same command
    with `--resume`. Resume proceeds only when the remote tag still names the
@@ -88,9 +89,10 @@ the hub's `/api/hub/versions`.
    Deploy the reviewed manifest and installer snapshots. Ordinary installs do
    not trust the checksum served beside the GitHub binary.
 7. After that deployment is live, manually dispatch `smoke.yml` with the
-   concrete version. It first proves production still routes `sevra/0.2.7`
-   and older through the old-signed v0.2.9 bridge while v0.2.9 and newer see
-   the true latest. It then installs from the release on macOS + Linux
+   concrete version. It first proves both production release endpoints route
+   `sevra/0.2.7` and older through the old-signed v0.2.9 bridge while v0.2.9
+   and newer see the true latest, and that the two endpoints agree. It then
+   installs from the release on macOS + Linux
    (install.sh) and Windows (install.ps1), proving both production installer
    scripts are byte-identical to this repository before it runs
    `sevra version` + the not-logged-in contract under
@@ -102,14 +104,16 @@ the hub's `/api/hub/versions`.
 
 ## Key custody
 
-The successor Ed25519 private key lives only in the separately controlled
-1Password Recovery vault and local release-process memory. It is not a
+Offline signer B lives only in the separately controlled 1Password Recovery
+vault and local release-process memory. It is not a
 repository, Actions environment, platform-runtime, filesystem, argv, or
-shell-profile secret. The referenced 1Password field contains the **base64 of
-the PKCS#8 PEM**. A raw PEM, base64-of-DER, or key with the wrong SPKI fails
+shell-profile secret. The signing helper accepts a direct PKCS#8 PEM or its
+canonical base64 form, canonical base64 PKCS#8 DER, or a canonical base64 raw
+32-byte Ed25519 seed. Any malformed, non-canonical, or wrong-SPKI key fails
 before any signature is written.
 
-The environment authorization exists only for the one-time v0.2.9 transition.
+The environment authorization existed only for the v0.2.9 and v0.2.10
+compatibility transitions.
 Its exact shape is `tag:sha:run_id.run_attempt:nonce`, where the SHA is 40
 lowercase hex and the nonce is 64 lowercase hex. A different tag, commit, run,
 or rerun cannot consume it. If that compatibility wrapper is interrupted
@@ -121,12 +125,12 @@ waiting/running, then run the cleanup command before `--resume`:
 scripts/release.sh --cleanup-ephemeral-secrets
 ```
 
-Rotation is additive and order-sensitive:
+The completed rotation was additive and order-sensitive:
 
 1. Pin the new public key alongside the old one in `src/signing.rs`,
    `install.sh`, `install.ps1`, and `sevra.pub`.
-2. Confirm the successor private key is recoverable from 1Password Recovery.
-   Release v0.2.9 with `scripts/release.sh v0.2.9` while the original
+2. Confirm signer A is recoverable before exposing its public key. Release
+   v0.2.9 with `scripts/release.sh v0.2.9` while the original
    repository secret still exists. The wrapper deletes that original secret
    only after the durable signed checkpoint and all exact-tag/SHA attestations
    verify locally.
@@ -134,24 +138,15 @@ Rotation is additive and order-sensitive:
    protected smoke workflow, then prove an installed v0.2.7 CLI can
    self-update to v0.2.9. These are the authoritative checks that the original
    key still crosses every installer/updater path.
-4. Delete the legacy `SEVRA_CLI_SIGNING_KEY_NEXT` environment secret:
-
-   ```sh
-   gh secret delete SEVRA_CLI_SIGNING_KEY_NEXT \
-     --repo sevrahq/sevra --env release-signing
-   ```
-
-   Release v0.2.10 through the wrapper's local `op://` path, still pinning both
-   public keys. The controller requires the successor SPKI for every release
-   after v0.2.9; no GitHub runner receives the key. Deploy its reviewed digest
-   manifest and byte-identical installers, then run the protected smoke. Prove
-   both a fresh install and a v0.2.9 self-update to v0.2.10.
-5. Only after v0.2.10 proves the successor signing path, remove the original
-   public-key pin from the updater, both installers, and `sevra.pub`; release
-   that successor-only trust set as v0.2.11 through the same local controller.
-   Deploy and smoke it in the same order. Keep v0.2.9's manifest entries and
-   the production User-Agent bridge: clients at v0.2.7 or older must still be
-   offered old-signed v0.2.9 first, then they can safely advance to the true
-   successor-signed latest on their next run.
+4. Release v0.2.10 through the protected compatibility path with signer A,
+   while pinning offline signer B alongside both earlier public keys. After the
+   immutable checkpoint, tag/SHA provenance, release, fresh install, and
+   historical update chain verify, delete A from GitHub.
+5. Every release after v0.2.10 uses signer B through the local `op://` path.
+   Keep all three public pins: retired private keys are gone, and their public
+   pins preserve explicit installs and historical update verification. Keep
+   v0.2.9's manifest entry and the production User-Agent bridge: clients at
+   v0.2.7 or older must be offered old-signed v0.2.9 first, then they can
+   advance to v0.2.10 and later releases.
 
 Full notes: the platform repo's `infra/README.md`.

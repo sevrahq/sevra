@@ -139,7 +139,8 @@ mod tests {
         assert!(workflow.contains("git rev-parse 'HEAD:install.ps1'"));
         assert!(workflow.contains("git hash-object --no-filters $prodInstaller"));
         assert!(workflow.contains("api/hub/releases/sevra/latest?smoke="));
-        assert!(!workflow.contains("api/hub/versions?smoke="));
+        assert!(workflow.contains("api/hub/versions?smoke="));
+        assert!(workflow.contains("endpoints disagree"));
         assert!(!workflow
             .contains("(Get-FileHash install.ps1).Hash -ne (Get-FileHash $prodInstaller).Hash"));
     }

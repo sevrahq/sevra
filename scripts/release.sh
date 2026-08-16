@@ -53,10 +53,11 @@ v0.2.10 consumes the protected-environment SEVRA_CLI_SIGNING_KEY_NEXT bridge.
 Each signer is deleted only after the exact signed set is durable in an
 immutable Actions artifact and every byte's tag/SHA provenance, checksum, and
 Ed25519 signature verify locally. Later releases require a 1Password secret
-reference whose value is the base64 of offline signer B's PKCS#8 PEM. The value
-is read only after unsigned artifact provenance and all five independent
-reproductions succeed, passed directly to one local Node process over stdin,
-and never sent to GitHub or written to disk.
+reference containing offline signer B as a PKCS#8 PEM or canonical base64 PEM,
+PKCS#8 DER, or raw 32-byte Ed25519 seed. The value is read only after unsigned
+artifact provenance and all five independent reproductions succeed, passed
+directly to one local Node process over stdin, and never sent to GitHub or
+written to disk.
 EOF
 }
 
