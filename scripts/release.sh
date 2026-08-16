@@ -838,32 +838,10 @@ if [ "$protected_signer" -eq 0 ]; then
 
     # The key flows directly from 1Password into one local process. The shell
     # never captures or exports it, and no byte is written to disk or argv.
-    op read "$signing_key_ref" | node -e '
-    const { createPrivateKey, createPublicKey, sign, verify } = require("node:crypto");
-    const { readFileSync, writeFileSync } = require("node:fs");
-    const expectedSpki = "MCowBQYDK2VwAyEAzOIUB6eaOlwx1PqHCUBDF2+F3FLa5VK1u6QoFOVyXME=";
-    const encoded = readFileSync(0, "utf8").trim();
-    if (!/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) {
-      throw new Error("the 1Password signing-key field is not one base64 value");
-    }
-    const decoded = Buffer.from(encoded, "base64");
-    if (decoded.toString("base64") !== encoded) {
-      throw new Error("the 1Password signing-key field is not canonical base64");
-    }
-    const key = createPrivateKey(decoded);
-    const publicKey = createPublicKey(key);
-    const actualSpki = publicKey.export({ type: "spki", format: "der" }).toString("base64");
-    if (actualSpki !== expectedSpki) throw new Error("wrong successor release signer");
-    for (const asset of process.argv.slice(1)) {
-      const bytes = readFileSync(asset);
-      const signature = sign(null, bytes, key);
-      if (!verify(null, bytes, publicKey, signature)) throw new Error("signature self-check failed");
-      writeFileSync(asset + ".sig", signature.toString("base64") + "\n", {
-        mode: 0o600,
-        flag: "wx",
-      });
-    }
-    ' "$release_dir"/sevra-darwin-aarch64 \
+    op read "$signing_key_ref" |
+      node "$source_dir/scripts/release-sign.mjs" \
+        "MCowBQYDK2VwAyEAzOIUB6eaOlwx1PqHCUBDF2+F3FLa5VK1u6QoFOVyXME=" \
+      "$release_dir"/sevra-darwin-aarch64 \
       "$release_dir"/sevra-darwin-x86_64 \
       "$release_dir"/sevra-linux-aarch64-musl \
       "$release_dir"/sevra-linux-x86_64-musl \

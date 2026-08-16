@@ -103,6 +103,10 @@ mod tests {
         assert!(workflow.contains(
             "SEVRA_EXPECTED_SIGNER_SPKI='MCowBQYDK2VwAyEAasunxAjcJp8W30eF0ndPlLXqwSjZ/u5raivn3QmaKcc='"
         ));
+        assert!(workflow.contains("node tests/release-sign.mjs"));
+        assert!(workflow.contains("actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd"));
+        assert!(workflow.contains("node ../scripts/release-sign.mjs"));
+        assert!(workflow.contains("unset SEVRA_CLI_SIGNING_KEY SEVRA_EXPECTED_SIGNER_SPKI"));
         assert!(workflow.contains("scripts/install-pinned-llvm.sh"));
         assert!(workflow.contains("$RUNNER_TEMP/llvm-mingw/bin"));
         assert!(workflow.contains("name: successor-unsigned"));
@@ -152,6 +156,7 @@ mod tests {
             "openssl rand -hex 32",
             "$tag:$release_sha:$release_run_id.$attempt:$auth_nonce",
             "op read \"$signing_key_ref\"",
+            "scripts/release-sign.mjs",
             "cleanup_ephemeral_secrets",
             "gh secret delete SEVRA_CLI_SIGNING_KEY --repo \"$repo\"",
             "--name successor-unsigned",
@@ -169,7 +174,7 @@ mod tests {
             "RUSTFLAGS=\"--remap-path-prefix=$source_canonical=/workspace",
             "export RUSTFLAGS SOURCE_DATE_EPOCH",
             "RUSTFLAGS=\"$RUSTFLAGS -C link-arg=/Brepro -C link-arg=/debug:none\"",
-            "const expectedSpki = \"MCowBQYDK2VwAyEAzOIUB6eaOlwx1PqHCUBDF2+F3FLa5VK1u6QoFOVyXME=\"",
+            "\"MCowBQYDK2VwAyEAzOIUB6eaOlwx1PqHCUBDF2+F3FLa5VK1u6QoFOVyXME=\"",
             "no byte is written to disk or argv",
             "(.immutable == true)",
             "gh attestation verify \"$asset\"",

@@ -85,6 +85,7 @@ jobs:
       - run: cargo build --locked
       - run: cargo test --locked
       - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: node tests/release-sign.mjs
       - uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902
         with:
           command: check advisories licenses bans sources
@@ -214,6 +215,9 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      # The signer is reviewed code from the exact tagged commit. Check it out
+      # before downloading the untrusted build artifacts it will validate.
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           path: staged
@@ -245,7 +249,6 @@ jobs:
           [ -n "$SEVRA_CLI_SIGNING_KEY" ] || { echo "::error::SEVRA_CLI_SIGNING_KEY secret is empty"; exit 1; }
           [ -n "$SEVRA_RELEASE_AUTHORIZATION" ] || { echo "::error::SEVRA_RELEASE_AUTHORIZATION secret is empty"; exit 1; }
           node -e '
-            const { createPrivateKey, createPublicKey } = require("node:crypto");
             const expectedRequest = process.env.GITHUB_RUN_ID + "." + process.env.GITHUB_RUN_ATTEMPT;
             const fields = process.env.SEVRA_RELEASE_AUTHORIZATION.split(":");
             if (
@@ -257,11 +260,6 @@ jobs:
               !/^[0-9a-f]{64}$/.test(fields[3])
             ) {
               throw new Error("release authorization is not bound to this exact tag, commit, and workflow attempt");
-            }
-            const key = createPrivateKey(Buffer.from(process.env.SEVRA_CLI_SIGNING_KEY, "base64"));
-            const actual = createPublicKey(key).export({ type: "spki", format: "der" }).toString("base64");
-            if (actual !== process.env.SEVRA_EXPECTED_SIGNER_SPKI) {
-              throw new Error("compatibility release is configured with the wrong release signer");
             }
           '
           mkdir -p dist
@@ -293,21 +291,14 @@ jobs:
           # Detached Ed25519 signature per binary (base64 of 64 raw bytes),
           # verified by the installer and `sevra update` against the pinned
           # publisher key.
-          for asset in \
+          printf '%s' "$SEVRA_CLI_SIGNING_KEY" | node ../scripts/release-sign.mjs \
+            "$SEVRA_EXPECTED_SIGNER_SPKI" \
             sevra-darwin-x86_64 \
             sevra-darwin-aarch64 \
             sevra-linux-x86_64-musl \
             sevra-linux-aarch64-musl \
             sevra-windows-x86_64.exe
-          do
-            node -e '
-              const { createPrivateKey, sign } = require("node:crypto");
-              const { readFileSync, writeFileSync } = require("node:fs");
-              const key = createPrivateKey(Buffer.from(process.env.SEVRA_CLI_SIGNING_KEY, "base64"));
-              const sig = sign(null, readFileSync(process.argv[1]), key);
-              writeFileSync(process.argv[1] + ".sig", sig.toString("base64") + "\n");
-            ' "$asset"
-          done
+          unset SEVRA_CLI_SIGNING_KEY SEVRA_EXPECTED_SIGNER_SPKI
           sha256sum sevra-* | grep -v '\.sig$' > SHA256SUMS
           ls -l
       # upload-artifact v4 artifacts are immutable after creation. This is the
