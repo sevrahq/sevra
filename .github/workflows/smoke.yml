@@ -121,7 +121,12 @@ jobs:
           $env:SEVRA_VERSION = $v
           $prodInstaller = Join-Path $env:RUNNER_TEMP 'production-sevra.ps1'
           Invoke-WebRequest -Uri 'https://www.sevrahq.com/install/sevra.ps1' -OutFile $prodInstaller -UseBasicParsing
-          if ((Get-FileHash install.ps1).Hash -ne (Get-FileHash $prodInstaller).Hash) {
+          # A Windows checkout may materialize CRLF even though the canonical
+          # Git blob and the production route are LF. Compare the downloaded
+          # bytes to the immutable blob, not to Git's checkout conversion.
+          $canonicalInstaller = (git rev-parse 'HEAD:install.ps1').Trim()
+          $productionInstaller = (git hash-object --no-filters $prodInstaller).Trim()
+          if ($canonicalInstaller -ne $productionInstaller) {
             throw 'production sevra.ps1 is not byte-identical to the canonical installer'
           }
           $env:SEVRA_INSTALL_DIR = Join-Path $env:RUNNER_TEMP 'sevra-bin'

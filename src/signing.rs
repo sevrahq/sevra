@@ -119,6 +119,15 @@ mod tests {
     }
 
     #[test]
+    fn windows_smoke_compares_production_to_the_canonical_git_blob() {
+        let workflow = include_str!("../.github/workflows/smoke.yml").replace("\r\n", "\n");
+        assert!(workflow.contains("git rev-parse 'HEAD:install.ps1'"));
+        assert!(workflow.contains("git hash-object --no-filters $prodInstaller"));
+        assert!(!workflow
+            .contains("(Get-FileHash install.ps1).Hash -ne (Get-FileHash $prodInstaller).Hash"));
+    }
+
+    #[test]
     fn release_wrapper_keeps_successor_signer_local_and_reproduces_every_binary() {
         let wrapper = include_str!("../scripts/release.sh");
         for required in [
