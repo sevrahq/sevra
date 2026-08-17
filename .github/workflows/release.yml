@@ -10,7 +10,8 @@
 # provenance. Every later release ends runner-key exposure: Actions produces
 # and attests exactly five unsigned
 # binaries, then scripts/release.sh verifies them, reproducibly rebuilds all
-# five targets, signs locally from 1Password, uploads the complete draft, and
+# five targets, signs locally from the dedicated device-only Keychain cache,
+# uploads the complete draft, and
 # publishes it immutable. A single SHA256SUMS covers every binary. install.sh /
 # install.ps1 and `sevra update` download these directly (no tarball to extract).
 #

@@ -136,9 +136,9 @@
   workflow attempt, and nonce, then deletes the transitional signer.
   Successor signing moves entirely off hosted runners: Actions emits five
   unsigned, tag/SHA-attested binaries; the local controller independently
-  rebuilds and byte-compares every target before reading the 1Password signer
-  over stdin-only process memory, then uploads a complete draft and publishes
-  it immutable. It verifies checksums, exact assets, tag target, and binary
+  rebuilds and byte-compares every target before reading the device-local
+  Keychain signer over stdin-only process memory, then uploads a complete draft
+  and publishes it immutable. It verifies checksums, exact assets, tag target, and binary
   provenance after publication.
 - Supply chain: the release controller can resume only when the remote tag
   still names the authorized commit and exactly one workflow run names that
