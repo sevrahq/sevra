@@ -15,9 +15,7 @@ both routes to agree for every compatibility generation.
 4. Run the guarded release wrapper from a clean `main` worktree:
 
    ```sh
-   scripts/release.sh \
-     --signing-key-ref 'op://RECOVERY_VAULT/SIGNING_ITEM/FIELD' \
-     vX.Y.Z
+   scripts/release.sh vX.Y.Z
    ```
 
    The wrapper refuses a dirty/non-main worktree, a non-canonical origin, a
@@ -39,8 +37,8 @@ both routes to agree for every compatibility generation.
    random CodeView/PDB identifier.
 
    For releases after v0.2.10, only after those five byte comparisons pass does
-   the wrapper read offline signer B from 1Password Recovery over memory, pass
-   it to one local Node process over stdin, check its pinned SPKI, sign, create
+   the wrapper read offline signer B from its dedicated local macOS Keychain
+   cache, pass it to one local Node process over stdin, check its pinned SPKI, sign, create
    checksums, upload the complete draft, and publish it immutable. Signer B is
    never a GitHub secret or exposed to a hosted runner. The wrapper then
    verifies the exact 11-asset set, checksums, every Ed25519 signature,
@@ -104,13 +102,27 @@ both routes to agree for every compatibility generation.
 
 ## Key custody
 
-Offline signer B lives only in the separately controlled 1Password Recovery
-vault and local release-process memory. It is not a
-repository, Actions environment, platform-runtime, filesystem, argv, or
-shell-profile secret. The signing helper accepts a direct PKCS#8 PEM or its
+Offline signer B's working copy lives only in a non-synchronizing,
+this-device-only macOS Keychain item and local release-process memory. An
+independent recovery copy may exist outside the workstation, but the release
+controller never contacts a password manager. It is not a repository, Actions
+environment, platform-runtime, filesystem, argv, or shell-profile secret. The
+signing helper accepts a direct PKCS#8 PEM or its
 canonical base64 form, canonical base64 PKCS#8 DER, or a canonical base64 raw
 32-byte Ed25519 seed. Any malformed, non-canonical, or wrong-SPKI key fails
 before any signature is written.
+
+Seed or rotate the working cache only through stdin, then verify presence
+without reading the value:
+
+```sh
+<independent-secret-read-command> | node scripts/release-keychain.mjs put
+node scripts/release-keychain.mjs has
+```
+
+The cache helper never prints on `put` or `has`. `get` exists only for the
+release controller's final stdin pipe. No release command attempts to populate
+the cache or falls back to another provider.
 
 The environment authorization existed only for the v0.2.9 and v0.2.10
 compatibility transitions.
@@ -142,7 +154,9 @@ The completed rotation was additive and order-sensitive:
    while pinning offline signer B alongside both earlier public keys. After the
    immutable checkpoint, tag/SHA provenance, release, fresh install, and
    historical update chain verify, delete A from GitHub.
-5. Every release after v0.2.10 uses signer B through the local `op://` path.
+5. Every release after v0.2.10 uses signer B through the dedicated local
+   Keychain cache. The controller fails if the cache is missing and never
+   invokes `op` or opens a password-manager prompt.
    Keep all three public pins: retired private keys are gone, and their public
    pins preserve explicit installs and historical update verification. Keep
    v0.2.9's manifest entry and the production User-Agent bridge: clients at

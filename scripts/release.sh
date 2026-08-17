@@ -4,12 +4,12 @@
 # and v0.2.10 is the one-time protected bridge from signer A to offline signer
 # B. Every later release keeps the Ed25519 private key local: Actions returns only unsigned,
 # tag/SHA-attested binaries; this controller independently reproduces the
-# five binaries, signs them from 1Password over stdin, then publishes.
+# five binaries, signs them from the local macOS Keychain cache over stdin,
+# then publishes. Password managers are never invoked by this controller.
 set -eu
 
 repo="sevrahq/sevra"
 environment="release-signing"
-signing_key_ref="${SEVRA_SIGNING_KEY_REFERENCE:-}"
 tag=""
 cleanup_only=0
 resume=0
@@ -45,19 +45,18 @@ sevra-windows-x86_64.exe.sig'
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/release.sh [--resume] [--signing-key-ref op://VAULT/ITEM/FIELD] [vX.Y.Z]
+  scripts/release.sh [--resume] [vX.Y.Z]
   scripts/release.sh --cleanup-ephemeral-secrets
 
 v0.2.9 consumes the transitional repository-scoped SEVRA_CLI_SIGNING_KEY.
 v0.2.10 consumes the protected-environment SEVRA_CLI_SIGNING_KEY_NEXT bridge.
 Each signer is deleted only after the exact signed set is durable in an
 immutable Actions artifact and every byte's tag/SHA provenance, checksum, and
-Ed25519 signature verify locally. Later releases require a 1Password secret
-reference containing offline signer B as a PKCS#8 PEM or canonical base64 PEM,
-PKCS#8 DER, or raw 32-byte Ed25519 seed. The value is read only after unsigned
+Ed25519 signature verify locally. Later releases require offline signer B in
+the dedicated local macOS Keychain cache. The value is read only after unsigned
 artifact provenance and all five independent reproductions succeed, passed
 directly to one local Node process over stdin, and never sent to GitHub or
-written to disk.
+written to disk. A missing cache fails without contacting a password manager.
 EOF
 }
 
@@ -227,11 +226,6 @@ trap 'exit 143' TERM
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --signing-key-ref)
-      [ "$#" -ge 2 ] || die "--signing-key-ref requires an op:// reference"
-      signing_key_ref="$2"
-      shift 2
-      ;;
     --cleanup-ephemeral-secrets)
       cleanup_only=1
       shift
@@ -414,7 +408,7 @@ else
     fi
   fi
   if have_secret environment SEVRA_CLI_SIGNING_KEY_NEXT; then
-    die "remove legacy SEVRA_CLI_SIGNING_KEY_NEXT after confirming its 1Password Recovery copy"
+    die "remove legacy SEVRA_CLI_SIGNING_KEY_NEXT after confirming independent recovery"
   fi
   [ "$(uname -s):$(uname -m)" = "Darwin:arm64" ] ||
     die "successor releases must run on the reviewed arm64 macOS controller"
@@ -438,13 +432,8 @@ else
   docker info >/dev/null 2>&1 ||
     die "the Docker daemon is not available for Linux reproduction"
   if [ "$preexisting_final" -eq 0 ]; then
-    [ -n "$signing_key_ref" ] ||
-      die "successor releases require --signing-key-ref op://VAULT/ITEM/FIELD"
-    case "$signing_key_ref" in
-      op://*) ;;
-      *) die "the signing-key reference must be an op:// 1Password reference" ;;
-    esac
-    command -v op >/dev/null 2>&1 || die "the 1Password CLI (op) is required"
+    node scripts/release-keychain.mjs has ||
+      die "successor releases require signer B in the local Keychain cache"
   fi
 fi
 
@@ -837,9 +826,10 @@ if [ "$protected_signer" -eq 0 ]; then
       cp -- "$unsigned_dir/$asset" "$release_dir/$asset"
     done
 
-    # The key flows directly from 1Password into one local process. The shell
-    # never captures or exports it, and no byte is written to disk or argv.
-    op read "$signing_key_ref" |
+    # The key flows directly from the dedicated local Keychain cache into one
+    # process; no byte is written to disk or argv. The shell never captures or
+    # exports it. The controller has no password-manager code path.
+    node "$source_dir/scripts/release-keychain.mjs" get |
       node "$source_dir/scripts/release-sign.mjs" \
         "MCowBQYDK2VwAyEAzOIUB6eaOlwx1PqHCUBDF2+F3FLa5VK1u6QoFOVyXME=" \
       "$release_dir"/sevra-darwin-aarch64 \

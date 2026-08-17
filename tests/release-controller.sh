@@ -771,11 +771,6 @@ cat >"$successor_bin/node" <<'EOF'
 printf '%s\n' "node final-signature-verify" >>"$SEVRA_TEST_LOG"
 exit 0
 EOF
-cat >"$successor_bin/op" <<'EOF'
-#!/bin/sh
-printf '%s\n' "successor resume attempted to read the signing key" >&2
-exit 97
-EOF
 chmod +x "$successor_bin"/*
 
 : >"$SEVRA_TEST_LOG"
@@ -806,7 +801,7 @@ if grep -Eq "^(cargo|cross|xwin) cwd=$successor_root " "$SEVRA_TEST_LOG"; then
   cat "$SEVRA_TEST_LOG" >&2
   exit 1
 fi
-if grep -Eq '^gh release (create|upload|edit|delete) |^op ' "$SEVRA_TEST_LOG"; then
+if grep -Eq '^gh release (create|upload|edit|delete) ' "$SEVRA_TEST_LOG"; then
   printf '%s\n' "immutable successor verification mutated release state or read the signer" >&2
   cat "$SEVRA_TEST_LOG" >&2
   exit 1

@@ -15,8 +15,9 @@ reproduce and the version (`sevra version`).
   compatibility release signed by the original key on a protected runner.
   Successor keys never enter GitHub: Actions produces exact unsigned,
   tag/SHA-attested binaries, then the local controller independently rebuilds
-  and byte-compares all five targets before reading the key from 1Password
-  Recovery over stdin-only process memory. It checks the successor SPKI,
+  and byte-compares all five targets before reading the key from a dedicated
+  non-synchronizing local macOS Keychain cache over stdin-only process memory.
+  The controller has no password-manager path. It checks the successor SPKI,
   signs locally, and publishes only the complete immutable release.
   GitHub/Sigstore provenance remains present for every binary. Verify with
   `gh attestation verify <binary> --repo sevrahq/sevra`.

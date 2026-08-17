@@ -158,7 +158,7 @@ mod tests {
             "immutable GitHub Releases must be enabled before tagging",
             "openssl rand -hex 32",
             "$tag:$release_sha:$release_run_id.$attempt:$auth_nonce",
-            "op read \"$signing_key_ref\"",
+            "node \"$source_dir/scripts/release-keychain.mjs\" get",
             "scripts/release-sign.mjs",
             "cleanup_ephemeral_secrets",
             "gh secret delete SEVRA_CLI_SIGNING_KEY --repo \"$repo\"",
@@ -197,6 +197,10 @@ mod tests {
             "the successor private key must never be uploaded to Actions"
         );
         assert!(
+            !wrapper.contains("op read") && !wrapper.contains("signing-key-ref"),
+            "the release controller must never invoke a password manager"
+        );
+        assert!(
             !wrapper.contains("${TMPDIR:-/tmp}/sevra-release"),
             "Cross-visible release scratch space must stay beneath the repository"
         );
@@ -205,6 +209,23 @@ mod tests {
             5,
             "all five attested binaries must reproduce before local signing"
         );
+    }
+
+    #[test]
+    fn release_signer_uses_a_private_local_keychain_cache() {
+        let bridge = include_str!("../scripts/release-keychain.mjs");
+        let helper = include_str!("../scripts/macos-keychain-signing-key.swift");
+        assert!(bridge.contains("com.sevra.release-signing"));
+        assert!(bridge.contains("Library"));
+        assert!(bridge.contains("Caches"));
+        assert!(bridge.contains("chmodSync(cacheDirectory, 0o700)"));
+        assert!(bridge.contains("statSync(binaryPath).mode & 0o077"));
+        assert!(helper.contains("com.sevra.release-signing"));
+        assert!(helper.contains("SEVRA_CLI_SIGNING_KEY"));
+        assert!(helper.contains("kSecAttrSynchronizable as String: kCFBooleanFalse"));
+        assert!(helper.contains("kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly"));
+        assert!(!bridge.contains("1Password"));
+        assert!(!helper.contains("1Password"));
     }
 
     #[test]
