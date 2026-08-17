@@ -30,7 +30,29 @@ fn absolute(path: &Path) -> io::Result<std::path::PathBuf> {
     // Unlike canonicalize, `absolute` never follows a symlink in the path we
     // are about to treat as the capability root. The platform traversal below
     // must inspect every original component itself.
-    std::path::absolute(path)
+    let resolved = std::path::absolute(path)?;
+    #[cfg(target_os = "macos")]
+    {
+        // macOS exposes three fixed root aliases as symlinks (`/var`, `/tmp`,
+        // `/etc` → `/private/...`). Refusing them makes ordinary temp paths
+        // unusable, including `sevra export /tmp/brain`. Rewrite only these
+        // operating-system aliases to their canonical fixed roots; arbitrary
+        // user-controlled symlinks remain subject to O_NOFOLLOW below.
+        let mut components = resolved.components();
+        if matches!(components.next(), Some(Component::RootDir)) {
+            if let Some(Component::Normal(first)) = components.next() {
+                if first == "var" || first == "tmp" || first == "etc" {
+                    let mut expanded = std::path::PathBuf::from("/private");
+                    expanded.push(first);
+                    for component in components {
+                        expanded.push(component.as_os_str());
+                    }
+                    return Ok(expanded);
+                }
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 fn parts(rel: &str) -> io::Result<Vec<OsString>> {
@@ -1945,6 +1967,17 @@ mod unix_tests {
         assert!(ensure_dir(&root, 0o755).is_err());
         assert!(atomic_write(&root, "victim", b"ATTACK", true, 0o600).is_err());
         assert!(!outside.join("victim").exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn secure_directory_creation_accepts_the_fixed_macos_temp_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let requested = temp.path().join("export-parent");
+        assert!(requested.starts_with("/var") || requested.starts_with("/tmp"));
+
+        ensure_dir(&requested, 0o700).unwrap();
+        assert!(requested.is_dir());
     }
 
     #[test]
