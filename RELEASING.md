@@ -33,8 +33,11 @@ both routes to agree for every compatibility generation.
    directory so Colima can mount it into the Linux builders without exposing
    it to the worktree. Every downloaded byte must match its independent rebuild.
    Canonical path remapping and `SOURCE_DATE_EPOCH` remove host-path/time
-   variance. The Windows link also uses `/Brepro` and omits the otherwise
-   random CodeView/PDB identifier.
+   variance. Darwin binaries replace the linker's nondeterministic `LC_UUID`
+   with a content-derived RFC 4122 UUID, then receive a stable ad-hoc signature
+   under the fixed `com.sevra.cli` identifier; both the hosted build and local
+   controller apply the same reviewed normalizer. The Windows link also uses
+   `/Brepro` and omits the otherwise random CodeView/PDB identifier.
 
    For releases after v0.2.10, only after those five byte comparisons pass does
    the wrapper read offline signer B from its dedicated local macOS Keychain

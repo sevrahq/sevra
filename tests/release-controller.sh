@@ -656,6 +656,10 @@ cat >"$successor_bin/docker" <<'EOF'
 #!/bin/sh
 [ "$1" = info ]
 EOF
+cat >"$successor_bin/codesign" <<'EOF'
+#!/bin/sh
+printf 'codesign %s\n' "$*" >>"$SEVRA_TEST_LOG"
+EOF
 cat >"$successor_bin/shasum" <<'EOF'
 #!/bin/sh
 exit 0
@@ -768,7 +772,7 @@ printf '%s\n' "$marker" >"$target_dir/$target/release/sevra"
 EOF
 cat >"$successor_bin/node" <<'EOF'
 #!/bin/sh
-printf '%s\n' "node final-signature-verify" >>"$SEVRA_TEST_LOG"
+printf 'node %s\n' "$*" >>"$SEVRA_TEST_LOG"
 exit 0
 EOF
 chmod +x "$successor_bin"/*
@@ -801,6 +805,21 @@ if grep -Eq "^(cargo|cross|xwin) cwd=$successor_root " "$SEVRA_TEST_LOG"; then
   cat "$SEVRA_TEST_LOG" >&2
   exit 1
 fi
+[ "$(grep -Ec '^node .*normalize-macho[.]mjs .*reproduce-darwin-' "$SEVRA_TEST_LOG")" -eq 2 ] || {
+  printf '%s\n' "successor did not normalize both Darwin reproductions" >&2
+  cat "$SEVRA_TEST_LOG" >&2
+  exit 1
+}
+[ "$(grep -Ec '^codesign --force --sign - --identifier com[.]sevra[.]cli --timestamp=none .*reproduce-darwin-' "$SEVRA_TEST_LOG")" -eq 2 ] || {
+  printf '%s\n' "successor did not ad-hoc sign both normalized Darwin reproductions" >&2
+  cat "$SEVRA_TEST_LOG" >&2
+  exit 1
+}
+[ "$(grep -Ec '^codesign --verify --strict .*reproduce-darwin-' "$SEVRA_TEST_LOG")" -eq 2 ] || {
+  printf '%s\n' "successor did not verify both normalized Darwin reproductions" >&2
+  cat "$SEVRA_TEST_LOG" >&2
+  exit 1
+}
 if grep -Eq '^gh release (create|upload|edit|delete) ' "$SEVRA_TEST_LOG"; then
   printf '%s\n' "immutable successor verification mutated release state or read the signer" >&2
   cat "$SEVRA_TEST_LOG" >&2

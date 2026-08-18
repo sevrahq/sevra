@@ -87,3 +87,9 @@ for workflow in \
 do
   check_workflow "$workflow"
 done
+
+release_workflow="$root/.github/workflows/release.yml"
+[ "$(grep -Fc "node scripts/normalize-macho.mjs \"\$binary\"" "$release_workflow")" -eq 1 ]
+[ "$(grep -Fc "/usr/bin/codesign --force --sign -" "$release_workflow")" -eq 1 ]
+[ "$(grep -Fc "/usr/bin/codesign --verify --strict \"\$binary\"" "$release_workflow")" -eq 1 ]
+printf '%s\n' "release.yml Darwin normalization/signing guard OK"

@@ -86,6 +86,7 @@ jobs:
       - run: cargo build --locked
       - run: cargo test --locked
       - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: node tests/normalize-macho.mjs
       - run: node tests/release-sign.mjs
       - uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902
         with:
@@ -185,6 +186,16 @@ jobs:
             cargo build --release --locked \
               --target ${{ matrix.rust_target }} --target-dir "$target_dir"
           fi
+      - name: Normalize and sign Darwin metadata
+        if: startsWith(matrix.target_name, 'darwin-')
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/reproduce-${{ matrix.target_name }}/${{ matrix.rust_target }}/release/sevra"
+          node scripts/normalize-macho.mjs "$binary"
+          /usr/bin/codesign --force --sign - \
+            --identifier com.sevra.cli --timestamp=none "$binary"
+          /usr/bin/codesign --verify --strict "$binary"
       - name: Stage asset
         shell: bash
         run: |

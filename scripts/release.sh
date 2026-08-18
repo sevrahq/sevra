@@ -412,10 +412,11 @@ else
   fi
   [ "$(uname -s):$(uname -m)" = "Darwin:arm64" ] ||
     die "successor releases must run on the reviewed arm64 macOS controller"
-  for release_tool in cross docker rustup curl tar shasum cmp; do
+  for release_tool in cross docker rustup curl tar shasum cmp node codesign; do
     command -v "$release_tool" >/dev/null 2>&1 ||
       die "$release_tool is required for independent release reproduction"
   done
+  codesign_tool="$(command -v codesign)"
   rustc +1.96.0 --version | grep -Fxq 'rustc 1.96.0 (ac68faa20 2026-05-25)' ||
     die "the exact Rust 1.96.0 release compiler is required"
   installed_targets="$(rustup target list --installed --toolchain 1.96.0)"
@@ -788,6 +789,15 @@ if [ "$protected_signer" -eq 0 ]; then
       --target-dir "$darwin_arm_dir"
     cargo +1.96.0 build --release --locked --target x86_64-apple-darwin \
       --target-dir "$darwin_x86_dir"
+    for darwin_binary in \
+      "$darwin_arm_dir/aarch64-apple-darwin/release/sevra" \
+      "$darwin_x86_dir/x86_64-apple-darwin/release/sevra"
+    do
+      node "$source_dir/scripts/normalize-macho.mjs" "$darwin_binary"
+      "$codesign_tool" --force --sign - \
+        --identifier com.sevra.cli --timestamp=none "$darwin_binary"
+      "$codesign_tool" --verify --strict "$darwin_binary"
+    done
     RUSTUP_TOOLCHAIN=1.96.0 cross build --release --locked \
       --target aarch64-unknown-linux-musl \
       --target-dir "$linux_arm_dir"

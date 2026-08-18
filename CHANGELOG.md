@@ -1,6 +1,13 @@
 # Changelog
 
-## 0.2.11 — 2026-08-18
+## 0.2.12 — 2026-08-18
+
+- Release integrity: Darwin artifacts now replace Apple's nondeterministic
+  `LC_UUID` with a content-derived RFC 4122 UUID and regenerate a stable
+  linker-compatible ad-hoc signature before attestation. The independent
+  controller performs the same normalization before byte comparison. The
+  v0.2.11 attempt detected the random UUID mismatch and stopped before reading
+  the offline signer, so no v0.2.11 release was published.
 
 - Integrity: push now uses the same canonical keep-home predicate for snapshot
   selection and withheld-link declarations. With an active `.sevralocal`, a

@@ -48,6 +48,7 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      - run: node tests/normalize-macho.mjs
       - run: sh -n install.sh tests/installers.sh tests/release-controller.sh tests/workflow-shell.sh scripts/install-pinned-llvm.sh scripts/release.sh
       - run: shellcheck install.sh tests/installers.sh tests/release-controller.sh tests/workflow-shell.sh scripts/install-pinned-llvm.sh scripts/release.sh
       - run: sh tests/installers.sh

@@ -104,6 +104,11 @@ mod tests {
             "SEVRA_EXPECTED_SIGNER_SPKI='MCowBQYDK2VwAyEAasunxAjcJp8W30eF0ndPlLXqwSjZ/u5raivn3QmaKcc='"
         ));
         assert!(workflow.contains("node tests/release-sign.mjs"));
+        assert!(workflow.contains("node tests/normalize-macho.mjs"));
+        assert!(workflow.contains("node scripts/normalize-macho.mjs \"$binary\""));
+        assert!(workflow.contains("/usr/bin/codesign --force --sign - \\"));
+        assert!(workflow.contains("--identifier com.sevra.cli --timestamp=none \"$binary\""));
+        assert!(workflow.contains("/usr/bin/codesign --verify --strict \"$binary\""));
         assert!(workflow.contains("actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd"));
         assert!(workflow.contains("node ../scripts/release-sign.mjs"));
         assert!(workflow.contains("unset SEVRA_CLI_SIGNING_KEY SEVRA_EXPECTED_SIGNER_SPKI"));
@@ -166,6 +171,9 @@ mod tests {
             "RUSTUP_TOOLCHAIN=1.96.0 cross build",
             "cargo +1.96.0 build --release --locked --target aarch64-apple-darwin",
             "cargo +1.96.0 build --release --locked --target x86_64-apple-darwin",
+            "node \"$source_dir/scripts/normalize-macho.mjs\" \"$darwin_binary\"",
+            "--identifier com.sevra.cli --timestamp=none \"$darwin_binary\"",
+            "--verify --strict \"$darwin_binary\"",
             "\"$xwin_dir/cargo-xwin\" xwin build",
             "\"$source_dir/scripts/install-pinned-llvm.sh\" \"$llvm_dir\"",
             "PATH=\"$llvm_dir/bin:$PATH\"",
