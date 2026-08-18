@@ -2065,7 +2065,10 @@ fn push_declares_only_linked_kept_home_names_and_counts_the_rest() {
 #[test]
 fn push_declares_linked_derived_catalogs_as_withheld() {
     let t = store_dir(&[
-        ("a.md", "Riding content links [[sub/index]]."),
+        (
+            "a.md",
+            "Riding content links [[sub/index]], while [[missing/index]] is truly absent.",
+        ),
         ("index.md", "unlinked generated catalog"),
         ("sub/index.md", "linked generated catalog"),
         // Any active entry keeps generated catalogs home, even when the entry
@@ -2075,7 +2078,9 @@ fn push_declares_linked_derived_catalogs_as_withheld() {
     let bin = tempfile::tempdir().unwrap();
     fake_dbmd(
         bin.path(),
-        r#"{"store":".","files":[{"path":"a.md","links":["sub/index.md"]},{"path":"index.md","links":[]},{"path":"sub/index.md","links":[]}],"summary":{"files":3,"sources":0,"records":3}}"#,
+        // Real dbmd emit includes normalized links to generated catalogs but
+        // deliberately omits the catalog files themselves from `files`.
+        r#"{"store":".","files":[{"path":"a.md","links":["sub/index.md","missing/index.md"]}],"summary":{"files":1,"sources":0,"records":1}}"#,
     );
     let (base, log, handle) = mock_hub(vec![(200, push_response(1, 0, 1))]);
     let out = sevra()

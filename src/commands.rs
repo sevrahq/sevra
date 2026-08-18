@@ -1601,6 +1601,7 @@ struct WithheldPushMetadata {
 /// contribution to `unlinked` crosses the boundary.
 fn withheld_push_metadata(
     dir: &str,
+    held_root: &crate::safe_path::SafeDir,
     store: &Store,
     stats: &WalkStats,
     scope: Option<&local::LocalScope>,
@@ -1664,11 +1665,27 @@ fn withheld_push_metadata(
             let Some(target) = link.as_str() else {
                 continue;
             };
+            if paths.contains(target) || path_rides(Some(scope), target) {
+                continue;
+            }
             // Use the exact same keep-home predicate as the snapshot walk.
             // An active .sevralocal keeps both explicitly matched files and
             // derived index.md catalogs off the wire; linked catalogs must be
             // declared withheld too or the hub misclassifies them as broken.
-            if existing.contains(target) && !path_rides(Some(scope), target) {
+            // dbmd emit deliberately omits generated catalogs from its file
+            // inventory, so prove those candidates exist through the already
+            // held, no-follow store capability before relabeling the edge.
+            let locally_exists = existing.contains(target)
+                || (target.rsplit('/').next() == Some("index.md")
+                    && held_root.open_relative(target).unwrap_or_else(|error| {
+                        fail(
+                            &format!(
+                                "push withheld accounting could not securely verify a linked derived catalog: {error}"
+                            ),
+                            None,
+                        )
+                    }).is_some());
+            if locally_exists {
                 paths.insert(target.to_string());
             }
         }
@@ -1737,7 +1754,7 @@ pub fn push(
     // load binds the following asset decisions to one explicit scope value.
     let scope = local::load(Path::new(dir)).unwrap_or_else(|msg| fail(&msg, None));
     const MAX_WITHHELD_PATH_BYTES: usize = 2 * 1024 * 1024;
-    let withheld = withheld_push_metadata(dir, &store, &stats, scope.as_ref());
+    let withheld = withheld_push_metadata(dir, &held_root, &store, &stats, scope.as_ref());
     let withheld_path_bytes: usize = withheld.paths.iter().map(|path| path.len()).sum();
     if withheld.paths.len() > MAX_STORE_FILES || withheld_path_bytes > MAX_WITHHELD_PATH_BYTES {
         fail(
