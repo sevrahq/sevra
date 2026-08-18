@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.16 — 2026-08-18
+
+- Clone resilience: asset restore now retries transient hub, object-storage,
+  and mid-body network failures with fresh presigned URLs and fresh private
+  stages. Integrity/policy failures still fail immediately, and clone remains
+  atomic. Long restores also report aggregate progress every 25 assets.
+
 ## 0.2.15 — 2026-08-18
 
 - Sync integrity: clone and pull now retain the exact hosted local-only link

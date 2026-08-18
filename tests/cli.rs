@@ -2813,6 +2813,52 @@ fn clone_restores_declared_assets_only_after_exact_sha_verification() {
 }
 
 #[test]
+fn clone_retries_a_transient_asset_presign_failure_without_leaking_a_partial_root() {
+    let work = tempfile::tempdir().unwrap();
+    let manifest = format!("{{\"path\":\"_files/x.bin\",\"sha256\":\"{BLOB_SHA}\",\"bytes\":4}}\n");
+    let snapshot = serde_json::json!({
+        "brain": "brain-1",
+        "slug": "b",
+        "headSeq": 1,
+        "feedHash": FEED_ONE,
+        "files": [
+            { "path": "a.md", "content": "alpha" },
+            { "path": "assets.jsonl", "content": manifest },
+        ],
+    })
+    .to_string();
+    let (base, log, handle) = mock_hub(vec![
+        (200, snapshot),
+        (0, String::new()),
+        (503, r#"{"error":"temporary presign outage"}"#.to_string()),
+        (200, r#"{"url":"{BASE}/blob-get"}"#.to_string()),
+        (200, "BLOB".to_string()),
+    ]);
+    let clone = sevra()
+        .args(["clone", "b", "brain"])
+        .current_dir(work.path())
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(clone.status.success(), "{}", all_output(&clone));
+    assert!(String::from_utf8_lossy(&clone.stderr).contains("restore was interrupted"));
+    assert_eq!(
+        std::fs::read(work.path().join("brain/_files/x.bin")).unwrap(),
+        b"BLOB"
+    );
+    handle.join().unwrap();
+    let requests = log.lock().unwrap();
+    assert_eq!(requests.len(), 5);
+    assert_eq!(
+        requests[1].path,
+        format!("/api/hub/brains/b/assets/presign?sha256={BLOB_SHA}&action=get")
+    );
+    assert_eq!(requests[1].path, requests[2].path);
+    assert_eq!(requests[2].path, requests[3].path);
+}
+
+#[test]
 fn clone_edit_pull_refuses_locally_before_any_head_request() {
     let work = tempfile::tempdir().unwrap();
     let (base, _, handle) = mock_hub(vec![(200, clone_snapshot(1, FEED_ONE, "alpha"))]);

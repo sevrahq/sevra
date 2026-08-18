@@ -21,13 +21,16 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::commands::{contained, human_size};
 use crate::config::Config;
-use crate::hub::{ensure_ok, get_presigned_to_writer, put_presigned_file, request};
+use crate::hub::{
+    ensure_ok, get_presigned_to_writer, hub_error_message, put_presigned_file, request, try_request,
+};
 use crate::local::LocalScope;
 use crate::output::{fail, note};
 
@@ -40,6 +43,18 @@ const MAX_ASSET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// transport, but the CLI says plainly that their content was not inspected.
 const MAX_ASSET_SECRET_SCAN_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ASSET_SECRET_SCAN_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+/// A large clone must survive an ordinary Wi-Fi/DNS interruption without
+/// throwing away every asset already staged in this process. Each retry gets
+/// a fresh presigned URL and a fresh private stage, so partial bytes are never
+/// appended or trusted.
+const RESTORE_RETRY_BACKOFF: [Duration; 6] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(16),
+    Duration::from_secs(30),
+];
 
 fn reject_symlink_components(root: &Path, rel: &str) -> Result<(), String> {
     let mut current = root.to_path_buf();
@@ -871,58 +886,133 @@ impl PreparedRestore {
     }
 }
 
-fn download_asset_stage(
+#[derive(Debug)]
+enum RestoreAttemptError {
+    Retryable(String),
+    Fatal(String),
+}
+
+fn with_restore_retries<T>(
+    path: &str,
+    backoff: &[Duration],
+    mut attempt: impl FnMut() -> Result<T, RestoreAttemptError>,
+) -> Result<T, String> {
+    for (failure, pause) in backoff.iter().enumerate() {
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(RestoreAttemptError::Fatal(error)) => return Err(error),
+            Err(RestoreAttemptError::Retryable(error)) => {
+                note(&format!(
+                    "asset {path} restore was interrupted; retrying in {}s ({}/{}) — {error}",
+                    pause.as_secs(),
+                    failure + 1,
+                    backoff.len()
+                ));
+                std::thread::sleep(*pause);
+            }
+        }
+    }
+    match attempt() {
+        Ok(value) => Ok(value),
+        Err(RestoreAttemptError::Fatal(error)) => Err(error),
+        Err(RestoreAttemptError::Retryable(error)) => Err(format!(
+            "could not restore asset {path} after {} attempts: {error}",
+            backoff.len() + 1
+        )),
+    }
+}
+
+fn download_asset_stage_once(
     cfg: &Config,
     brain: &str,
     declaration: &AssetDeclaration,
-) -> Result<AssetStage, String> {
-    let presigned = ensure_ok(
-        request(
-            cfg,
-            "GET",
-            &format!(
-                "/api/hub/brains/{}/assets/presign?sha256={}&action=get",
-                enc(brain),
-                declaration.sha256
-            ),
-            None,
-            true,
+) -> Result<AssetStage, RestoreAttemptError> {
+    let presigned_response = try_request(
+        cfg,
+        "GET",
+        &format!(
+            "/api/hub/brains/{}/assets/presign?sha256={}&action=get",
+            enc(brain),
+            declaration.sha256
         ),
-        "prepare asset download",
-    );
+        None,
+        true,
+    )
+    .map_err(|error| {
+        RestoreAttemptError::Retryable(format!("could not request a fresh download URL: {error}"))
+    })?;
+    if presigned_response.status >= 400 {
+        let message = format!(
+            "prepare asset download failed (HTTP {}): {}",
+            presigned_response.status,
+            hub_error_message(&presigned_response)
+        );
+        return Err(
+            if presigned_response.status == 408
+                || presigned_response.status == 429
+                || presigned_response.status >= 500
+            {
+                RestoreAttemptError::Retryable(message)
+            } else {
+                RestoreAttemptError::Fatal(message)
+            },
+        );
+    }
+    let presigned = ensure_ok(presigned_response, "prepare asset download");
     let url = presigned
         .get("url")
         .and_then(Value::as_str)
-        .ok_or_else(|| format!("hub returned no download URL for {}", declaration.path))?;
-    let mut stage = AssetStage::create()?;
+        .ok_or_else(|| {
+            RestoreAttemptError::Fatal(format!(
+                "hub returned no download URL for {}",
+                declaration.path
+            ))
+        })?;
+    let mut stage = AssetStage::create().map_err(RestoreAttemptError::Fatal)?;
     let mut hasher = Sha256::new();
     let mut hashing_writer = HashingWriter {
         inner: &mut stage.file,
         hasher: &mut hasher,
     };
     let downloaded = get_presigned_to_writer(cfg, url, &mut hashing_writer, declaration.bytes)
-        .map_err(|error| format!("could not restore asset {}: {error}", declaration.path))?;
+        .map_err(|error| {
+            let message = format!("could not restore asset {}: {error}", declaration.path);
+            if error.starts_with("presigned download failed") {
+                RestoreAttemptError::Retryable(message)
+            } else {
+                RestoreAttemptError::Fatal(message)
+            }
+        })?;
     if downloaded != declaration.bytes {
-        return Err(format!(
+        return Err(RestoreAttemptError::Fatal(format!(
             "downloaded length disagrees with the manifest for {}",
             declaration.path
-        ));
+        )));
     }
     if format!("{:x}", hasher.finalize()) != declaration.sha256 {
-        return Err(format!(
+        return Err(RestoreAttemptError::Fatal(format!(
             "downloaded bytes failed SHA-256 verification for {}",
             declaration.path
-        ));
+        )));
     }
     stage
         .file
         .sync_all()
-        .map_err(|error| format!("asset stage sync failed: {error}"))?;
-    stage
-        .file
-        .seek(SeekFrom::Start(0))
-        .map_err(|error| format!("asset stage rewind failed: {error}"))?;
+        .map_err(|error| RestoreAttemptError::Fatal(format!("asset stage sync failed: {error}")))?;
+    stage.file.seek(SeekFrom::Start(0)).map_err(|error| {
+        RestoreAttemptError::Fatal(format!("asset stage rewind failed: {error}"))
+    })?;
     Ok(stage)
+}
+
+fn download_asset_stage(
+    cfg: &Config,
+    brain: &str,
+    declaration: &AssetDeclaration,
+) -> Result<AssetStage, String> {
+    with_restore_retries(&declaration.path, &RESTORE_RETRY_BACKOFF, || {
+        download_asset_stage_once(cfg, brain, declaration)
+    })
 }
 
 /// Stage every missing asset before the first exported file is changed. The
@@ -936,12 +1026,25 @@ pub fn prepare_restore(
 ) -> Result<PreparedRestore, String> {
     let mut assets = Vec::new();
     let mut present = 0usize;
-    for declaration in declarations {
+    if !declarations.is_empty() {
+        note(&format!(
+            "checking and restoring {} declared asset(s)",
+            declarations.len()
+        ));
+    }
+    for (index, declaration) in declarations.iter().enumerate() {
         if let Some(root) = root {
             match root.open_relative(&declaration.path) {
                 Ok(Some(file)) => {
                     if held_file_matches(file, declaration.bytes, &declaration.sha256) {
                         present += 1;
+                        let processed = index + 1;
+                        if processed % 25 == 0 || processed == declarations.len() {
+                            note(&format!(
+                                "asset restore: processed {processed}/{}",
+                                declarations.len()
+                            ));
+                        }
                         continue;
                     }
                 }
@@ -960,6 +1063,13 @@ pub fn prepare_restore(
             sha256: declaration.sha256.clone(),
             stage: download_asset_stage(cfg, brain, declaration)?,
         });
+        let processed = index + 1;
+        if processed % 25 == 0 || processed == declarations.len() {
+            note(&format!(
+                "asset restore: processed {processed}/{}",
+                declarations.len()
+            ));
+        }
     }
     Ok(PreparedRestore { assets, present })
 }
@@ -1004,11 +1114,69 @@ impl<W: Write> Write for HashingWriter<'_, W> {
 mod tests {
     use super::{
         open_asset_source, parse_restore_manifest, preflight_asset_destination, stage_asset_source,
-        write_asset_destination, AssetStage, PreparedAsset, MAX_ASSET_BYTES,
+        with_restore_retries, write_asset_destination, AssetStage, PreparedAsset,
+        RestoreAttemptError, MAX_ASSET_BYTES,
     };
     use sha2::{Digest, Sha256};
+    use std::cell::Cell;
     use std::fs;
     use std::io::{Seek, SeekFrom, Write};
+    use std::time::Duration;
+
+    #[test]
+    fn asset_restore_retries_transient_failures_then_returns_the_verified_stage() {
+        let attempts = Cell::new(0);
+        let value = with_restore_retries(
+            "_files/example.bin",
+            &[Duration::ZERO, Duration::ZERO],
+            || {
+                let attempt = attempts.get() + 1;
+                attempts.set(attempt);
+                if attempt < 3 {
+                    Err(RestoreAttemptError::Retryable(format!(
+                        "temporary failure {attempt}"
+                    )))
+                } else {
+                    Ok("verified")
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(value, "verified");
+        assert_eq!(attempts.get(), 3);
+    }
+
+    #[test]
+    fn asset_restore_never_retries_a_fatal_integrity_failure() {
+        let attempts = Cell::new(0);
+        let error = with_restore_retries(
+            "_files/example.bin",
+            &[Duration::ZERO, Duration::ZERO],
+            || {
+                attempts.set(attempts.get() + 1);
+                Err::<(), _>(RestoreAttemptError::Fatal("hash mismatch".into()))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, "hash mismatch");
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[test]
+    fn asset_restore_reports_exhausted_transient_retries() {
+        let attempts = Cell::new(0);
+        let error = with_restore_retries(
+            "_files/example.bin",
+            &[Duration::ZERO, Duration::ZERO],
+            || {
+                attempts.set(attempts.get() + 1);
+                Err::<(), _>(RestoreAttemptError::Retryable("offline".into()))
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("after 3 attempts") && error.contains("offline"));
+        assert_eq!(attempts.get(), 3);
+    }
 
     #[cfg(unix)]
     #[test]
