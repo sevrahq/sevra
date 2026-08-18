@@ -168,6 +168,11 @@ jobs:
           set -euo pipefail
           cargo_home="${CARGO_HOME:-$HOME/.cargo}"
           RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/workspace --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=/project=/workspace"
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            linux_rustc="$(rustup which --toolchain 1.96.0-x86_64-unknown-linux-gnu rustc)"
+            linux_sysroot="$(dirname "$(dirname "$linux_rustc")")"
+            RUSTFLAGS="$RUSTFLAGS --remap-path-prefix=$linux_sysroot=/rust"
+          fi
           SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
           export RUSTFLAGS SOURCE_DATE_EPOCH
           target_dir="target/reproduce-${{ matrix.target_name }}"

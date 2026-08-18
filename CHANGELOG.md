@@ -1,6 +1,16 @@
 # Changelog
 
-## 0.2.13 — 2026-08-18
+## 0.2.14 — 2026-08-18
+
+- Release integrity: Linux builds now remap the Rust 1.96.0 x86_64 Linux
+  sysroot to the canonical `/rust` prefix in both CI and the independent
+  controller. This removes embedded workstation toolchain paths from Rust
+  standard-library source locations and makes the static read-only layout
+  reproducible. The v0.2.13 attempt proved both Darwin targets and failed
+  closed on the first Linux comparison before reading the offline signer, so
+  no v0.2.13 release exists.
+
+## 0.2.13 — unpublished
 
 - Release integrity: the independent arm64 macOS controller now rebuilds the
   Intel artifact with the Intel-host Rust toolchain under Rosetta. This keeps

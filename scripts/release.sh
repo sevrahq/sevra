@@ -425,9 +425,14 @@ else
   x86_cargo="$(
     rustup which --toolchain 1.96.0-x86_64-apple-darwin cargo 2>/dev/null
   )" || die "the Intel-native Rust 1.96.0 toolchain is required"
+  linux_rustc="$(
+    rustup which --toolchain 1.96.0-x86_64-unknown-linux-gnu rustc 2>/dev/null
+  )" || die "the Linux-host Rust 1.96.0 toolchain is required"
   if [ ! -x "$x86_rustc" ] || [ ! -x "$x86_cargo" ]; then
     die "the Intel-native Rust 1.96.0 toolchain is incomplete"
   fi
+  [ -x "$linux_rustc" ] ||
+    die "the Linux-host Rust 1.96.0 toolchain is incomplete"
   arch -x86_64 "$x86_rustc" --version |
     grep -Fxq 'rustc 1.96.0 (ac68faa20 2026-05-25)' ||
     die "Rosetta and the exact Intel-native Rust 1.96.0 compiler are required"
@@ -792,7 +797,8 @@ if [ "$protected_signer" -eq 0 ]; then
   # the tag unsigned and unpublished for explicit investigation.
   release_cargo_home="${CARGO_HOME:-$HOME/.cargo}"
   x86_toolchain_bin="$(dirname -- "$x86_rustc")"
-  RUSTFLAGS="--remap-path-prefix=$source_canonical=/workspace --remap-path-prefix=$release_cargo_home=/cargo --remap-path-prefix=/project=/workspace"
+  linux_sysroot="$(dirname -- "$(dirname -- "$linux_rustc")")"
+  RUSTFLAGS="--remap-path-prefix=$source_canonical=/workspace --remap-path-prefix=$release_cargo_home=/cargo --remap-path-prefix=/project=/workspace --remap-path-prefix=$linux_sysroot=/rust"
   SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$release_sha")"
   export RUSTFLAGS SOURCE_DATE_EPOCH
   (

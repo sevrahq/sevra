@@ -34,10 +34,13 @@ both routes to agree for every compatibility generation.
    directory so Colima can mount it into the Linux builders without exposing
    it to the worktree. Every downloaded byte must match its independent rebuild.
    Canonical path remapping and `SOURCE_DATE_EPOCH` remove host-path/time
-   variance. Matching the Intel execution architecture matters because the
-   arm64 and x86_64 slices of Apple's `ld64` can produce different valid Intel
-   layouts despite reporting the same release version. Darwin binaries replace
-   the linker's nondeterministic `LC_UUID`
+   variance. The x86_64 Linux Rust sysroot is also normalized to `/rust`; Rust
+   source locations from `core` and `std` otherwise embed the controller's
+   toolchain path and shift the static read-only data layout. Matching the
+   Intel execution architecture matters because the arm64 and x86_64 slices
+   of Apple's `ld64` can produce different valid Intel layouts despite
+   reporting the same release version. Darwin binaries replace the linker's
+   nondeterministic `LC_UUID`
    with a content-derived RFC 4122 UUID, then receive a stable ad-hoc signature
    under the fixed `com.sevra.cli` identifier; both the hosted build and local
    controller apply the same reviewed normalizer. The Windows link also uses
