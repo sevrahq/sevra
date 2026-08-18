@@ -645,12 +645,30 @@ printf '%s\n' 'rustc 1.96.0 (ac68faa20 2026-05-25)'
 EOF
 cat >"$successor_bin/rustup" <<'EOF'
 #!/bin/sh
-printf '%s\n' \
-  aarch64-apple-darwin \
-  x86_64-apple-darwin \
-  x86_64-unknown-linux-musl \
-  aarch64-unknown-linux-musl \
-  x86_64-pc-windows-msvc
+case "$1" in
+  which)
+    case "$*" in
+      *" rustc") command -v rustc ;;
+      *" cargo") command -v cargo ;;
+      *) exit 98 ;;
+    esac
+    ;;
+  target)
+    printf '%s\n' \
+      aarch64-apple-darwin \
+      x86_64-unknown-linux-musl \
+      aarch64-unknown-linux-musl \
+      x86_64-pc-windows-msvc
+    ;;
+  *) exit 98 ;;
+esac
+EOF
+cat >"$successor_bin/arch" <<'EOF'
+#!/bin/sh
+printf 'arch %s\n' "$*" >>"$SEVRA_TEST_LOG"
+[ "$1" = -x86_64 ] || exit 98
+shift
+exec "$@"
 EOF
 cat >"$successor_bin/docker" <<'EOF'
 #!/bin/sh
@@ -797,6 +815,12 @@ fi
 grep -Fq 'build-marker = "mutated"' "$successor_root/Cargo.toml"
 [ "$(grep -Ec '^(cargo|cross|xwin) cwd=.*exact-source ' "$SEVRA_TEST_LOG")" -eq 5 ] || {
   printf '%s\n' "successor did not rebuild all five targets from exact-source" >&2
+  cat "$SEVRA_TEST_LOG" >&2
+  exit 1
+}
+grep -Eq '^arch -x86_64 /usr/bin/env .*cargo build --release --locked --target x86_64-apple-darwin ' \
+  "$SEVRA_TEST_LOG" || {
+  printf '%s\n' "successor did not rebuild Intel Darwin under the x86_64 execution preference" >&2
   cat "$SEVRA_TEST_LOG" >&2
   exit 1
 }

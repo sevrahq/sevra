@@ -412,17 +412,28 @@ else
   fi
   [ "$(uname -s):$(uname -m)" = "Darwin:arm64" ] ||
     die "successor releases must run on the reviewed arm64 macOS controller"
-  for release_tool in cross docker rustup curl tar shasum cmp node codesign; do
+  for release_tool in arch cross docker rustup curl tar shasum cmp node codesign; do
     command -v "$release_tool" >/dev/null 2>&1 ||
       die "$release_tool is required for independent release reproduction"
   done
   codesign_tool="$(command -v codesign)"
   rustc +1.96.0 --version | grep -Fxq 'rustc 1.96.0 (ac68faa20 2026-05-25)' ||
     die "the exact Rust 1.96.0 release compiler is required"
+  x86_rustc="$(
+    rustup which --toolchain 1.96.0-x86_64-apple-darwin rustc 2>/dev/null
+  )" || die "the Intel-native Rust 1.96.0 toolchain is required"
+  x86_cargo="$(
+    rustup which --toolchain 1.96.0-x86_64-apple-darwin cargo 2>/dev/null
+  )" || die "the Intel-native Rust 1.96.0 toolchain is required"
+  if [ ! -x "$x86_rustc" ] || [ ! -x "$x86_cargo" ]; then
+    die "the Intel-native Rust 1.96.0 toolchain is incomplete"
+  fi
+  arch -x86_64 "$x86_rustc" --version |
+    grep -Fxq 'rustc 1.96.0 (ac68faa20 2026-05-25)' ||
+    die "Rosetta and the exact Intel-native Rust 1.96.0 compiler are required"
   installed_targets="$(rustup target list --installed --toolchain 1.96.0)"
   for release_target in \
     aarch64-apple-darwin \
-    x86_64-apple-darwin \
     x86_64-unknown-linux-musl \
     aarch64-unknown-linux-musl \
     x86_64-pc-windows-msvc
@@ -780,6 +791,7 @@ if [ "$protected_signer" -eq 0 ]; then
   # Any platform/toolchain nondeterminism is fail-closed: a mismatch leaves
   # the tag unsigned and unpublished for explicit investigation.
   release_cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+  x86_toolchain_bin="$(dirname -- "$x86_rustc")"
   RUSTFLAGS="--remap-path-prefix=$source_canonical=/workspace --remap-path-prefix=$release_cargo_home=/cargo --remap-path-prefix=/project=/workspace"
   SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$release_sha")"
   export RUSTFLAGS SOURCE_DATE_EPOCH
@@ -787,7 +799,14 @@ if [ "$protected_signer" -eq 0 ]; then
     cd "$source_dir"
     cargo +1.96.0 build --release --locked --target aarch64-apple-darwin \
       --target-dir "$darwin_arm_dir"
-    cargo +1.96.0 build --release --locked --target x86_64-apple-darwin \
+    # Apple ships different arm64 and x86_64 slices of ld64 under the same
+    # version. They can lay out an Intel Mach-O differently. Reproduce the
+    # Intel CI runner with an Intel-host Rust toolchain and Rosetta so cargo,
+    # rustc, clang, and ld64 all execute as x86_64.
+    arch -x86_64 /usr/bin/env \
+      PATH="$x86_toolchain_bin:$PATH" \
+      RUSTC="$x86_rustc" \
+      "$x86_cargo" build --release --locked --target x86_64-apple-darwin \
       --target-dir "$darwin_x86_dir"
     for darwin_binary in \
       "$darwin_arm_dir/aarch64-apple-darwin/release/sevra" \

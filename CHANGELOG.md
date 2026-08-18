@@ -1,6 +1,15 @@
 # Changelog
 
-## 0.2.12 — 2026-08-18
+## 0.2.13 — 2026-08-18
+
+- Release integrity: the independent arm64 macOS controller now rebuilds the
+  Intel artifact with the Intel-host Rust toolchain under Rosetta. This keeps
+  cargo, rustc, clang, and Apple's architecture-specific `ld64` slice aligned
+  with the hosted Intel runner before the byte comparison. The v0.2.12 attempt
+  proved the other four targets and failed closed on the Intel linker-layout
+  mismatch before reading the offline signer, so no v0.2.12 release exists.
+
+## 0.2.12 — unpublished
 
 - Release integrity: Darwin artifacts now replace Apple's nondeterministic
   `LC_UUID` with a content-derived RFC 4122 UUID and regenerate a stable

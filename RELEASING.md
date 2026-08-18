@@ -24,8 +24,9 @@ both routes to agree for every compatibility generation.
    are enabled before creating the tag. It then waits for Actions to produce
    exactly five unsigned, tag/SHA-attested binaries. Before reading the
    successor key, the wrapper verifies every attestation and rebuilds all five
-   with the same Rust 1.96.0 compiler and locked dependencies: both Darwin
-   targets locally, both Linux targets through digest-pinned Cross images,
+   with the same Rust 1.96.0 compiler and locked dependencies: arm64 Darwin
+   natively, Intel Darwin with the Intel-host toolchain under Rosetta, both
+   Linux targets through digest-pinned Cross images,
    and Windows through SHA-256-pinned cargo-xwin and LLVM tool archives with
    fixed SDK/CRT versions. The rebuild source is a private, read-only archive materialized
    from the exact authorized Git object, never the operator checkout after the
@@ -33,11 +34,25 @@ both routes to agree for every compatibility generation.
    directory so Colima can mount it into the Linux builders without exposing
    it to the worktree. Every downloaded byte must match its independent rebuild.
    Canonical path remapping and `SOURCE_DATE_EPOCH` remove host-path/time
-   variance. Darwin binaries replace the linker's nondeterministic `LC_UUID`
+   variance. Matching the Intel execution architecture matters because the
+   arm64 and x86_64 slices of Apple's `ld64` can produce different valid Intel
+   layouts despite reporting the same release version. Darwin binaries replace
+   the linker's nondeterministic `LC_UUID`
    with a content-derived RFC 4122 UUID, then receive a stable ad-hoc signature
    under the fixed `com.sevra.cli` identifier; both the hosted build and local
    controller apply the same reviewed normalizer. The Windows link also uses
    `/Brepro` and omits the otherwise random CodeView/PDB identifier.
+
+   The reviewed arm64 controller therefore needs Rosetta 2 plus the non-host
+   toolchain installed with:
+
+   ```sh
+   rustup toolchain install 1.96.0-x86_64-apple-darwin \
+     --profile minimal --force-non-host
+   ```
+
+   The wrapper verifies both the exact Intel compiler revision and successful
+   x86_64 execution before it creates the version tag.
 
    For releases after v0.2.10, only after those five byte comparisons pass does
    the wrapper read offline signer B from its dedicated local macOS Keychain
