@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.11 — 2026-08-18
+
+- Integrity: push now uses the same canonical keep-home predicate for snapshot
+  selection and withheld-link declarations. With an active `.sevralocal`, a
+  riding link to a generated `index.md` catalog is classified as intentionally
+  withheld rather than broken, while the catalog body remains local.
+- Portability: secure path handling accepts only the fixed macOS root aliases
+  needed for system temporary-directory resolution without weakening symlink
+  or path-containment checks.
+- Supply chain: successor releases read signer B only from the dedicated,
+  device-local macOS Keychain cache after independent exact-source builds
+  reproduce all five targets. Production update smoke coverage proves both the
+  automatic and explicit signed-update routes.
+
 ## 0.2.9 — 2026-08-15
 
 - Move the old-key compatibility bridge from the protected but unpublished

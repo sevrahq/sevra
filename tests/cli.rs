@@ -2063,6 +2063,47 @@ fn push_declares_only_linked_kept_home_names_and_counts_the_rest() {
 
 #[cfg(unix)]
 #[test]
+fn push_declares_linked_derived_catalogs_as_withheld() {
+    let t = store_dir(&[
+        ("a.md", "Riding content links [[sub/index]]."),
+        ("index.md", "unlinked generated catalog"),
+        ("sub/index.md", "linked generated catalog"),
+        // Any active entry keeps generated catalogs home, even when the entry
+        // itself matches no file in the store.
+        (".sevralocal", "ghost.md\n"),
+    ]);
+    let bin = tempfile::tempdir().unwrap();
+    fake_dbmd(
+        bin.path(),
+        r#"{"store":".","files":[{"path":"a.md","links":["sub/index.md"]},{"path":"index.md","links":[]},{"path":"sub/index.md","links":[]}],"summary":{"files":3,"sources":0,"records":3}}"#,
+    );
+    let (base, log, handle) = mock_hub(vec![(200, push_response(1, 0, 1))]);
+    let out = sevra()
+        .args(["push", t.path().to_str().unwrap(), "--brain", "b"])
+        .env("PATH", bin.path())
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", all_output(&out));
+    assert!(all_output(&out)
+        .contains("1 withheld target name(s) declared; 1 other kept-home file(s) stay unnamed"));
+    handle.join().unwrap();
+
+    let requests = log.lock().unwrap();
+    let body: serde_json::Value = serde_json::from_str(&requests[0].body).unwrap();
+    assert_eq!(body["withheld_paths"], serde_json::json!(["sub/index.md"]),);
+    assert_eq!(body["kept_home_unlinked"], 1);
+    assert!(
+        !requests[0].body.contains("linked generated catalog")
+            && !requests[0].body.contains("unlinked generated catalog"),
+        "catalog bodies must stay local: {}",
+        requests[0].body,
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn push_with_possible_linked_withholding_refuses_without_dbmd_before_network() {
     let t = store_dir(&[
         ("a.md", "Maybe [[private]]."),

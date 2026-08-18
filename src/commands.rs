@@ -1664,7 +1664,11 @@ fn withheld_push_metadata(
             let Some(target) = link.as_str() else {
                 continue;
             };
-            if existing.contains(target) && scope.keeps_home(target) {
+            // Use the exact same keep-home predicate as the snapshot walk.
+            // An active .sevralocal keeps both explicitly matched files and
+            // derived index.md catalogs off the wire; linked catalogs must be
+            // declared withheld too or the hub misclassifies them as broken.
+            if existing.contains(target) && !path_rides(Some(scope), target) {
                 paths.insert(target.to_string());
             }
         }
