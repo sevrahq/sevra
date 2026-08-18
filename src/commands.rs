@@ -45,6 +45,7 @@ const VAULT_EXPORT_FILE: &str = ".sevra-vault.json";
 const VAULT_EXPORT_WARNING: &str = "warning: this export includes recoverable vault values; .sevra-vault.json is as sensitive as the credentials themselves. Store it securely and delete it when no longer needed";
 const SYNC_BASELINE_FILE: &str = ".sevra-sync.json";
 const MAX_SYNC_BASELINE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_WITHHELD_PATH_BYTES: usize = 2 * 1024 * 1024;
 const PULL_JOURNAL_FILE: &str = ".sevra-pull-journal.json";
 const PULL_BACKUP_PREFIX: &str = ".sevra-pull-backup-";
 const PULL_LOCK_FILE: &str = ".sevra-pull.lock";
@@ -62,6 +63,12 @@ struct SyncBaseline {
     feed_hash: Option<String>,
     pack_sha256: Option<String>,
     paths: BTreeMap<String, String>,
+    #[serde(default)]
+    withheld_paths: Vec<String>,
+    #[serde(default)]
+    kept_home_unlinked: usize,
+    #[serde(default)]
+    carried_kept_home_unlinked: usize,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -103,6 +110,8 @@ struct PulledSnapshot {
     pack_sha256: Option<String>,
     entries: Vec<(String, Vec<u8>)>,
     assets: Vec<crate::assets::AssetDeclaration>,
+    withheld_paths: Vec<String>,
+    kept_home_unlinked: usize,
 }
 
 #[derive(Serialize)]
@@ -272,10 +281,49 @@ fn validate_sync_baseline(mut baseline: SyncBaseline) -> Result<SyncBaseline, St
             ));
         }
     }
+    baseline.withheld_paths =
+        validate_hosted_withholding(baseline.withheld_paths, baseline.kept_home_unlinked)?;
+    if baseline
+        .withheld_paths
+        .iter()
+        .any(|path| baseline.paths.contains_key(path))
+    {
+        return Err(format!(
+            "{SYNC_BASELINE_FILE} classifies a riding path as withheld"
+        ));
+    }
+    if baseline.carried_kept_home_unlinked > baseline.kept_home_unlinked {
+        return Err(format!(
+            "{SYNC_BASELINE_FILE} carries more unnamed local-only files than the hosted snapshot"
+        ));
+    }
     // Canonicalize empty optional strings away before later comparisons.
     baseline.feed_hash = baseline.feed_hash.filter(|value| !value.is_empty());
     baseline.pack_sha256 = baseline.pack_sha256.filter(|value| !value.is_empty());
     Ok(baseline)
+}
+
+fn validate_hosted_withholding(
+    mut paths: Vec<String>,
+    kept_home_unlinked: usize,
+) -> Result<Vec<String>, String> {
+    if paths.len() > MAX_STORE_FILES || kept_home_unlinked > MAX_STORE_FILES {
+        return Err("hub returned too much local-only metadata".to_string());
+    }
+    let path_bytes: usize = paths.iter().map(String::len).sum();
+    if path_bytes > MAX_WITHHELD_PATH_BYTES {
+        return Err("hub returned oversized local-only path metadata".to_string());
+    }
+    for path in &paths {
+        validate_portable_core_path(path)
+            .map_err(|_| "hub returned an unsafe local-only path".to_string())?;
+        if !path.ends_with(".md") {
+            return Err("hub returned a non-Markdown local-only path".to_string());
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
 }
 
 fn load_sync_baseline(root: &Path) -> Result<Option<SyncBaseline>, String> {
@@ -532,6 +580,33 @@ fn fetch_snapshot(cfg: &Config, brain: &str, exact: Option<(u64, &str)>) -> Pull
     }
     let assets =
         crate::assets::parse_restore_manifest(manifest).unwrap_or_else(|error| fail(&error, None));
+    let withheld_paths = match response.get("withheldPaths") {
+        None => Vec::new(),
+        Some(Value::Array(paths)) => paths
+            .iter()
+            .map(|path| {
+                path.as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| fail("hub returned malformed local-only metadata", None))
+            })
+            .collect(),
+        Some(_) => fail("hub returned malformed local-only metadata", None),
+    };
+    let kept_home_unlinked = match response.get("keptHomeUnlinked") {
+        None => 0,
+        Some(value) => value
+            .as_u64()
+            .and_then(|count| usize::try_from(count).ok())
+            .unwrap_or_else(|| fail("hub returned malformed local-only metadata", None)),
+    };
+    let withheld_paths = validate_hosted_withholding(withheld_paths, kept_home_unlinked)
+        .unwrap_or_else(|error| fail(&error, None));
+    if withheld_paths
+        .iter()
+        .any(|withheld| entries.iter().any(|(path, _)| path == withheld))
+    {
+        fail("hub classified a present snapshot path as local-only", None);
+    }
     validate_export_paths(
         entries
             .iter()
@@ -549,6 +624,8 @@ fn fetch_snapshot(cfg: &Config, brain: &str, exact: Option<(u64, &str)>) -> Pull
         pack_sha256,
         entries,
         assets,
+        withheld_paths,
+        kept_home_unlinked,
     }
 }
 
@@ -1605,18 +1682,27 @@ fn withheld_push_metadata(
     store: &Store,
     stats: &WalkStats,
     scope: Option<&local::LocalScope>,
+    baseline: Option<&SyncBaseline>,
 ) -> WithheldPushMetadata {
     let kept_total = stats.kept_home + stats.catalogs_kept;
-    let Some(scope) = scope.filter(|scope| scope.active()) else {
+    let active_scope = scope.filter(|scope| scope.active());
+    let trusted_paths: BTreeSet<&str> = baseline
+        .into_iter()
+        .flat_map(|baseline| baseline.withheld_paths.iter().map(String::as_str))
+        .collect();
+    let carried_unlinked = baseline
+        .map(|baseline| baseline.carried_kept_home_unlinked)
+        .unwrap_or(0);
+    if active_scope.is_none() && trusted_paths.is_empty() && carried_unlinked == 0 {
         return WithheldPushMetadata {
             paths: Vec::new(),
             unlinked: 0,
         };
-    };
-    if kept_total == 0 {
+    }
+    if kept_total == 0 && trusted_paths.is_empty() {
         return WithheldPushMetadata {
             paths: Vec::new(),
-            unlinked: 0,
+            unlinked: carried_unlinked,
         };
     }
     // No possible wiki-link token means no name needs parsing or disclosure.
@@ -1625,7 +1711,7 @@ fn withheld_push_metadata(
     if !store.files.iter().any(|file| file.content.contains("[[")) {
         return WithheldPushMetadata {
             paths: Vec::new(),
-            unlinked: kept_total,
+            unlinked: kept_total.saturating_add(carried_unlinked),
         };
     }
 
@@ -1649,6 +1735,7 @@ fn withheld_push_metadata(
         .collect();
     let riding: BTreeSet<&str> = store.files.iter().map(|file| file.path.as_str()).collect();
     let mut paths = BTreeSet::new();
+    let mut locally_withheld = BTreeSet::new();
     for file in &files {
         let Some(src) = file.get("path").and_then(Value::as_str) else {
             continue;
@@ -1665,7 +1752,7 @@ fn withheld_push_metadata(
             let Some(target) = link.as_str() else {
                 continue;
             };
-            if paths.contains(target) || path_rides(Some(scope), target) {
+            if paths.contains(target) || riding.contains(target) {
                 continue;
             }
             // Use the exact same keep-home predicate as the snapshot walk.
@@ -1685,14 +1772,27 @@ fn withheld_push_metadata(
                             None,
                         )
                     }).is_some());
-            if locally_exists {
+            let local_omission = active_scope.is_some_and(|scope| !path_rides(Some(scope), target))
+                && locally_exists;
+            if local_omission {
+                locally_withheld.insert(target.to_string());
+                paths.insert(target.to_string());
+            } else if trusted_paths.contains(target) && !existing.contains(target) {
+                // A clone cannot possess the omitted body. The immutable
+                // snapshot baseline is the proof that this exact missing
+                // target was intentionally withheld at the feed head it
+                // cloned. Reuse that proof only while riding content still
+                // links to the same absent path; every new missing target
+                // remains genuinely broken.
                 paths.insert(target.to_string());
             }
         }
     }
     let paths: Vec<String> = paths.into_iter().collect();
     WithheldPushMetadata {
-        unlinked: kept_total.saturating_sub(paths.len()),
+        unlinked: kept_total
+            .saturating_sub(locally_withheld.len())
+            .saturating_add(carried_unlinked),
         paths,
     }
 }
@@ -1753,8 +1853,14 @@ pub fn push(
     // The markdown walk already validated this file; repeating the secure
     // load binds the following asset decisions to one explicit scope value.
     let scope = local::load(Path::new(dir)).unwrap_or_else(|msg| fail(&msg, None));
-    const MAX_WITHHELD_PATH_BYTES: usize = 2 * 1024 * 1024;
-    let withheld = withheld_push_metadata(dir, &held_root, &store, &stats, scope.as_ref());
+    let withheld = withheld_push_metadata(
+        dir,
+        &held_root,
+        &store,
+        &stats,
+        scope.as_ref(),
+        prior_baseline.as_ref(),
+    );
     let withheld_path_bytes: usize = withheld.paths.iter().map(|path| path.len()).sum();
     if withheld.paths.len() > MAX_STORE_FILES || withheld_path_bytes > MAX_WITHHELD_PATH_BYTES {
         fail(
@@ -1983,6 +2089,13 @@ pub fn push(
         feed_hash: Some(feed_hash),
         pack_sha256: Some(pack_sha256),
         paths: expected_snapshot_hashes(&snapshot_entries, &asset_declarations, scope.as_ref()),
+        withheld_paths: withheld.paths.clone(),
+        kept_home_unlinked: withheld.unlinked,
+        carried_kept_home_unlinked: prior_baseline
+            .as_ref()
+            .map(|baseline| baseline.carried_kept_home_unlinked)
+            .unwrap_or(0)
+            .min(withheld.unlinked),
     };
     write_sync_baseline(&root, &next_baseline).unwrap_or_else(|error| {
         fail(
@@ -4339,6 +4452,9 @@ pub fn clone_brain(cfg: &Config, brain: &str, dir: Option<String>) {
         feed_hash: snapshot.feed_hash.clone(),
         pack_sha256: snapshot.pack_sha256.clone(),
         paths: expected_snapshot_hashes(&snapshot.entries, &snapshot.assets, None),
+        withheld_paths: snapshot.withheld_paths.clone(),
+        kept_home_unlinked: snapshot.kept_home_unlinked,
+        carried_kept_home_unlinked: snapshot.kept_home_unlinked,
     };
     validate_sync_baseline(baseline.clone())
         .unwrap_or_else(|error| fail(&format!("cannot record clone baseline: {error}"), None));
@@ -4449,6 +4565,13 @@ pub fn clone_brain(cfg: &Config, brain: &str, dir: Option<String>) {
             "\nassets: {} restored ({})",
             restore.restored,
             human_size(restore.restored_bytes)
+        ));
+    }
+    if !baseline.withheld_paths.is_empty() || baseline.kept_home_unlinked > 0 {
+        human.push_str(&format!(
+            "\nlocal-only: {} linked target name(s) and {} other file(s) remain on the source machine; their hosted classification is preserved for future pushes",
+            baseline.withheld_paths.len(),
+            baseline.kept_home_unlinked,
         ));
     }
     out_layout(&human, Some(Value::Object(data)));
@@ -4581,6 +4704,17 @@ pub fn pull(cfg: &Config, dir: Option<String>, force: bool) {
     }
 
     let new_hashes = expected_snapshot_hashes(&snapshot.entries, &snapshot.assets, scope.as_ref());
+    let carried_kept_home_unlinked =
+        if snapshot.kept_home_unlinked >= baseline.kept_home_unlinked {
+            baseline
+                .carried_kept_home_unlinked
+                .saturating_add(snapshot.kept_home_unlinked - baseline.kept_home_unlinked)
+        } else {
+            baseline
+                .carried_kept_home_unlinked
+                .saturating_sub(baseline.kept_home_unlinked - snapshot.kept_home_unlinked)
+        }
+        .min(snapshot.kept_home_unlinked);
     let next_baseline = SyncBaseline {
         version: 1,
         brain_id: snapshot.brain_id.clone(),
@@ -4589,6 +4723,9 @@ pub fn pull(cfg: &Config, dir: Option<String>, force: bool) {
         feed_hash: snapshot.feed_hash.clone(),
         pack_sha256: snapshot.pack_sha256.clone(),
         paths: new_hashes.clone(),
+        withheld_paths: snapshot.withheld_paths.clone(),
+        kept_home_unlinked: snapshot.kept_home_unlinked,
+        carried_kept_home_unlinked,
     };
     validate_sync_baseline(next_baseline.clone())
         .unwrap_or_else(|error| fail(&format!("cannot record pull baseline: {error}"), None));

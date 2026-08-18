@@ -2688,6 +2688,85 @@ fn clone_records_a_baseline_and_clean_pull_is_a_noop() {
     assert_eq!(requests[1].path, "/api/hub/brains/brain-1");
 }
 
+#[cfg(unix)]
+#[test]
+fn cloned_push_preserves_only_the_hosted_withholding_classification() {
+    let work = tempfile::tempdir().unwrap();
+    let snapshot = serde_json::json!({
+        "brain": "brain-1",
+        "slug": "b",
+        "headSeq": 1,
+        "feedHash": FEED_ONE,
+        "files": [{
+            "path": "a.md",
+            "content": "Known omission [[private]], genuinely missing [[new]].",
+        }],
+        "withheldPaths": ["private.md"],
+        "keptHomeUnlinked": 4,
+    })
+    .to_string();
+    let bin = tempfile::tempdir().unwrap();
+    fake_dbmd(
+        bin.path(),
+        r#"{"store":".","files":[{"path":"a.md","links":["private.md","new.md"]}],"summary":{"files":1,"sources":0,"records":1}}"#,
+    );
+    let (base, log, handle) = mock_hub(vec![
+        (200, snapshot),
+        (200, r#"{"id":"brain-1"}"#.to_string()),
+        (200, push_response(1, 0, 2)),
+    ]);
+
+    let clone = sevra()
+        .args(["clone", "b", "brain"])
+        .current_dir(work.path())
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(clone.status.success(), "{}", all_output(&clone));
+    assert!(all_output(&clone)
+        .contains("1 linked target name(s) and 4 other file(s) remain on the source machine"));
+    let cloned_baseline: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(work.path().join("brain/.sevra-sync.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        cloned_baseline["withheldPaths"],
+        serde_json::json!(["private.md"])
+    );
+    assert_eq!(cloned_baseline["keptHomeUnlinked"], 4);
+    assert_eq!(cloned_baseline["carriedKeptHomeUnlinked"], 4);
+
+    let push = sevra()
+        .args(["push", "brain", "--brain", "b", "--skip-assets"])
+        .current_dir(work.path())
+        .env("PATH", bin.path())
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(push.status.success(), "{}", all_output(&push));
+    handle.join().unwrap();
+
+    let requests = log.lock().unwrap();
+    let body: serde_json::Value = serde_json::from_str(&requests[2].body).unwrap();
+    assert_eq!(body["withheld_paths"], serde_json::json!(["private.md"]));
+    assert_eq!(body["kept_home_unlinked"], 4);
+    assert!(
+        !body["withheld_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path == "new.md"),
+        "a newly broken target must not inherit trust from the clone baseline",
+    );
+
+    let pushed_baseline: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(work.path().join("brain/.sevra-sync.json")).unwrap())
+            .unwrap();
+    assert_eq!(pushed_baseline["keptHomeUnlinked"], 4);
+    assert_eq!(pushed_baseline["carriedKeptHomeUnlinked"], 4);
+}
+
 #[test]
 fn clone_restores_declared_assets_only_after_exact_sha_verification() {
     let work = tempfile::tempdir().unwrap();

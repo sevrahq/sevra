@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.15 — 2026-08-18
+
+- Sync integrity: clone and pull now retain the exact hosted local-only link
+  classification in `.sevra-sync.json`. An unchanged second-machine push
+  preserves intentionally withheld targets and unnamed kept-home counts,
+  while a newly missing target still remains genuinely broken.
+
 ## 0.2.14 — 2026-08-18
 
 - Release integrity: Linux builds now remap the Rust 1.96.0 x86_64 Linux
