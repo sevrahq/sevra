@@ -31,7 +31,8 @@ sevra logout                                     revoke a browser-minted key + f
 sevra whoami
 
 sevra brains                                     list your brains
-sevra runs <brain>                               show run agents and the manual-only schedule state
+sevra agents <brain>                             show configured agents, sources, flags, and schedule state
+sevra runs <brain>                               show recent run history, outcomes, and errors
 sevra run <brain> <agent>                        manually queue one Sevra-run agent
 sevra create <slug> [--name] [--scope] [--public]
 sevra delete <brain> [--confirm <slug>]          permanently delete a hosted brain (owner-only)
@@ -42,7 +43,7 @@ sevra query <brain> [text] [--type] [--layer] [--meta-type] [--tag] [--where k=v
 sevra query --brain <ref> [text] …               the same query, brain as a flag
 sevra get <brain> <db.md-id|path>
 sevra graph <brain> <path> [--dir in|out|both]
-sevra mcp                                        serve your brains to MCP clients (stdio, read-only)
+sevra mcp                                        serve brain reads and manual runs to MCP clients over stdio
 
 sevra grant <brain> <email> [--write]
 sevra grants <brain>
@@ -85,7 +86,7 @@ The brain vault keeps credentials with the brain, so an agent can retrieve them 
 
 `export` always records the brain's vault names in `.sevra-vault.json` inside the exported directory. Values are absent by default. `--with-secrets` explicitly includes recoverable canonical-base64 values and prints a warning; the resulting 0600 file is as sensitive as the credentials themselves. The dot-prefixed file never rides a later push.
 
-`mcp` serves the hub's read surface (list_brains, search_brain, get_record, graph) to any MCP client over stdio — for agents that cannot run a CLI. Configure the client with `{"command": "sevra", "args": ["mcp"]}`. It uses the stored sign-in (env `SEVRA_API_KEY` / `SEVRA_HUB_URL` override it); without one it reaches public brains only. stdout carries only JSON-RPC frames; notices go to stderr.
+`mcp` serves focused brain tools (list_brains, search_brain, get_record, graph, list_runs, start_run) to any MCP client over stdio, including agents that cannot issue separate CLI commands. `list_runs` discovers exact agent names, configuration flags, the manual-only policy, and recent outcomes. `start_run` queues one explicit Sevra-run agent and can spend the owner's run credits. Configure the client with `{"command": "sevra", "args": ["mcp"]}`. It uses the stored sign-in (env `SEVRA_API_KEY` / `SEVRA_HUB_URL` override it); without one, public reads remain available but manual runs are unauthorized. stdout carries only JSON-RPC frames; notices go to stderr.
 
 ## Built for agents
 

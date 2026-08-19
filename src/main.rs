@@ -74,7 +74,9 @@ enum Commands {
     Whoami,
     /// List your brains
     Brains,
-    /// Show a brain's run agents and manual-only schedule state
+    /// Show a brain's configured run agents and schedule state
+    Agents { brain: String },
+    /// Show a brain's recent run history
     Runs { brain: String },
     /// Manually queue one Sevra-run agent
     Run { brain: String, agent: String },
@@ -176,7 +178,7 @@ enum Commands {
         #[arg(long, value_parser = ["in", "out", "both"])]
         dir: Option<String>,
     },
-    /// Serve your brains to MCP clients over stdio (read-only)
+    /// Serve your brains and manual run controls to MCP clients over stdio
     Mcp,
     /// Grant a person read (or --write) access
     Grant {
@@ -421,6 +423,7 @@ fn main() {
     match cli.command {
         Commands::Whoami => commands::whoami(&cfg),
         Commands::Brains => commands::brains(&cfg),
+        Commands::Agents { brain } => commands::agents(&cfg, &brain),
         Commands::Runs { brain } => commands::runs(&cfg, &brain),
         Commands::Run { brain, agent } => commands::run(&cfg, &brain, &agent),
         Commands::Create {

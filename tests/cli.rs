@@ -580,17 +580,41 @@ fn respond_json(stream: &mut TcpStream, status: u16, body: &str) {
 }
 
 #[test]
-fn runs_show_manual_only_state_and_run_posts_the_agent() {
+fn agents_and_runs_have_distinct_truthful_surfaces_and_run_posts_the_agent() {
     let (base, log, handle) = mock_hub(vec![
         (
             200,
-            r#"{"execution":{"automaticSchedulesEnabled":false,"automaticSchedulesStatus":"temporarily_disabled","manualRunsEnabled":true},"agents":[{"name":"curate\u001b[31m","engine":"sevra","enabled":true,"schedule":"0 3 * * *"}],"runs":[],"billing":{"balanceCents":500,"sevraRunsPaused":false}}"#.to_string(),
+            r#"{"execution":{"automaticSchedulesEnabled":false,"automaticSchedulesStatus":"temporarily_disabled","manualRunsEnabled":true},"configurationIssues":[{"sourceDocPath":"records/broken.md","message":"agent name is required"}],"agents":[{"name":"curate\u001b[31m","engine":"sevra","enabled":true,"schedule":"0 3 * * *","model":"claude-haiku-4-5-20251001","sourceDocPath":"records/agent.md","flags":[]}],"runs":[],"billing":{"balanceCents":500,"sevraRunsPaused":false}}"#.to_string(),
+        ),
+        (
+            200,
+            r#"{"execution":{"automaticSchedulesEnabled":false,"automaticSchedulesStatus":"temporarily_disabled","manualRunsEnabled":true},"agents":[],"runs":[{"id":"01run","agent":"curate\u001b[31m","trigger":"manual","status":"failed","queuedAt":"2026-08-19T12:00:00.000Z","creditsDebitedCents":2,"error":"model unavailable\u001b[31m","outcome":null}],"billing":{"balanceCents":498,"sevraRunsPaused":false}}"#.to_string(),
         ),
         (
             202,
             r#"{"status":"queued","runId":"01test"}"#.to_string(),
         ),
     ]);
+
+    let agents = sevra()
+        .args(["agents", "brain"])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", MOCK_KEY)
+        .output()
+        .unwrap();
+    assert!(agents.status.success(), "{}", all_output(&agents));
+    assert!(!agents.stdout.contains(&0x1b));
+    let human = String::from_utf8(agents.stdout).unwrap();
+    assert!(
+        human.contains("automatic schedules are temporarily off"),
+        "{human}"
+    );
+    assert!(human.contains("manual only"), "{human}");
+    assert!(human.contains("records/agent.md"), "{human}");
+    assert!(
+        human.contains("configuration issue in records/broken.md"),
+        "{human}"
+    );
 
     let listed = sevra()
         .args(["runs", "brain"])
@@ -600,13 +624,10 @@ fn runs_show_manual_only_state_and_run_posts_the_agent() {
         .unwrap();
     assert!(listed.status.success(), "{}", all_output(&listed));
     assert!(!listed.stdout.contains(&0x1b));
-    let human = String::from_utf8(listed.stdout).unwrap();
-    assert!(
-        human.contains("automatic schedules are temporarily off"),
-        "{human}"
-    );
-    assert!(human.contains("manual only"), "{human}");
-    assert!(human.contains("sevra run brain <agent>"), "{human}");
+    let history = String::from_utf8(listed.stdout).unwrap();
+    assert!(history.contains("failed"), "{history}");
+    assert!(history.contains("model unavailable"), "{history}");
+    assert!(history.contains("2c debited"), "{history}");
 
     let queued = sevra()
         .args(["run", "brain", "curate"])
@@ -619,13 +640,15 @@ fn runs_show_manual_only_state_and_run_posts_the_agent() {
 
     handle.join().unwrap();
     let requests = log.lock().unwrap();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
     assert_eq!(requests[0].method, "GET");
     assert_eq!(requests[0].path, "/api/hub/brains/brain/runs");
-    assert_eq!(requests[1].method, "POST");
+    assert_eq!(requests[1].method, "GET");
     assert_eq!(requests[1].path, "/api/hub/brains/brain/runs");
+    assert_eq!(requests[2].method, "POST");
+    assert_eq!(requests[2].path, "/api/hub/brains/brain/runs");
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&requests[1].body).unwrap(),
+        serde_json::from_str::<serde_json::Value>(&requests[2].body).unwrap(),
         serde_json::json!({ "agent": "curate" })
     );
 }
@@ -1157,6 +1180,41 @@ fn mcp_tools_call_reaches_the_hub_with_the_stored_bearer() {
         stdout.contains("01brain"),
         "the tool text carries the hub body: {stdout}"
     );
+}
+
+#[test]
+fn mcp_start_run_posts_the_exact_agent_with_the_stored_bearer() {
+    let (base, log, handle) = mock_hub(vec![(
+        202,
+        r#"{"status":"queued","runId":"01run"}"#.to_string(),
+    )]);
+    let out = sevra()
+        .arg("mcp")
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "sevra_account_mcp")
+        .write_stdin(concat!(
+            r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"start_run","arguments":{"brain":"work","agent":"curator"}}}"#,
+            "\n"
+        ))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", all_output(&out));
+    handle.join().unwrap();
+    let reqs = log.lock().unwrap();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].method, "POST");
+    assert_eq!(reqs[0].path, "/api/hub/brains/work/runs");
+    assert_eq!(
+        reqs[0].authorization.as_deref(),
+        Some("Bearer sevra_account_mcp")
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&reqs[0].body).unwrap(),
+        serde_json::json!({ "agent": "curator" })
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(r#""isError":false"#), "{stdout}");
+    assert!(stdout.contains("01run"), "{stdout}");
 }
 
 // --- push preflights, --force, delete, query --brain (the 0.2.4 surface) -----

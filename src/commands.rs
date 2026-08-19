@@ -1381,8 +1381,8 @@ pub fn brains(cfg: &Config) {
     }
 }
 
-pub fn runs(cfg: &Config, brain: &str) {
-    let r = ensure_ok(
+fn run_surface(cfg: &Config, brain: &str, action: &str) -> Value {
+    ensure_ok(
         request(
             cfg,
             "GET",
@@ -1390,13 +1390,11 @@ pub fn runs(cfg: &Config, brain: &str) {
             None,
             true,
         ),
-        "list runs",
-    );
-    if json_mode() {
-        out("", Some(r));
-        return;
-    }
+        action,
+    )
+}
 
+fn show_run_policy(r: &Value, brain: &str) {
     let automatic = r
         .pointer("/execution/automaticSchedulesEnabled")
         .and_then(Value::as_bool)
@@ -1406,20 +1404,52 @@ pub fn runs(cfg: &Config, brain: &str) {
     } else {
         out(
             &format!(
-                "automatic schedules are temporarily off. Nothing runs from a schedule; use `sevra run {} <agent>` or the dashboard",
+                "automatic schedules are temporarily off. Sevra does not dispatch them; use `sevra run {} <agent>` or the dashboard",
                 terminal_safe(brain)
             ),
             None,
         );
     }
+}
 
+pub fn agents(cfg: &Config, brain: &str) {
+    let r = run_surface(cfg, brain, "list agents");
+    if json_mode() {
+        out("", Some(r));
+        return;
+    }
+    show_run_policy(&r, brain);
+
+    let issues = r
+        .get("configurationIssues")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for issue in issues {
+        out(
+            &format!(
+                "configuration issue in {}: {}",
+                terminal_safe(str_field(&issue, "sourceDocPath")),
+                terminal_safe(str_field(&issue, "message"))
+            ),
+            None,
+        );
+    }
+
+    let automatic = r
+        .pointer("/execution/automaticSchedulesEnabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let agents = r
         .get("agents")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
     if agents.is_empty() {
-        out("no run agents are configured on this brain", None);
+        out(
+            "no run agents are configured. Add an `agent:` block to a brain record, then sync",
+            None,
+        );
         return;
     }
     for agent in agents {
@@ -1430,23 +1460,88 @@ pub fn runs(cfg: &Config, brain: &str) {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let schedule = agent.get("schedule").and_then(Value::as_str);
+        let source = terminal_safe(str_field(&agent, "sourceDocPath"));
+        let model = terminal_safe(str_field(&agent, "model"));
         let state = if !enabled {
             "disabled".to_string()
         } else if engine == "byo" {
-            "runs on your agent".to_string()
+            match schedule {
+                Some(value) => format!(
+                    "runs on your AI; schedule {} must be dispatched by your runtime",
+                    terminal_safe(value)
+                ),
+                None => "runs on your AI; never metered by Sevra".to_string(),
+            }
         } else if let Some(schedule) = schedule {
             if automatic {
                 format!("scheduled ({})", terminal_safe(schedule))
             } else {
                 format!(
-                    "manual only; configured schedule {} is temporarily off",
+                    "manual only; saved schedule {} is temporarily off",
                     terminal_safe(schedule)
                 )
             }
         } else {
             "manual only".to_string()
         };
-        out_layout(&format!("{name}\t{engine}\t{state}"), None);
+        out_layout(
+            &format!("{name}\t{engine}\t{state}\t{model}\t{source}"),
+            None,
+        );
+
+        if let Some(flags) = agent.get("flags").and_then(Value::as_array) {
+            for flag in flags.iter().filter_map(Value::as_str) {
+                out(
+                    &format!("  configuration issue: {}", terminal_safe(flag)),
+                    None,
+                );
+            }
+        }
+    }
+}
+
+pub fn runs(cfg: &Config, brain: &str) {
+    let r = run_surface(cfg, brain, "list runs");
+    if json_mode() {
+        out("", Some(r));
+        return;
+    }
+    show_run_policy(&r, brain);
+    let runs = r
+        .get("runs")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if runs.is_empty() {
+        out("no runs recorded on this brain", None);
+        return;
+    }
+    for run in runs {
+        let name = terminal_safe(str_field(&run, "agent"));
+        let status = terminal_safe(str_field(&run, "status"));
+        let trigger = terminal_safe(str_field(&run, "trigger"));
+        let queued = terminal_safe(str_field(&run, "queuedAt"));
+        let debit = run
+            .get("creditsDebitedCents")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        out_layout(
+            &format!(
+                "{status}\t{name}\t{trigger}\t{queued}{}",
+                if debit > 0 {
+                    format!("\t{debit}c debited")
+                } else {
+                    String::new()
+                }
+            ),
+            None,
+        );
+        let detail = [str_field(&run, "error"), str_field(&run, "outcome")]
+            .into_iter()
+            .find(|value| !value.is_empty());
+        if let Some(detail) = detail {
+            out(&format!("  {}", terminal_safe(detail)), None);
+        }
     }
 }
 

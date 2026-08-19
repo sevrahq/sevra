@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.19 — 2026-08-19
+
 - Sync: new permissioned incremental brains negotiate through a typed hub
   response and delegate clone, pull, and push to `dbmd`. Sevra retains local
   secret, path, and asset preflights, records the brain identity locally, and
@@ -10,6 +12,11 @@
   behavior. The client changes protocol only on `v2_sync_required`, so an
   arbitrary 404, legacy response, or transport failure cannot trigger a
   silent fallback.
+- Runs: `sevra agents <brain>` now owns agent discovery, source paths,
+  configuration flags, and the saved schedule policy. `sevra runs <brain>`
+  now means recent run history and shows terminal outcomes and errors.
+- MCP: the stdio server adds `list_runs` and explicit `start_run`. Starting a
+  run requires both the brain and exact agent name and uses the stored sign-in.
 
 ## 0.2.18 — 2026-08-19
 

@@ -1,13 +1,13 @@
-//! `sevra mcp` — a stdio MCP server over the hub's read surface (the
+//! `sevra mcp` — a stdio MCP server over the hub's focused brain surface (the
 //! supported secondary reach path; the CLI stays primary). An agent that
 //! speaks MCP but cannot run a CLI — a chat app, a remote agent with no local
 //! files — points its client at `{"command":"sevra","args":["mcp"]}` and
 //! reaches the signed-in account's brains.
 //!
 //! A faithful port of the hub's MCP core: newline-delimited JSON-RPC 2.0 on
-//! stdin/stdout; the same four read-only tools (list_brains / search_brain /
-//! get_record / graph) over the same hub GET endpoints, with the same result
-//! and isError shapes. The tool surface is deliberately TIGHT — a small
+//! stdin/stdout; read/reach tools plus explicit run discovery and one manual
+//! run control, with the same hub result and isError shapes. The tool surface
+//! is deliberately TIGHT — a small
 //! schema sidesteps MCP's tool-schema context bloat, the exact failure mode
 //! the CLI-first policy guards against.
 //!
@@ -36,7 +36,7 @@ const SERVER_NAME: &str = "sevra-brain";
 const MAX_MCP_FRAME_BYTES: usize = 1024 * 1024;
 
 const INSTRUCTIONS: &str = "A Sevra brain over MCP: a db.md store (plain-file records + sources). \
-     Prefer the `dbmd` CLI for local/write-heavy work; these tools are the read/reach surface. \
+     Prefer the `dbmd` CLI for local/write-heavy work; these tools cover read/reach and explicit manual runs. \
      Start with list_brains.";
 
 /// One hub read-API answer. `body` is `Value::Null` when the response carried
@@ -52,6 +52,7 @@ struct HubGet {
 /// transport trouble becomes a 502-shaped `Ok` the model can read.
 trait McpHubClient {
     fn get(&self, path: &str) -> Result<HubGet, String>;
+    fn post(&self, path: &str, body: &Value) -> Result<HubGet, String>;
 }
 
 fn log(msg: &str) {
@@ -110,6 +111,31 @@ fn tools() -> Value {
                     "dir": { "type": "string", "enum": ["in", "out", "both"], "description": "Direction (default both)." },
                 },
                 "required": ["brain", "path"],
+                "additionalProperties": false,
+            },
+        },
+        {
+            "name": "list_runs",
+            "description": "List a brain's configured run agents, source paths, validation flags, manual-only policy, credit state, and recent run outcomes. Call this before start_run to discover the exact agent name.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "brain": { "type": "string", "description": "Brain id or slug." },
+                },
+                "required": ["brain"],
+                "additionalProperties": false,
+            },
+        },
+        {
+            "name": "start_run",
+            "description": "Manually queue one enabled Sevra-run agent. This can spend the brain owner's run credits. Automatic schedules remain separate and temporarily disabled.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "brain": { "type": "string", "description": "Brain id or slug." },
+                    "agent": { "type": "string", "description": "Exact configured agent name from list_runs." },
+                },
+                "required": ["brain", "agent"],
                 "additionalProperties": false,
             },
         },
@@ -216,6 +242,20 @@ fn call_tool(name: &str, args: &Value, client: &dyn McpHubClient) -> Result<Valu
                 "/api/hub/brains/{b}/graph{}",
                 qs(&[("path", path), ("dir", owned("dir"))])
             ))?
+        }
+        "list_runs" => client.get(&format!("/api/hub/brains/{b}/runs"))?,
+        "start_run" => {
+            let agent = owned("agent");
+            if agent.is_none() {
+                return Ok(tool_result(
+                    &json!({ "error": "`agent` is required" }),
+                    true,
+                ));
+            }
+            client.post(
+                &format!("/api/hub/brains/{b}/runs"),
+                &json!({ "agent": agent }),
+            )?
         }
         _ => {
             return Ok(tool_result(
@@ -375,6 +415,19 @@ impl McpHubClient for ApiClient<'_> {
             }),
         }
     }
+
+    fn post(&self, path: &str, body: &Value) -> Result<HubGet, String> {
+        match hub::try_request(self.cfg, "POST", path, Some(body), true) {
+            Ok(r) => Ok(HubGet {
+                status: r.status,
+                body: r.body.unwrap_or(Value::Null),
+            }),
+            Err(t) => Ok(HubGet {
+                status: 502,
+                body: json!({ "error": t }),
+            }),
+        }
+    }
 }
 
 /// `sevra mcp`: serve until stdin closes. Exits 0 when the client hangs up.
@@ -484,6 +537,17 @@ mod tests {
                 Err(e) => Err(e.clone()),
             }
         }
+
+        fn post(&self, path: &str, body: &Value) -> Result<HubGet, String> {
+            self.calls.borrow_mut().push(format!("POST {path} {body}"));
+            match &self.response {
+                Ok((status, response)) => Ok(HubGet {
+                    status: *status,
+                    body: response.clone(),
+                }),
+                Err(e) => Err(e.clone()),
+            }
+        }
     }
 
     fn handle(msg: Value, client: &dyn McpHubClient) -> Option<Value> {
@@ -579,7 +643,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_is_the_tight_read_surface() {
+    fn tools_list_is_the_tight_brain_surface() {
         let mock = Mock::with(200, json!({}));
         let resp = handle(
             json!({ "jsonrpc": "2.0", "id": 5, "method": "tools/list" }),
@@ -590,7 +654,14 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(
             names,
-            ["list_brains", "search_brain", "get_record", "graph"]
+            [
+                "list_brains",
+                "search_brain",
+                "get_record",
+                "graph",
+                "list_runs",
+                "start_run"
+            ]
         );
         for tool in tools {
             assert_eq!(tool["inputSchema"]["additionalProperties"], false);
@@ -600,6 +671,11 @@ mod tests {
         assert_eq!(
             tools[3]["inputSchema"]["required"],
             json!(["brain", "path"])
+        );
+        assert_eq!(tools[4]["inputSchema"]["required"], json!(["brain"]));
+        assert_eq!(
+            tools[5]["inputSchema"]["required"],
+            json!(["brain", "agent"])
         );
     }
 
@@ -717,6 +793,52 @@ mod tests {
         .unwrap();
         assert_eq!(resp["result"]["isError"], true);
         assert_eq!(tool_text(&resp), json!({ "error": "`path` is required" }));
+    }
+
+    #[test]
+    fn list_runs_reads_the_full_run_surface() {
+        let body = json!({ "agents": [{ "name": "curator" }], "runs": [] });
+        let mock = Mock::with(200, body.clone());
+        let resp = handle(
+            json!({ "jsonrpc": "2.0", "id": 15, "method": "tools/call",
+                    "params": { "name": "list_runs", "arguments": { "brain": "work" } } }),
+            &mock,
+        )
+        .unwrap();
+        assert_eq!(mock.calls(), ["/api/hub/brains/work/runs"]);
+        assert_eq!(resp["result"]["isError"], false);
+        assert_eq!(tool_text(&resp), body);
+    }
+
+    #[test]
+    fn start_run_requires_an_agent_then_posts_it() {
+        let mock = Mock::with(202, json!({ "status": "queued", "runId": "01run" }));
+        let missing = handle(
+            json!({ "jsonrpc": "2.0", "id": 16, "method": "tools/call",
+                    "params": { "name": "start_run", "arguments": { "brain": "work" } } }),
+            &mock,
+        )
+        .unwrap();
+        assert_eq!(missing["result"]["isError"], true);
+        assert_eq!(
+            tool_text(&missing),
+            json!({ "error": "`agent` is required" })
+        );
+        assert!(mock.calls().is_empty());
+
+        let queued = handle(
+            json!({ "jsonrpc": "2.0", "id": 17, "method": "tools/call",
+                    "params": { "name": "start_run", "arguments": {
+                        "brain": "work", "agent": "curator" } } }),
+            &mock,
+        )
+        .unwrap();
+        assert_eq!(queued["result"]["isError"], false);
+        assert_eq!(tool_text(&queued)["status"], "queued");
+        assert_eq!(
+            mock.calls(),
+            [r#"POST /api/hub/brains/work/runs {"agent":"curator"}"#]
+        );
     }
 
     #[test]
