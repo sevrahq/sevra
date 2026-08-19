@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.17 — 2026-08-18
+
+- Transfer performance: initial sync and restore now plan assets in windows of
+  128, reuse pooled HTTP connections, and run up to eight byte streams in
+  parallel. Each upload window performs one aggregate quota reservation and
+  confirmation; successful members are durably confirmed before interrupted
+  members retry with fresh capabilities.
+- Observability: push and restore JSON now report transfer-window counts, hub
+  request counts, and phase timings. Human push output includes total asset
+  sync time, making real-brain throughput regressions visible.
+
 ## 0.2.16 — 2026-08-18
 
 - Clone resilience: asset restore now retries transient hub, object-storage,

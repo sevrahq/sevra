@@ -17,11 +17,11 @@
 //! once the manifest naming it has been ingested (`undeclared_asset`
 //! otherwise), which is why sync runs strictly AFTER the snapshot commit.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -29,7 +29,8 @@ use sha2::{Digest, Sha256};
 use crate::commands::{contained, human_size};
 use crate::config::Config;
 use crate::hub::{
-    ensure_ok, get_presigned_to_writer, hub_error_message, put_presigned_file, request, try_request,
+    ensure_ok, get_presigned_to_writer, hub_error_message, put_presigned_file_result, request,
+    try_request,
 };
 use crate::local::LocalScope;
 use crate::output::{fail, note};
@@ -55,6 +56,55 @@ const RESTORE_RETRY_BACKOFF: [Duration; 6] = [
     Duration::from_secs(16),
     Duration::from_secs(30),
 ];
+/// One request remains comfortably below the hub body cap and its five-minute
+/// signed-URL lifetime, while collapsing hundreds of auth/quota round-trips.
+const TRANSFER_WINDOW: usize = 128;
+/// Enough parallel streams to fill a normal uplink without making the local
+/// machine, R2, or a shared network connection absorb an unbounded burst.
+const TRANSFER_CONCURRENCY: usize = 8;
+
+#[derive(Debug)]
+enum RestoreAttemptError {
+    Retryable(String),
+    Fatal(String),
+}
+
+fn transfer_window_response(
+    cfg: &Config,
+    brain: &str,
+    action: &str,
+    hashes: Vec<&str>,
+) -> Result<Value, RestoreAttemptError> {
+    let response = try_request(
+        cfg,
+        "POST",
+        &format!("/api/hub/brains/{}/assets/transfer", enc(brain)),
+        Some(&json!({ "action": action, "sha256s": hashes })),
+        true,
+    )
+    .map_err(|error| {
+        RestoreAttemptError::Retryable(format!(
+            "could not request a fresh transfer window: {error}"
+        ))
+    })?;
+    if !(200..300).contains(&response.status) {
+        let message = format!(
+            "prepare asset transfer failed (HTTP {}): {}",
+            response.status,
+            hub_error_message(&response),
+        );
+        return Err(
+            if response.status == 408 || response.status == 429 || response.status >= 500 {
+                RestoreAttemptError::Retryable(message)
+            } else {
+                RestoreAttemptError::Fatal(message)
+            },
+        );
+    }
+    response
+        .body
+        .ok_or_else(|| RestoreAttemptError::Fatal("hub returned no transfer response".into()))
+}
 
 fn reject_symlink_components(root: &Path, rel: &str) -> Result<(), String> {
     let mut current = root.to_path_buf();
@@ -278,6 +328,13 @@ pub struct SyncReport {
     pub kept_home: usize,
     pub missing_local: usize,
     pub drifted: usize,
+    pub windows: usize,
+    pub hub_requests: usize,
+    pub staging_ms: u64,
+    pub planning_ms: u64,
+    pub transfer_ms: u64,
+    pub confirm_ms: u64,
+    pub elapsed_ms: u64,
 }
 
 impl SyncReport {
@@ -289,8 +346,287 @@ impl SyncReport {
             "keptHome": self.kept_home,
             "missingLocal": self.missing_local,
             "drifted": self.drifted,
+            "windows": self.windows,
+            "hubRequests": self.hub_requests,
+            "stagingMs": self.staging_ms,
+            "planningMs": self.planning_ms,
+            "transferMs": self.transfer_ms,
+            "confirmMs": self.confirm_ms,
+            "elapsedMs": self.elapsed_ms,
         })
     }
+}
+
+fn elapsed_ms(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+struct StagedUpload {
+    sha256: String,
+    bytes: u64,
+    display_path: String,
+    stage: AssetStage,
+}
+
+#[derive(Clone)]
+struct UploadCapability {
+    upload_index: usize,
+    url: String,
+    headers: Value,
+    reservation_id: String,
+}
+
+fn plan_upload_window(
+    cfg: &Config,
+    brain: &str,
+    uploads: &[StagedUpload],
+    indices: &[usize],
+) -> Result<(Vec<usize>, Vec<UploadCapability>), RestoreAttemptError> {
+    let hashes: Vec<&str> = indices
+        .iter()
+        .map(|index| uploads[*index].sha256.as_str())
+        .collect();
+    let planned = transfer_window_response(cfg, brain, "put", hashes)?;
+    let items = planned
+        .get("items")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| fail("hub returned no asset transfer items", None));
+    if items.len() != indices.len() {
+        fail("hub returned an incomplete asset transfer window", None);
+    }
+    let mut expected: BTreeMap<&str, usize> = indices
+        .iter()
+        .map(|index| (uploads[*index].sha256.as_str(), *index))
+        .collect();
+    let mut already_present = Vec::new();
+    let mut capabilities = Vec::new();
+    for item in items {
+        let sha256 = item
+            .get("sha256")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| fail("hub returned an asset transfer item without a hash", None));
+        let Some(upload_index) = expected.remove(sha256) else {
+            fail(
+                "hub returned an unexpected or duplicate transfer hash",
+                None,
+            );
+        };
+        if item
+            .get("alreadyPresent")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            if item.get("bytes").and_then(Value::as_u64) != Some(uploads[upload_index].bytes) {
+                fail(
+                    "hub returned inconsistent bytes for an existing asset",
+                    None,
+                );
+            }
+            already_present.push(upload_index);
+            continue;
+        }
+        let url = item
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| fail("hub returned no asset upload URL", None));
+        let reservation_id = item
+            .get("reservationId")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| fail("hub returned no asset reservation id", None));
+        capabilities.push(UploadCapability {
+            upload_index,
+            url: url.to_string(),
+            headers: item.get("headers").cloned().unwrap_or(Value::Null),
+            reservation_id: reservation_id.to_string(),
+        });
+    }
+    if !expected.is_empty() {
+        fail("hub omitted a requested asset transfer hash", None);
+    }
+    Ok((already_present, capabilities))
+}
+
+fn upload_capabilities(
+    cfg: &Config,
+    uploads: &[StagedUpload],
+    capabilities: &[UploadCapability],
+) -> Vec<(UploadCapability, Result<(), String>)> {
+    let mut results = Vec::with_capacity(capabilities.len());
+    for group in capabilities.chunks(TRANSFER_CONCURRENCY) {
+        let completed = std::thread::scope(|scope| {
+            let handles: Vec<_> = group
+                .iter()
+                .map(|capability| {
+                    scope.spawn(move || {
+                        let upload = &uploads[capability.upload_index];
+                        put_presigned_file_result(
+                            cfg,
+                            &capability.url,
+                            &capability.headers,
+                            &upload.stage.file,
+                            upload.bytes,
+                        )
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .enumerate()
+                .map(|(index, handle)| {
+                    let result = handle.join().unwrap_or_else(|_| {
+                        Err("asset upload worker terminated unexpectedly".to_string())
+                    });
+                    (group[index].clone(), result)
+                })
+                .collect::<Vec<_>>()
+        });
+        results.extend(completed);
+    }
+    results
+}
+
+fn confirm_upload_window(
+    cfg: &Config,
+    brain: &str,
+    uploads: &[StagedUpload],
+    capabilities: &[UploadCapability],
+) {
+    let items: Vec<Value> = capabilities
+        .iter()
+        .map(|capability| {
+            json!({
+                "sha256": uploads[capability.upload_index].sha256,
+                "reservationId": capability.reservation_id,
+            })
+        })
+        .collect();
+    ensure_ok(
+        request(
+            cfg,
+            "POST",
+            &format!("/api/hub/brains/{}/assets/transfer/confirm", enc(brain),),
+            Some(&json!({ "items": items })),
+            true,
+        ),
+        "confirm asset transfer window",
+    );
+}
+
+fn sync_staged_window(
+    cfg: &Config,
+    brain: &str,
+    uploads: &[StagedUpload],
+    report: &mut SyncReport,
+) -> bool {
+    let mut remaining: Vec<usize> = (0..uploads.len()).collect();
+    let mut progressed = false;
+    for (attempt, retry_pause) in RESTORE_RETRY_BACKOFF
+        .iter()
+        .copied()
+        .map(Some)
+        .chain(std::iter::once(None))
+        .enumerate()
+    {
+        let planning_started = Instant::now();
+        let planned = plan_upload_window(cfg, brain, uploads, &remaining);
+        report.planning_ms = report
+            .planning_ms
+            .saturating_add(elapsed_ms(planning_started));
+        report.windows += 1;
+        report.hub_requests += 1;
+        let (already_present, capabilities) = match planned {
+            Ok(planned) => planned,
+            Err(RestoreAttemptError::Fatal(error)) => fail(&error, None),
+            Err(RestoreAttemptError::Retryable(error)) => {
+                let Some(pause) = retry_pause else {
+                    fail(
+                        &format!(
+                            "asset transfer planning failed after {} attempts: {error}",
+                            RESTORE_RETRY_BACKOFF.len() + 1,
+                        ),
+                        None,
+                    );
+                };
+                note(&format!(
+                    "asset transfer planning was interrupted; retrying in {}s ({}/{}) — {error}",
+                    pause.as_secs(),
+                    attempt + 1,
+                    RESTORE_RETRY_BACKOFF.len(),
+                ));
+                std::thread::sleep(pause);
+                continue;
+            }
+        };
+        for index in already_present {
+            report.already_present += 1;
+            progressed = true;
+            note(&format!(
+                "asset {} already present ({})",
+                uploads[index].display_path,
+                human_size(uploads[index].bytes),
+            ));
+        }
+
+        let transfer_started = Instant::now();
+        let results = upload_capabilities(cfg, uploads, &capabilities);
+        report.transfer_ms = report
+            .transfer_ms
+            .saturating_add(elapsed_ms(transfer_started));
+        let mut succeeded = Vec::new();
+        let mut failed = Vec::new();
+        for (capability, result) in results {
+            match result {
+                Ok(()) => succeeded.push(capability),
+                Err(error) => failed.push((capability.upload_index, error)),
+            }
+        }
+        if !succeeded.is_empty() {
+            let confirm_started = Instant::now();
+            confirm_upload_window(cfg, brain, uploads, &succeeded);
+            report.confirm_ms = report
+                .confirm_ms
+                .saturating_add(elapsed_ms(confirm_started));
+            report.hub_requests += 1;
+            for capability in &succeeded {
+                let upload = &uploads[capability.upload_index];
+                note(&format!(
+                    "asset {} uploaded ({})",
+                    upload.display_path,
+                    human_size(upload.bytes),
+                ));
+                report.uploaded += 1;
+                report.uploaded_bytes = report.uploaded_bytes.saturating_add(upload.bytes);
+                progressed = true;
+            }
+        }
+        if failed.is_empty() {
+            return progressed;
+        }
+        let Some(pause) = retry_pause else {
+            let details = failed
+                .iter()
+                .map(|(index, error)| format!("{}: {error}", uploads[*index].display_path))
+                .collect::<Vec<_>>()
+                .join("; ");
+            fail(
+                &format!(
+                    "asset transfer failed after {} attempts: {details}",
+                    RESTORE_RETRY_BACKOFF.len() + 1,
+                ),
+                None,
+            );
+        };
+        note(&format!(
+            "{} asset upload(s) interrupted; confirmed the successful uploads and retrying in {}s ({}/{})",
+            failed.len(),
+            pause.as_secs(),
+            attempt + 1,
+            RESTORE_RETRY_BACKOFF.len(),
+        ));
+        std::thread::sleep(pause);
+        remaining = failed.into_iter().map(|(index, _)| index).collect();
+    }
+    progressed
 }
 
 fn enc(s: &str) -> String {
@@ -351,6 +687,7 @@ pub fn sync_after_push(
     dir: &str,
     scope: Option<&LocalScope>,
 ) -> SyncReport {
+    let sync_started = Instant::now();
     let root = Path::new(dir);
     let mut report = SyncReport {
         uploaded: 0,
@@ -359,6 +696,13 @@ pub fn sync_after_push(
         kept_home: 0,
         missing_local: 0,
         drifted: 0,
+        windows: 0,
+        hub_requests: 0,
+        staging_ms: 0,
+        planning_ms: 0,
+        transfer_ms: 0,
+        confirm_ms: 0,
+        elapsed_ms: 0,
     };
 
     // The missing set only shrinks as confirms land, so a truncated first
@@ -366,6 +710,7 @@ pub fn sync_after_push(
     // ends the loop (every remaining row was skipped as kept-home/missing).
     loop {
         let (missing, truncated) = missing_assets(cfg, brain);
+        report.hub_requests += 1;
         if missing.is_empty() {
             break;
         }
@@ -379,6 +724,7 @@ pub fn sync_after_push(
         }
 
         let mut progressed = false;
+        let mut staged_window = Vec::with_capacity(TRANSFER_WINDOW);
         for (sha256, (declared_bytes, paths)) in &by_sha {
             if *declared_bytes > MAX_ASSET_BYTES {
                 note(&format!(
@@ -393,6 +739,7 @@ pub fn sync_after_push(
             // manifest. A drifted file (edited since `dbmd assets scan`) is
             // named and skipped — re-scan and push again to update the
             // declaration.
+            let staging_started = Instant::now();
             let mut staged: Option<AssetStage> = None;
             let mut kept = 0usize;
             let mut absent = 0usize;
@@ -419,6 +766,9 @@ pub fn sync_after_push(
                 report.drifted += 1;
             }
             let Some(staged) = staged else {
+                report.staging_ms = report
+                    .staging_ms
+                    .saturating_add(elapsed_ms(staging_started));
                 if kept > 0 && kept == paths.len() {
                     report.kept_home += kept;
                 } else if report.drifted == 0 || absent > 0 {
@@ -431,69 +781,29 @@ pub fn sync_after_push(
                 }
                 continue;
             };
-
-            let presigned = ensure_ok(
-                request(
-                    cfg,
-                    "GET",
-                    &format!(
-                        "/api/hub/brains/{}/assets/presign?sha256={}&action=put",
-                        enc(brain),
-                        sha256
-                    ),
-                    None,
-                    true,
-                ),
-                "prepare asset upload",
-            );
-            if presigned
-                .get("alreadyPresent")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                report.already_present += 1;
-                progressed = true;
-                continue;
+            report.staging_ms = report
+                .staging_ms
+                .saturating_add(elapsed_ms(staging_started));
+            staged_window.push(StagedUpload {
+                sha256: sha256.clone(),
+                bytes: *declared_bytes,
+                display_path: paths.first().cloned().unwrap_or_else(|| sha256.clone()),
+                stage: staged,
+            });
+            if staged_window.len() == TRANSFER_WINDOW {
+                progressed |= sync_staged_window(cfg, brain, &staged_window, &mut report);
+                staged_window.clear();
             }
-            let url = presigned
-                .get("url")
-                .and_then(Value::as_str)
-                .unwrap_or_else(|| fail("hub returned no asset upload URL", None));
-            let reservation_id = presigned
-                .get("reservationId")
-                .and_then(Value::as_str)
-                .unwrap_or_else(|| fail("hub returned no asset reservation id", None));
-            put_presigned_file(
-                cfg,
-                url,
-                presigned.get("headers").unwrap_or(&Value::Null),
-                &staged.file,
-                *declared_bytes,
-            );
-            ensure_ok(
-                request(
-                    cfg,
-                    "POST",
-                    &format!("/api/hub/brains/{}/assets/confirm", enc(brain)),
-                    Some(&json!({ "sha256": sha256, "reservationId": reservation_id })),
-                    true,
-                ),
-                "confirm asset upload",
-            );
-            note(&format!(
-                "asset {} uploaded ({})",
-                paths.first().map(String::as_str).unwrap_or(sha256),
-                human_size(*declared_bytes)
-            ));
-            report.uploaded += 1;
-            report.uploaded_bytes += *declared_bytes;
-            progressed = true;
+        }
+        if !staged_window.is_empty() {
+            progressed |= sync_staged_window(cfg, brain, &staged_window, &mut report);
         }
 
         if !truncated || !progressed {
             break;
         }
     }
+    report.elapsed_ms = elapsed_ms(sync_started);
     report
 }
 
@@ -865,6 +1175,11 @@ impl PreparedAsset {
 pub struct PreparedRestore {
     assets: Vec<PreparedAsset>,
     present: usize,
+    windows: usize,
+    hub_requests: usize,
+    planning_ms: u64,
+    transfer_ms: u64,
+    elapsed_ms: u64,
 }
 
 impl PreparedRestore {
@@ -882,16 +1197,16 @@ impl PreparedRestore {
             restored_bytes: self.assets.iter().map(|asset| asset.bytes).sum(),
             present: self.present,
             failed: 0,
+            windows: self.windows,
+            hub_requests: self.hub_requests,
+            planning_ms: self.planning_ms,
+            transfer_ms: self.transfer_ms,
+            elapsed_ms: self.elapsed_ms,
         }
     }
 }
 
-#[derive(Debug)]
-enum RestoreAttemptError {
-    Retryable(String),
-    Fatal(String),
-}
-
+#[cfg(test)]
 fn with_restore_retries<T>(
     path: &str,
     backoff: &[Duration],
@@ -922,52 +1237,66 @@ fn with_restore_retries<T>(
     }
 }
 
-fn download_asset_stage_once(
+#[derive(Clone)]
+struct DownloadCapability {
+    declaration_index: usize,
+    url: String,
+}
+
+fn plan_download_window(
     cfg: &Config,
     brain: &str,
-    declaration: &AssetDeclaration,
-) -> Result<AssetStage, RestoreAttemptError> {
-    let presigned_response = try_request(
-        cfg,
-        "GET",
-        &format!(
-            "/api/hub/brains/{}/assets/presign?sha256={}&action=get",
-            enc(brain),
-            declaration.sha256
-        ),
-        None,
-        true,
-    )
-    .map_err(|error| {
-        RestoreAttemptError::Retryable(format!("could not request a fresh download URL: {error}"))
-    })?;
-    if presigned_response.status >= 400 {
-        let message = format!(
-            "prepare asset download failed (HTTP {}): {}",
-            presigned_response.status,
-            hub_error_message(&presigned_response)
-        );
-        return Err(
-            if presigned_response.status == 408
-                || presigned_response.status == 429
-                || presigned_response.status >= 500
-            {
-                RestoreAttemptError::Retryable(message)
-            } else {
-                RestoreAttemptError::Fatal(message)
-            },
-        );
+    declarations: &[AssetDeclaration],
+    indices: &[usize],
+) -> Result<Vec<DownloadCapability>, RestoreAttemptError> {
+    let hashes: Vec<&str> = indices
+        .iter()
+        .map(|index| declarations[*index].sha256.as_str())
+        .collect();
+    let planned = transfer_window_response(cfg, brain, "get", hashes)?;
+    let items = planned
+        .get("items")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| fail("hub returned no asset download items", None));
+    if items.len() != indices.len() {
+        fail("hub returned an incomplete asset download window", None);
     }
-    let presigned = ensure_ok(presigned_response, "prepare asset download");
-    let url = presigned
-        .get("url")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            RestoreAttemptError::Fatal(format!(
-                "hub returned no download URL for {}",
-                declaration.path
-            ))
-        })?;
+    let mut expected: BTreeMap<&str, usize> = indices
+        .iter()
+        .map(|index| (declarations[*index].sha256.as_str(), *index))
+        .collect();
+    let mut capabilities = Vec::with_capacity(items.len());
+    for item in items {
+        let sha256 = item
+            .get("sha256")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| fail("hub returned a download item without a hash", None));
+        let Some(declaration_index) = expected.remove(sha256) else {
+            fail(
+                "hub returned an unexpected or duplicate download hash",
+                None,
+            );
+        };
+        let url = item
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| fail("hub returned no asset download URL", None));
+        capabilities.push(DownloadCapability {
+            declaration_index,
+            url: url.to_string(),
+        });
+    }
+    if !expected.is_empty() {
+        fail("hub omitted a requested asset download hash", None);
+    }
+    Ok(capabilities)
+}
+
+fn download_asset_stage_from_url(
+    cfg: &Config,
+    declaration: &AssetDeclaration,
+    url: &str,
+) -> Result<AssetStage, RestoreAttemptError> {
     let mut stage = AssetStage::create().map_err(RestoreAttemptError::Fatal)?;
     let mut hasher = Sha256::new();
     let mut hashing_writer = HashingWriter {
@@ -1005,14 +1334,139 @@ fn download_asset_stage_once(
     Ok(stage)
 }
 
-fn download_asset_stage(
+fn download_capabilities(
+    cfg: &Config,
+    declarations: &[AssetDeclaration],
+    capabilities: &[DownloadCapability],
+) -> Vec<(DownloadCapability, Result<AssetStage, RestoreAttemptError>)> {
+    let mut results = Vec::with_capacity(capabilities.len());
+    for group in capabilities.chunks(TRANSFER_CONCURRENCY) {
+        let completed = std::thread::scope(|scope| {
+            let handles: Vec<_> = group
+                .iter()
+                .map(|capability| {
+                    scope.spawn(move || {
+                        download_asset_stage_from_url(
+                            cfg,
+                            &declarations[capability.declaration_index],
+                            &capability.url,
+                        )
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .enumerate()
+                .map(|(index, handle)| {
+                    let result = handle.join().unwrap_or_else(|_| {
+                        Err(RestoreAttemptError::Fatal(
+                            "asset download worker terminated unexpectedly".to_string(),
+                        ))
+                    });
+                    (group[index].clone(), result)
+                })
+                .collect::<Vec<_>>()
+        });
+        results.extend(completed);
+    }
+    results
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_download_window(
     cfg: &Config,
     brain: &str,
-    declaration: &AssetDeclaration,
-) -> Result<AssetStage, String> {
-    with_restore_retries(&declaration.path, &RESTORE_RETRY_BACKOFF, || {
-        download_asset_stage_once(cfg, brain, declaration)
-    })
+    declarations: &[AssetDeclaration],
+    indices: &[usize],
+    prepared: &mut Vec<(usize, PreparedAsset)>,
+    windows: &mut usize,
+    hub_requests: &mut usize,
+    planning_ms: &mut u64,
+    transfer_ms: &mut u64,
+) -> Result<(), String> {
+    let mut remaining = indices.to_vec();
+    for (attempt, retry_pause) in RESTORE_RETRY_BACKOFF
+        .iter()
+        .copied()
+        .map(Some)
+        .chain(std::iter::once(None))
+        .enumerate()
+    {
+        let planning_started = Instant::now();
+        let planned = plan_download_window(cfg, brain, declarations, &remaining);
+        *planning_ms = planning_ms.saturating_add(elapsed_ms(planning_started));
+        *windows += 1;
+        *hub_requests += 1;
+        let capabilities = match planned {
+            Ok(capabilities) => capabilities,
+            Err(RestoreAttemptError::Fatal(error)) => return Err(error),
+            Err(RestoreAttemptError::Retryable(error)) => {
+                let Some(pause) = retry_pause else {
+                    return Err(format!(
+                        "asset download planning failed after {} attempts: {error}",
+                        RESTORE_RETRY_BACKOFF.len() + 1,
+                    ));
+                };
+                note(&format!(
+                    "asset download planning was interrupted; retrying in {}s ({}/{}) — {error}",
+                    pause.as_secs(),
+                    attempt + 1,
+                    RESTORE_RETRY_BACKOFF.len(),
+                ));
+                std::thread::sleep(pause);
+                continue;
+            }
+        };
+
+        let transfer_started = Instant::now();
+        let results = download_capabilities(cfg, declarations, &capabilities);
+        *transfer_ms = transfer_ms.saturating_add(elapsed_ms(transfer_started));
+        let mut failed = Vec::new();
+        for (capability, result) in results {
+            match result {
+                Ok(stage) => {
+                    let declaration = &declarations[capability.declaration_index];
+                    prepared.push((
+                        capability.declaration_index,
+                        PreparedAsset {
+                            path: declaration.path.clone(),
+                            bytes: declaration.bytes,
+                            sha256: declaration.sha256.clone(),
+                            stage,
+                        },
+                    ));
+                }
+                Err(RestoreAttemptError::Fatal(error)) => return Err(error),
+                Err(RestoreAttemptError::Retryable(error)) => {
+                    failed.push((capability.declaration_index, error));
+                }
+            }
+        }
+        if failed.is_empty() {
+            return Ok(());
+        }
+        let Some(pause) = retry_pause else {
+            let details = failed
+                .iter()
+                .map(|(index, error)| format!("{}: {error}", declarations[*index].path))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(format!(
+                "asset restore failed after {} attempts: {details}",
+                RESTORE_RETRY_BACKOFF.len() + 1,
+            ));
+        };
+        note(&format!(
+            "{} asset download(s) interrupted; retained verified stages and retrying in {}s ({}/{})",
+            failed.len(),
+            pause.as_secs(),
+            attempt + 1,
+            RESTORE_RETRY_BACKOFF.len(),
+        ));
+        std::thread::sleep(pause);
+        remaining = failed.into_iter().map(|(index, _)| index).collect();
+    }
+    Ok(())
 }
 
 /// Stage every missing asset before the first exported file is changed. The
@@ -1024,8 +1478,14 @@ pub fn prepare_restore(
     root: Option<&crate::safe_path::SafeDir>,
     declarations: &[AssetDeclaration],
 ) -> Result<PreparedRestore, String> {
-    let mut assets = Vec::new();
+    let restore_started = Instant::now();
+    let mut prepared = Vec::new();
+    let mut pending = Vec::new();
     let mut present = 0usize;
+    let mut windows = 0usize;
+    let mut hub_requests = 0usize;
+    let mut planning_ms = 0u64;
+    let mut transfer_ms = 0u64;
     if !declarations.is_empty() {
         note(&format!(
             "checking and restoring {} declared asset(s)",
@@ -1033,6 +1493,13 @@ pub fn prepare_restore(
         ));
     }
     for (index, declaration) in declarations.iter().enumerate() {
+        if declaration.bytes > MAX_ASSET_BYTES {
+            return Err(format!(
+                "refusing asset {}: manifest size exceeds the {} GiB client limit",
+                declaration.path,
+                MAX_ASSET_BYTES / (1024 * 1024 * 1024),
+            ));
+        }
         if let Some(root) = root {
             match root.open_relative(&declaration.path) {
                 Ok(Some(file)) => {
@@ -1057,21 +1524,52 @@ pub fn prepare_restore(
                 }
             }
         }
-        assets.push(PreparedAsset {
-            path: declaration.path.clone(),
-            bytes: declaration.bytes,
-            sha256: declaration.sha256.clone(),
-            stage: download_asset_stage(cfg, brain, declaration)?,
-        });
-        let processed = index + 1;
-        if processed % 25 == 0 || processed == declarations.len() {
-            note(&format!(
-                "asset restore: processed {processed}/{}",
-                declarations.len()
-            ));
-        }
+        pending.push(index);
     }
-    Ok(PreparedRestore { assets, present })
+
+    // The transfer contract requires unique hashes inside one window. Duplicate
+    // declarations are placed in later windows; they remain separate private
+    // stages so final installation keeps the same atomic filesystem boundary.
+    while !pending.is_empty() {
+        let mut seen = BTreeSet::new();
+        let mut window = Vec::with_capacity(TRANSFER_WINDOW);
+        let mut deferred = Vec::new();
+        for index in pending {
+            let sha256 = declarations[index].sha256.clone();
+            if window.len() < TRANSFER_WINDOW && seen.insert(sha256) {
+                window.push(index);
+            } else {
+                deferred.push(index);
+            }
+        }
+        restore_download_window(
+            cfg,
+            brain,
+            declarations,
+            &window,
+            &mut prepared,
+            &mut windows,
+            &mut hub_requests,
+            &mut planning_ms,
+            &mut transfer_ms,
+        )?;
+        let processed = present + prepared.len();
+        note(&format!(
+            "asset restore: processed {processed}/{}",
+            declarations.len(),
+        ));
+        pending = deferred;
+    }
+    prepared.sort_by_key(|(index, _)| *index);
+    Ok(PreparedRestore {
+        assets: prepared.into_iter().map(|(_, asset)| asset).collect(),
+        present,
+        windows,
+        hub_requests,
+        planning_ms,
+        transfer_ms,
+        elapsed_ms: elapsed_ms(restore_started),
+    })
 }
 
 /// What an export-side restore did, for the export summary.
@@ -1080,6 +1578,11 @@ pub struct RestoreReport {
     pub restored_bytes: u64,
     pub present: usize,
     pub failed: usize,
+    pub windows: usize,
+    pub hub_requests: usize,
+    pub planning_ms: u64,
+    pub transfer_ms: u64,
+    pub elapsed_ms: u64,
 }
 
 impl RestoreReport {
@@ -1089,6 +1592,11 @@ impl RestoreReport {
             "restoredBytes": self.restored_bytes,
             "present": self.present,
             "failed": self.failed,
+            "windows": self.windows,
+            "hubRequests": self.hub_requests,
+            "planningMs": self.planning_ms,
+            "transferMs": self.transfer_ms,
+            "elapsedMs": self.elapsed_ms,
         })
     }
 }
@@ -1113,15 +1621,176 @@ impl<W: Write> Write for HashingWriter<'_, W> {
 #[cfg(test)]
 mod tests {
     use super::{
-        open_asset_source, parse_restore_manifest, preflight_asset_destination, stage_asset_source,
-        with_restore_retries, write_asset_destination, AssetStage, PreparedAsset,
-        RestoreAttemptError, MAX_ASSET_BYTES,
+        download_capabilities, open_asset_source, parse_restore_manifest,
+        preflight_asset_destination, stage_asset_source, upload_capabilities, with_restore_retries,
+        write_asset_destination, AssetDeclaration, AssetStage, DownloadCapability, PreparedAsset,
+        RestoreAttemptError, StagedUpload, UploadCapability, MAX_ASSET_BYTES, TRANSFER_CONCURRENCY,
     };
+    use crate::config::Config;
+    use serde_json::Value;
     use sha2::{Digest, Sha256};
     use std::cell::Cell;
     use std::fs;
-    use std::io::{Seek, SeekFrom, Write};
+    use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn asset_upload_pool_is_parallel_and_bounded() {
+        const COUNT: usize = 12;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let server_active = active.clone();
+        let server_maximum = maximum.clone();
+        let server = std::thread::spawn(move || {
+            let mut workers = Vec::new();
+            for _ in 0..COUNT {
+                let (mut stream, _) = listener.accept().unwrap();
+                let active = server_active.clone();
+                let maximum = server_maximum.clone();
+                workers.push(std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let mut content_length = 0usize;
+                    loop {
+                        line.clear();
+                        reader.read_line(&mut line).unwrap();
+                        if line.trim().is_empty() {
+                            break;
+                        }
+                        if let Some((name, value)) = line.split_once(':') {
+                            if name.eq_ignore_ascii_case("content-length") {
+                                content_length = value.trim().parse().unwrap();
+                            }
+                        }
+                    }
+                    let mut body = vec![0; content_length];
+                    reader.read_exact(&mut body).unwrap();
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(100));
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        )
+                        .unwrap();
+                    active.fetch_sub(1, Ordering::SeqCst);
+                }));
+            }
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        });
+
+        let cfg = Config {
+            hub: base.clone(),
+            key: None,
+        };
+        let mut uploads = Vec::new();
+        let mut capabilities = Vec::new();
+        for index in 0..COUNT {
+            let mut stage = AssetStage::create().unwrap();
+            stage.file.write_all(&[index as u8]).unwrap();
+            stage.file.seek(SeekFrom::Start(0)).unwrap();
+            uploads.push(StagedUpload {
+                sha256: format!("{index:064x}"),
+                bytes: 1,
+                display_path: format!("asset-{index}"),
+                stage,
+            });
+            capabilities.push(UploadCapability {
+                upload_index: index,
+                url: format!("{base}/blob-{index}"),
+                headers: Value::Null,
+                reservation_id: format!("reservation-{index}"),
+            });
+        }
+        let results = upload_capabilities(&cfg, &uploads, &capabilities);
+        assert!(results.iter().all(|(_, result)| result.is_ok()));
+        server.join().unwrap();
+        assert!(maximum.load(Ordering::SeqCst) >= 2, "uploads were serial");
+        assert!(
+            maximum.load(Ordering::SeqCst) <= TRANSFER_CONCURRENCY,
+            "upload concurrency exceeded its bound",
+        );
+    }
+
+    #[test]
+    fn asset_download_pool_is_parallel_bounded_and_hash_verified() {
+        const COUNT: usize = 12;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let server_active = active.clone();
+        let server_maximum = maximum.clone();
+        let server = std::thread::spawn(move || {
+            let mut workers = Vec::new();
+            for _ in 0..COUNT {
+                let (mut stream, _) = listener.accept().unwrap();
+                let active = server_active.clone();
+                let maximum = server_maximum.clone();
+                workers.push(std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let path = line.split_whitespace().nth(1).unwrap();
+                    let index: usize = path.trim_start_matches("/blob-").parse().unwrap();
+                    loop {
+                        line.clear();
+                        reader.read_line(&mut line).unwrap();
+                        if line.trim().is_empty() {
+                            break;
+                        }
+                    }
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(100));
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 1\r\nconnection: close\r\n\r\n",
+                        )
+                        .unwrap();
+                    stream.write_all(&[index as u8]).unwrap();
+                    active.fetch_sub(1, Ordering::SeqCst);
+                }));
+            }
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        });
+
+        let cfg = Config {
+            hub: base.clone(),
+            key: None,
+        };
+        let declarations: Vec<_> = (0..COUNT)
+            .map(|index| AssetDeclaration {
+                path: format!("asset-{index}"),
+                sha256: format!("{:x}", Sha256::digest([index as u8])),
+                bytes: 1,
+            })
+            .collect();
+        let capabilities: Vec<_> = (0..COUNT)
+            .map(|index| DownloadCapability {
+                declaration_index: index,
+                url: format!("{base}/blob-{index}"),
+            })
+            .collect();
+        let results = download_capabilities(&cfg, &declarations, &capabilities);
+        assert!(results.iter().all(|(_, result)| result.is_ok()));
+        server.join().unwrap();
+        assert!(maximum.load(Ordering::SeqCst) >= 2, "downloads were serial");
+        assert!(
+            maximum.load(Ordering::SeqCst) <= TRANSFER_CONCURRENCY,
+            "download concurrency exceeded its bound",
+        );
+    }
 
     #[test]
     fn asset_restore_retries_transient_failures_then_returns_the_verified_stage() {

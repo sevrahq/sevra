@@ -2784,7 +2784,12 @@ fn clone_restores_declared_assets_only_after_exact_sha_verification() {
     .to_string();
     let (base, log, handle) = mock_hub(vec![
         (200, snapshot),
-        (200, r#"{"url":"{BASE}/blob-get"}"#.to_string()),
+        (
+            200,
+            format!(
+                r#"{{"items":[{{"sha256":"{BLOB_SHA}","url":"{{BASE}}/blob-get","method":"GET"}}]}}"#
+            ),
+        ),
         (200, "BLOB".to_string()),
     ]);
     let clone = sevra()
@@ -2806,10 +2811,7 @@ fn clone_restores_declared_assets_only_after_exact_sha_verification() {
     handle.join().unwrap();
     let requests = log.lock().unwrap();
     assert_eq!(requests.len(), 3);
-    assert_eq!(
-        requests[1].path,
-        format!("/api/hub/brains/b/assets/presign?sha256={BLOB_SHA}&action=get")
-    );
+    assert_eq!(requests[1].path, "/api/hub/brains/b/assets/transfer");
 }
 
 #[test]
@@ -2831,7 +2833,12 @@ fn clone_retries_a_transient_asset_presign_failure_without_leaking_a_partial_roo
         (200, snapshot),
         (0, String::new()),
         (503, r#"{"error":"temporary presign outage"}"#.to_string()),
-        (200, r#"{"url":"{BASE}/blob-get"}"#.to_string()),
+        (
+            200,
+            format!(
+                r#"{{"items":[{{"sha256":"{BLOB_SHA}","url":"{{BASE}}/blob-get","method":"GET"}}]}}"#
+            ),
+        ),
         (200, "BLOB".to_string()),
     ]);
     let clone = sevra()
@@ -2842,7 +2849,7 @@ fn clone_retries_a_transient_asset_presign_failure_without_leaking_a_partial_roo
         .output()
         .unwrap();
     assert!(clone.status.success(), "{}", all_output(&clone));
-    assert!(String::from_utf8_lossy(&clone.stderr).contains("restore was interrupted"));
+    assert!(String::from_utf8_lossy(&clone.stderr).contains("planning was interrupted"));
     assert_eq!(
         std::fs::read(work.path().join("brain/_files/x.bin")).unwrap(),
         b"BLOB"
@@ -2850,10 +2857,7 @@ fn clone_retries_a_transient_asset_presign_failure_without_leaking_a_partial_roo
     handle.join().unwrap();
     let requests = log.lock().unwrap();
     assert_eq!(requests.len(), 5);
-    assert_eq!(
-        requests[1].path,
-        format!("/api/hub/brains/b/assets/presign?sha256={BLOB_SHA}&action=get")
-    );
+    assert_eq!(requests[1].path, "/api/hub/brains/b/assets/transfer");
     assert_eq!(requests[1].path, requests[2].path);
     assert_eq!(requests[2].path, requests[3].path);
 }
@@ -3291,12 +3295,13 @@ fn push_syncs_missing_assets_after_commit() {
     let missing = format!(
         r#"{{"assets":[{{"path":"_files/x.bin","sha256":"{BLOB_SHA}","bytes":4,"required":true,"presentInR2":false}}],"truncated":false}}"#
     );
-    let presigned =
-        r#"{"url":"{BASE}/blob-put","method":"PUT","reservationId":"01hzy3v7q8r9s0t1v2w3x4y5z7"}"#;
+    let presigned = format!(
+        r#"{{"items":[{{"sha256":"{BLOB_SHA}","url":"{{BASE}}/blob-put","method":"PUT","reservationId":"01hzy3v7q8r9s0t1v2w3x4y5z7","headers":{{"content-length":"4"}}}}]}}"#
+    );
     let (base, log, handle) = mock_hub(vec![
         (200, push_response(1, 1, 1)),
         (200, missing),
-        (200, presigned.to_string()),
+        (200, presigned),
         (200, "{}".to_string()), // the presigned PUT itself
         (200, r#"{"present":true}"#.to_string()),
     ]);
@@ -3314,21 +3319,116 @@ fn push_syncs_missing_assets_after_commit() {
     );
     handle.join().unwrap();
     let reqs = log.lock().unwrap();
-    assert_eq!(reqs.len(), 5, "push, list, presign, PUT, confirm: {reqs:?}");
-    assert_eq!(reqs[1].path, "/api/hub/brains/b/assets?status=missing");
     assert_eq!(
-        reqs[2].path,
-        format!("/api/hub/brains/b/assets/presign?sha256={BLOB_SHA}&action=put")
+        reqs.len(),
+        5,
+        "push, list, transfer, PUT, confirm: {reqs:?}"
     );
+    assert_eq!(reqs[1].path, "/api/hub/brains/b/assets?status=missing");
+    assert_eq!(reqs[2].path, "/api/hub/brains/b/assets/transfer");
     assert_eq!(reqs[3].method, "PUT");
     assert_eq!(reqs[3].path, "/blob-put");
     assert_eq!(reqs[3].body, "BLOB", "the exact blob bytes ride the PUT");
-    assert_eq!(reqs[4].path, "/api/hub/brains/b/assets/confirm");
+    assert_eq!(reqs[4].path, "/api/hub/brains/b/assets/transfer/confirm");
     assert!(
         reqs[4].body.contains(BLOB_SHA) && reqs[4].body.contains("01hzy3v7q8r9s0t1v2w3x4y5z7"),
         "confirm carries hash + reservation: {}",
         reqs[4].body
     );
+}
+
+#[test]
+fn push_batches_multiple_assets_into_one_planning_and_confirm_window() {
+    let t = tempfile::tempdir().unwrap();
+    let blobs = [
+        ("_files/one.bin", b"ONE".as_slice()),
+        ("_files/two.bin", b"TWO".as_slice()),
+        ("_files/three.bin", b"THREE".as_slice()),
+    ];
+    let mut manifest = String::new();
+    let mut missing_rows = Vec::new();
+    let mut transfer_items = Vec::new();
+    for (index, (path, bytes)) in blobs.iter().enumerate() {
+        let sha256 = format!("{:x}", Sha256::digest(bytes));
+        let destination = t.path().join(path);
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::write(destination, bytes).unwrap();
+        manifest.push_str(
+            &serde_json::json!({ "path": path, "sha256": sha256, "bytes": bytes.len() })
+                .to_string(),
+        );
+        manifest.push('\n');
+        missing_rows.push(serde_json::json!({
+            "path": path,
+            "sha256": sha256,
+            "bytes": bytes.len(),
+            "required": true,
+            "presentInR2": false,
+        }));
+        transfer_items.push(serde_json::json!({
+            "sha256": sha256,
+            "url": format!("{{BASE}}/blob-put-{index}"),
+            "method": "PUT",
+            "reservationId": format!("01hzy3v7q8r9s0t1v2w3x4y5{}", index + 1),
+            "headers": { "content-length": bytes.len().to_string() },
+        }));
+    }
+    std::fs::write(
+        t.path().join("a.md"),
+        "---\ntype: note\nsummary: batch fixture\n---\nbatch fixture\n",
+    )
+    .unwrap();
+    std::fs::write(t.path().join("assets.jsonl"), manifest).unwrap();
+    let (base, log, handle) = mock_hub(vec![
+        (200, push_response(1, 3, 1)),
+        (
+            200,
+            serde_json::json!({ "assets": missing_rows, "truncated": false }).to_string(),
+        ),
+        (
+            200,
+            serde_json::json!({ "items": transfer_items }).to_string(),
+        ),
+        (200, "{}".to_string()),
+        (200, "{}".to_string()),
+        (200, "{}".to_string()),
+        (200, r#"{"present":true,"confirmed":3}"#.to_string()),
+    ]);
+
+    let out = sevra()
+        .args(["push", t.path().to_str().unwrap(), "--brain", "b", "--json"])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", all_output(&out));
+    let output: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(output["assetSync"]["uploaded"], 3);
+    assert_eq!(output["assetSync"]["windows"], 1);
+    assert_eq!(output["assetSync"]["hubRequests"], 3);
+
+    handle.join().unwrap();
+    let requests = log.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/api/hub/brains/b/assets/transfer")
+            .count(),
+        1,
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "PUT")
+            .count(),
+        3,
+    );
+    let confirm = requests
+        .iter()
+        .find(|request| request.path == "/api/hub/brains/b/assets/transfer/confirm")
+        .unwrap();
+    let confirm_body: serde_json::Value = serde_json::from_str(&confirm.body).unwrap();
+    assert_eq!(confirm_body["items"].as_array().unwrap().len(), 3);
 }
 
 #[test]
@@ -3392,10 +3492,12 @@ fn export_restores_missing_assets_sha_verified() {
     let export_body = format!(
         r#"{{"slug":"b","files":[{{"path":"a.md","content":"alpha"}},{{"path":"assets.jsonl","content":"{manifest_line}"}}]}}"#
     );
-    let presigned = r#"{"url":"{BASE}/blob-get"}"#;
+    let presigned = format!(
+        r#"{{"items":[{{"sha256":"{BLOB_SHA}","url":"{{BASE}}/blob-get","method":"GET"}}]}}"#
+    );
     let (base, log, handle) = mock_hub(vec![
         (200, export_body),
-        (200, presigned.to_string()),
+        (200, presigned),
         (200, "BLOB".to_string()), // the presigned GET body
     ]);
     let work = tempfile::tempdir().unwrap();
@@ -3414,11 +3516,8 @@ fn export_restores_missing_assets_sha_verified() {
     );
     handle.join().unwrap();
     let reqs = log.lock().unwrap();
-    assert_eq!(reqs.len(), 3, "export, presign, GET: {reqs:?}");
-    assert_eq!(
-        reqs[1].path,
-        format!("/api/hub/brains/b/assets/presign?sha256={BLOB_SHA}&action=get")
-    );
+    assert_eq!(reqs.len(), 3, "export, transfer, GET: {reqs:?}");
+    assert_eq!(reqs[1].path, "/api/hub/brains/b/assets/transfer");
     let restored = std::fs::read(work.path().join("out/_files/x.bin")).unwrap();
     assert_eq!(restored, b"BLOB", "restored bytes match the manifest hash");
 }
@@ -3836,10 +3935,12 @@ fn export_stream_refuses_first_byte_past_declared_length_without_installing() {
     let export_body = format!(
         r#"{{"slug":"b","files":[{{"path":"a.md","content":"alpha"}},{{"path":"assets.jsonl","content":"{manifest_line}"}}]}}"#
     );
-    let presigned = r#"{"url":"{BASE}/blob-get"}"#;
+    let presigned = format!(
+        r#"{{"items":[{{"sha256":"{BLOB_SHA}","url":"{{BASE}}/blob-get","method":"GET"}}]}}"#
+    );
     let (base, log, handle) = mock_hub(vec![
         (200, export_body),
-        (200, presigned.to_string()),
+        (200, presigned),
         (200, "BLOBS".to_string()),
     ]);
     let work = tempfile::tempdir().unwrap();
@@ -4016,13 +4117,15 @@ fn export_asset_restore_refuses_an_ancestor_swapped_during_presign() {
                 match turn {
                     0 => respond_json(&mut stream, 200, &export_body),
                     1 => {
-                        assert!(request.path.contains("/assets/presign"));
+                        assert!(request.path.contains("/assets/transfer"));
                         std::fs::create_dir(&export_root).unwrap();
                         std::fs::write(&planted_path, b"SAFE").unwrap();
                         respond_json(
                             &mut stream,
                             200,
-                            &format!(r#"{{"url":"{base_for_server}/blob"}}"#),
+                            &format!(
+                                r#"{{"items":[{{"sha256":"{BLOB_SHA}","url":"{base_for_server}/blob","method":"GET"}}]}}"#
+                            ),
                         );
                     }
                     2 => respond_json(&mut stream, 200, "BLOB"),

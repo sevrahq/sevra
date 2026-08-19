@@ -6,6 +6,7 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::sync::OnceLock;
 
 use serde_json::Value;
 
@@ -115,36 +116,46 @@ fn presigned_network_policy(cfg: &Config, parsed: &url::Url) -> Result<bool, &'s
 }
 
 fn transfer_agent(allow_local: bool) -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .user_agent(concat!("sevra/", env!("CARGO_PKG_VERSION")))
-        .redirects(0)
-        .timeout_connect(std::time::Duration::from_secs(10))
-        .timeout_read(std::time::Duration::from_secs(120))
-        // Resolve exactly once for the connection and reject the complete DNS
-        // answer if any address is private/local. The HTTP client consumes
-        // this vetted vector directly, closing the resolve-check-resolve DNS
-        // rebinding window.
-        .resolver(move |netloc: &str| {
-            let addresses: Vec<SocketAddr> = netloc.to_socket_addrs()?.collect();
-            if addresses.is_empty() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "transfer host resolved to no addresses",
-                ));
-            }
-            if !allow_local
-                && addresses
-                    .iter()
-                    .any(|address| !public_transfer_ip(address.ip()))
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "transfer host resolved to a private or local address",
-                ));
-            }
-            Ok(addresses)
-        })
-        .build()
+    static LOCAL_TRANSFER_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    static PUBLIC_TRANSFER_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    let slot = if allow_local {
+        &LOCAL_TRANSFER_AGENT
+    } else {
+        &PUBLIC_TRANSFER_AGENT
+    };
+    slot.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .user_agent(concat!("sevra/", env!("CARGO_PKG_VERSION")))
+            .redirects(0)
+            .timeout_connect(std::time::Duration::from_secs(10))
+            .timeout_read(std::time::Duration::from_secs(120))
+            // Resolve exactly once for the connection and reject the complete
+            // DNS answer if any address is private/local. The HTTP client
+            // consumes this vetted vector directly, closing the
+            // resolve-check-resolve DNS rebinding window.
+            .resolver(move |netloc: &str| {
+                let addresses: Vec<SocketAddr> = netloc.to_socket_addrs()?.collect();
+                if addresses.is_empty() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "transfer host resolved to no addresses",
+                    ));
+                }
+                if !allow_local
+                    && addresses
+                        .iter()
+                        .any(|address| !public_transfer_ip(address.ip()))
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "transfer host resolved to a private or local address",
+                    ));
+                }
+                Ok(addresses)
+            })
+            .build()
+    })
+    .clone()
 }
 
 pub fn put_presigned(cfg: &Config, url: &str, headers: &Value, bytes: &[u8]) {
@@ -193,13 +204,23 @@ pub fn put_presigned(cfg: &Config, url: &str, headers: &Value, bytes: &[u8]) {
 /// Each connect retry clones and rewinds the same descriptor; `take(length)`
 /// ensures a concurrently extended file can never send bytes beyond the
 /// already-validated object length.
-pub fn put_presigned_file(cfg: &Config, url: &str, headers: &Value, file: &File, length: u64) {
-    let parsed = url::Url::parse(url)
-        .unwrap_or_else(|_| fail("the hub returned an invalid upload URL", None));
+/// Fallible asset PUT used by the bounded transfer pool. Unlike the legacy
+/// wrapper it never terminates the process from a worker thread, so successful
+/// members of a window can be confirmed before failed members are retried.
+pub fn put_presigned_file_result(
+    cfg: &Config,
+    url: &str,
+    headers: &Value,
+    file: &File,
+    length: u64,
+) -> Result<(), String> {
+    let parsed =
+        url::Url::parse(url).map_err(|_| "the hub returned an invalid upload URL".to_string())?;
     let allow_local = presigned_network_policy(cfg, &parsed)
-        .unwrap_or_else(|_| fail("the hub returned an unsafe upload URL", None));
+        .map_err(|_| "the hub returned an unsafe upload URL".to_string())?;
     let http = transfer_agent(allow_local);
-    let result = with_connect_retries(|| {
+    let mut attempt = 0;
+    let result = loop {
         let mut req = http.put(url);
         if let Some(map) = headers.as_object() {
             for (name, value) in map {
@@ -209,41 +230,43 @@ pub fn put_presigned_file(cfg: &Config, url: &str, headers: &Value, file: &File,
             }
         }
         req = req.set("content-length", &length.to_string());
-        let mut upload = file.try_clone().unwrap_or_else(|error| {
-            fail(
-                &format!("asset upload could not clone its stage: {error}"),
-                None,
-            )
-        });
-        upload.seek(SeekFrom::Start(0)).unwrap_or_else(|error| {
-            fail(
-                &format!("asset upload could not rewind its stage: {error}"),
-                None,
-            )
-        });
-        req.send(upload.take(length)).map_err(Box::new)
-    });
+        let mut upload = file
+            .try_clone()
+            .map_err(|error| format!("asset upload could not clone its stage: {error}"))?;
+        upload
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| format!("asset upload could not rewind its stage: {error}"))?;
+        match req.send(upload.take(length)).map_err(Box::new) {
+            Err(error)
+                if matches!(
+                    error.as_ref(),
+                    ureq::Error::Transport(transport)
+                        if is_pre_request_transport(transport.kind())
+                ) && attempt + 1 < CONNECT_ATTEMPTS =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    CONNECT_RETRY_BACKOFF_MS[attempt],
+                ));
+                attempt += 1;
+            }
+            result => break result,
+        }
+    };
     match result {
-        Ok(resp) if resp.status() < 300 => {}
+        Ok(resp) if resp.status() < 300 => Ok(()),
         Ok(resp) => {
             let status = resp.status();
-            fail(
-                &format!(
-                    "asset upload failed (HTTP {status}){}",
-                    response_snippet_suffix(resp)
-                ),
-                None,
-            )
+            Err(format!(
+                "asset upload failed (HTTP {status}){}",
+                response_snippet_suffix(resp)
+            ))
         }
         Err(error) => match *error {
-            ureq::Error::Status(code, resp) => fail(
-                &format!(
-                    "asset upload failed (HTTP {code}){}",
-                    response_snippet_suffix(resp)
-                ),
-                None,
-            ),
-            ureq::Error::Transport(err) => fail(&format!("asset upload failed: {err}"), None),
+            ureq::Error::Status(code, resp) => Err(format!(
+                "asset upload failed (HTTP {code}){}",
+                response_snippet_suffix(resp)
+            )),
+            ureq::Error::Transport(err) => Err(format!("asset upload failed: {err}")),
         },
     }
 }
@@ -354,17 +377,20 @@ fn snippet_of(text: &str) -> String {
 }
 
 fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .user_agent(concat!("sevra/", env!("CARGO_PKG_VERSION")))
-        // Redirects are never implicit on authenticated or presigned traffic.
-        // A redirect can cross origins and strip or replay sensitive material;
-        // callers receive the 3xx and fail it as a non-success instead.
-        .redirects(0)
-        // A hung hub must never hang an agent's loop: bounded connect, and a
-        // read window sized for a large pack transfer on a slow link.
-        .timeout_connect(std::time::Duration::from_secs(10))
-        .timeout_read(std::time::Duration::from_secs(120))
-        .build()
+    static HUB_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    HUB_AGENT
+        .get_or_init(|| {
+            ureq::AgentBuilder::new()
+                .user_agent(concat!("sevra/", env!("CARGO_PKG_VERSION")))
+                // Redirects are never implicit on authenticated or presigned
+                // traffic. A redirect can cross origins and strip or replay
+                // sensitive material; callers receive the 3xx and fail it.
+                .redirects(0)
+                .timeout_connect(std::time::Duration::from_secs(10))
+                .timeout_read(std::time::Duration::from_secs(120))
+                .build()
+        })
+        .clone()
 }
 
 /// Retry only failures that happen before an HTTP request can reach the hub.

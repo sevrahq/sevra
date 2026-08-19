@@ -2139,9 +2139,12 @@ pub fn push(
         let sync = crate::assets::sync_after_push(cfg, brain, dir, scope.as_ref());
         if sync.uploaded > 0 {
             human.push_str(&format!(
-                "\nassets: {} uploaded ({})",
+                "\nassets: {} uploaded ({}) in {:.1}s ({} transfer window(s), {} hub request(s))",
                 sync.uploaded,
-                human_size(sync.uploaded_bytes)
+                human_size(sync.uploaded_bytes),
+                sync.elapsed_ms as f64 / 1000.0,
+                sync.windows,
+                sync.hub_requests,
             ));
         } else if sync.missing_local == 0 && sync.drifted == 0 {
             human.push_str(&format!("\nassets: all {manifest_assets} present"));
