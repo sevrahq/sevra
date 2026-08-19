@@ -584,11 +584,11 @@ fn agents_and_runs_have_distinct_truthful_surfaces_and_run_posts_the_agent() {
     let (base, log, handle) = mock_hub(vec![
         (
             200,
-            r#"{"execution":{"automaticSchedulesEnabled":false,"automaticSchedulesStatus":"temporarily_disabled","manualRunsEnabled":true},"configurationIssues":[{"sourceDocPath":"records/broken.md","message":"agent name is required"}],"agents":[{"name":"curate\u001b[31m","engine":"sevra","enabled":true,"schedule":"0 3 * * *","model":"claude-haiku-4-5-20251001","sourceDocPath":"records/agent.md","flags":[]}],"runs":[],"billing":{"balanceCents":500,"sevraRunsPaused":false}}"#.to_string(),
+            r#"{"execution":{"automaticSchedulesEnabled":true,"automaticSchedulesStatus":"enabled","manualRunsEnabled":true},"configurationIssues":[{"sourceDocPath":"records/broken.md","message":"agent name is required"}],"agents":[{"name":"curate\u001b[31m","engine":"sevra","enabled":true,"schedule":"0 3 * * *","model":"claude-haiku-4-5-20251001","sourceDocPath":"records/agent.md","flags":[]}],"runs":[],"billing":{"balanceCents":500,"sevraRunsPaused":false}}"#.to_string(),
         ),
         (
             200,
-            r#"{"execution":{"automaticSchedulesEnabled":false,"automaticSchedulesStatus":"temporarily_disabled","manualRunsEnabled":true},"agents":[],"runs":[{"id":"01run","agent":"curate\u001b[31m","trigger":"manual","status":"failed","queuedAt":"2026-08-19T12:00:00.000Z","creditsDebitedCents":2,"error":"model unavailable\u001b[31m","outcome":null}],"billing":{"balanceCents":498,"sevraRunsPaused":false}}"#.to_string(),
+            r#"{"execution":{"automaticSchedulesEnabled":true,"automaticSchedulesStatus":"enabled","manualRunsEnabled":true},"agents":[],"runs":[{"id":"01run","agent":"curate\u001b[31m","trigger":"manual","status":"failed","queuedAt":"2026-08-19T12:00:00.000Z","creditsDebitedCents":2,"error":"model unavailable\u001b[31m","outcome":null}],"billing":{"balanceCents":498,"sevraRunsPaused":false}}"#.to_string(),
         ),
         (
             202,
@@ -605,11 +605,8 @@ fn agents_and_runs_have_distinct_truthful_surfaces_and_run_posts_the_agent() {
     assert!(agents.status.success(), "{}", all_output(&agents));
     assert!(!agents.stdout.contains(&0x1b));
     let human = String::from_utf8(agents.stdout).unwrap();
-    assert!(
-        human.contains("automatic schedules are temporarily off"),
-        "{human}"
-    );
-    assert!(human.contains("manual only"), "{human}");
+    assert!(human.contains("automatic schedules are enabled"), "{human}");
+    assert!(human.contains("scheduled (0 3 * * *)"), "{human}");
     assert!(human.contains("records/agent.md"), "{human}");
     assert!(
         human.contains("configuration issue in records/broken.md"),

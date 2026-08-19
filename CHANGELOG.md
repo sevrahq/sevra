@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.2.21 — 2026-08-19
+
+- Runs: automatic schedule state is now reported as enabled when the hub
+  enables it; configured Sevra agents show their normalized schedule while
+  manual `sevra run` remains available.
+- MCP: `list_runs` describes the complete automatic/manual policy and
+  `start_run` is accurately presented as an immediate run alongside configured
+  automatic schedules.
+
 ## 0.2.20 — 2026-08-19
 
 - Export and clone: rebuild db.md's derived catalogs inside the private

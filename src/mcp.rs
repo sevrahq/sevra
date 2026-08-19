@@ -116,7 +116,7 @@ fn tools() -> Value {
         },
         {
             "name": "list_runs",
-            "description": "List a brain's configured run agents, source paths, validation flags, manual-only policy, credit state, and recent run outcomes. Call this before start_run to discover the exact agent name.",
+            "description": "List a brain's configured run agents, schedules, source paths, validation flags, automatic/manual execution policy, credit state, and recent run outcomes. Call this before start_run to discover the exact agent name.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -128,7 +128,7 @@ fn tools() -> Value {
         },
         {
             "name": "start_run",
-            "description": "Manually queue one enabled Sevra-run agent. This can spend the brain owner's run credits. Automatic schedules remain separate and temporarily disabled.",
+            "description": "Queue one enabled Sevra-run agent now, alongside any configured automatic schedule. This can spend the brain owner's run credits.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
