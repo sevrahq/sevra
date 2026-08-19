@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 0.2.20 — 2026-08-19
+
+- Export and clone: rebuild db.md's derived catalogs inside the private
+  atomic stage before publishing a local checkout. A hosted v1 brain now
+  passes `dbmd validate --all` and answers structured queries immediately
+  after materialization, while the source snapshot stays byte-exact.
+- Pull: refresh the same local catalogs after the transactional source update.
+  Missing db.md tooling remains an explicit, actionable cache warning; an
+  unexpected rebuild failure cannot pretend the committed source pull rolled
+  back.
+- Cleanup: failed staged rebuilds and destination races remove request-owned
+  files through held directory capabilities, including newly generated
+  sidecars, without following swapped paths.
+
 ## 0.2.19 — 2026-08-19
 
 - Sync: new permissioned incremental brains negotiate through a typed hub
