@@ -97,13 +97,11 @@ enum Commands {
         #[arg(long, value_name = "SLUG")]
         confirm: Option<String>,
     },
-    /// Push a local db.md store (index-on-push). Push REPLACES the brain's
-    /// whole hosted store with <DIR>: files absent locally are removed from
-    /// the hub. A push that would shrink the brain's document count is
-    /// refused unless --force is given. A cloned/pushed store also refuses if
-    /// the hosted feed advanced past its local baseline; --force explicitly
-    /// replaces that newer state. Before anything uploads, the store is
-    /// checked against the hub's snapshot limits and scanned for
+    /// Sync local changes to a brain. Link.md v2 delegates to dbmd's verified
+    /// incremental engine: only changed blobs and explicit deletes travel,
+    /// conflicts never overwrite, and --force is refused. Legacy v1 brains
+    /// retain whole-store replacement until an explicit verified bridge.
+    /// Before anything uploads, the store is checked and scanned for
     /// secret-shaped markdown, asset contents, and names (--allow-secrets
     /// overrides). Bounded asset inspection reports anything it skips.
     ///
@@ -117,7 +115,7 @@ enum Commands {
         dir: String,
         #[arg(long)]
         brain: String,
-        /// Allow a shrinking or stale-baseline replacement
+        /// Legacy v1 only: allow a shrinking or stale-baseline replacement
         #[arg(long)]
         force: bool,
         /// Push even when the secret scan finds matches
@@ -128,15 +126,15 @@ enum Commands {
         #[arg(long)]
         skip_assets: bool,
     },
-    /// Bring a hosted brain onto this machine for the first time. Records,
-    /// declared assets, and a divergence baseline land atomically in a fresh
-    /// directory.
+    /// Bring a hosted brain onto this machine for the first time. Link.md v2
+    /// delegates verification, scoped materialization, and private baselines
+    /// to dbmd; the checkout lands atomically in a fresh directory.
     Clone { brain: String, dir: Option<String> },
-    /// Refresh a cloned brain in place. Refuses local divergence unless
-    /// --force is explicit.
+    /// Refresh a cloned brain in place. V2 performs a verified three-way sync
+    /// and preserves conflicts; --force applies only to legacy v1 snapshots.
     Pull {
         dir: Option<String>,
-        /// Discard local divergence and replace riding paths from the hub
+        /// Legacy v1 only: discard local divergence and replace riding paths
         #[arg(long)]
         force: bool,
     },

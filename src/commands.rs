@@ -44,6 +44,7 @@ const MAX_SECRET_STDIN_BYTES: usize = MAX_SECRET_VALUE_BYTES + 2;
 const VAULT_EXPORT_FILE: &str = ".sevra-vault.json";
 const VAULT_EXPORT_WARNING: &str = "warning: this export includes recoverable vault values; .sevra-vault.json is as sensitive as the credentials themselves. Store it securely and delete it when no longer needed";
 const SYNC_BASELINE_FILE: &str = ".sevra-sync.json";
+const V2_CHECKOUT_FILE: &str = ".sevra-v2.json";
 const MAX_SYNC_BASELINE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_WITHHELD_PATH_BYTES: usize = 2 * 1024 * 1024;
 const PULL_JOURNAL_FILE: &str = ".sevra-pull-journal.json";
@@ -69,6 +70,13 @@ struct SyncBaseline {
     kept_home_unlinked: usize,
     #[serde(default)]
     carried_kept_home_unlinked: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct V2Checkout {
+    v: u8,
+    brain: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -436,27 +444,30 @@ fn snapshot_query(address: Option<(u64, Option<&str>)>, include_vault_names: boo
     query
 }
 
-fn request_snapshot(
+fn request_snapshot_from(
     cfg: &Config,
     brain: &str,
     exact: Option<(u64, &str)>,
     include_vault_names: bool,
+    first: Option<HubResponse>,
 ) -> (Value, Option<(u64, Option<String>)>) {
     let requested = exact.map(|(seq, hash)| (seq, Some(hash.to_string())));
-    let first = request(
-        cfg,
-        "GET",
-        &format!(
-            "/api/hub/brains/{}/export{}",
-            enc(brain),
-            snapshot_query(
-                exact.map(|(seq, hash)| (seq, Some(hash))),
-                include_vault_names,
-            )
-        ),
-        None,
-        true,
-    );
+    let first = first.unwrap_or_else(|| {
+        request(
+            cfg,
+            "GET",
+            &format!(
+                "/api/hub/brains/{}/export{}",
+                enc(brain),
+                snapshot_query(
+                    exact.map(|(seq, hash)| (seq, Some(hash))),
+                    include_vault_names,
+                )
+            ),
+            None,
+            true,
+        )
+    });
     if exact.is_none()
         && first.status == 400
         && body_code(&first) == Some("snapshot_address_required")
@@ -485,8 +496,20 @@ fn request_snapshot(
     (ensure_ok(first, "fetch brain snapshot"), requested)
 }
 
-fn fetch_snapshot(cfg: &Config, brain: &str, exact: Option<(u64, &str)>) -> PulledSnapshot {
-    let (response, requested) = request_snapshot(cfg, brain, exact, false);
+fn request_snapshot(
+    cfg: &Config,
+    brain: &str,
+    exact: Option<(u64, &str)>,
+    include_vault_names: bool,
+) -> (Value, Option<(u64, Option<String>)>) {
+    request_snapshot_from(cfg, brain, exact, include_vault_names, None)
+}
+
+fn parse_snapshot(
+    cfg: &Config,
+    response: Value,
+    requested: Option<(u64, Option<String>)>,
+) -> PulledSnapshot {
     let brain_id = response
         .get("brain")
         .and_then(Value::as_str)
@@ -627,6 +650,11 @@ fn fetch_snapshot(cfg: &Config, brain: &str, exact: Option<(u64, &str)>) -> Pull
         withheld_paths,
         kept_home_unlinked,
     }
+}
+
+fn fetch_snapshot(cfg: &Config, brain: &str, exact: Option<(u64, &str)>) -> PulledSnapshot {
+    let (response, requested) = request_snapshot(cfg, brain, exact, false);
+    parse_snapshot(cfg, response, requested)
 }
 
 pub(crate) fn enc(s: &str) -> String {
@@ -1895,6 +1923,126 @@ fn withheld_push_metadata(
     }
 }
 
+fn run_dbmd_sync(cfg: &Config, args: &[String], working_dir: &Path) -> Value {
+    let key = cfg
+        .key
+        .as_deref()
+        .unwrap_or_else(|| fail(NOT_LOGGED_IN, None));
+    let output = Command::new("dbmd")
+        .arg("--json")
+        .arg("sync")
+        .args(args)
+        .arg("--hub")
+        .arg(&cfg.hub)
+        .env("DBMD_HUB_KEY", key)
+        .env_remove("DBMD_HUB_URL")
+        .env_remove("DBMD_HUB_CREDENTIAL_ORIGIN")
+        .current_dir(working_dir)
+        .output()
+        .unwrap_or_else(|error| {
+            fail(
+                &format!(
+                    "could not run dbmd sync (install it from https://www.sevrahq.com/install): {error}"
+                ),
+                None,
+            )
+        });
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr);
+        let structured = serde_json::from_slice::<Value>(&output.stderr).ok();
+        fail(
+            &format!("dbmd sync failed: {}", terminal_safe(message.trim())),
+            structured,
+        );
+    }
+    serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| fail(&format!("dbmd sync returned invalid JSON: {error}"), None))
+}
+
+fn push_v2(
+    cfg: &Config,
+    dir: &str,
+    brain: &str,
+    force: bool,
+    allow_secrets: bool,
+    skip_assets: bool,
+) {
+    if force {
+        fail(
+            "v2 sync has no force overwrite; pull, resolve the reported paths, and push a new explicit mutation",
+            Some(json!({ "code": "v2_force_removed" })),
+        );
+    }
+    if !Path::new(dir).exists() {
+        fail(&format!("store directory not found: {dir}"), None);
+    }
+    let (store, stats) = read_store_checked(dir, true);
+    let scope = local::load(Path::new(dir)).unwrap_or_else(|message| fail(&message, None));
+    if !allow_secrets {
+        let mut hits = scan_store(&store);
+        if !skip_assets {
+            let mut scan = crate::assets::scan_declared_asset_secrets(
+                dir,
+                store.assets.as_deref(),
+                scope.as_ref(),
+                false,
+            );
+            hits.append(&mut scan.hits);
+        }
+        if !hits.is_empty() {
+            fail_secret_hits(&hits, dir, None);
+        }
+    }
+    if store
+        .assets
+        .as_deref()
+        .is_some_and(|manifest| !manifest.trim().is_empty())
+    {
+        fail(
+            "this brain declares assets; v2 asset-root transport must be enabled before Sevra can move those bytes",
+            Some(json!({ "code": "v2_assets_not_enabled" })),
+        );
+    }
+    let result = run_dbmd_sync(
+        cfg,
+        &[
+            brain.to_string(),
+            "--push".to_string(),
+            "--dir".to_string(),
+            ".".to_string(),
+        ],
+        Path::new(dir),
+    );
+    let canonical = std::fs::canonicalize(dir)
+        .unwrap_or_else(|error| fail(&format!("cannot record v2 checkout: {error}"), None));
+    let canonical_brain = result
+        .get("brain_id")
+        .or_else(|| result.get("brain"))
+        .and_then(Value::as_str)
+        .unwrap_or(brain);
+    write_v2_checkout(&canonical, canonical_brain).unwrap_or_else(|error| {
+        fail(
+            &format!("push committed but {V2_CHECKOUT_FILE} could not be written: {error}"),
+            Some(result.clone()),
+        )
+    });
+    let seq = result.get("seq").and_then(Value::as_u64).unwrap_or(0);
+    let applied = result.get("applied").and_then(Value::as_u64).unwrap_or(0);
+    let status = result
+        .get("sync_status")
+        .and_then(Value::as_str)
+        .unwrap_or("synced");
+    out_layout(
+        &format!(
+            "synced {} riding file(s); {applied} change(s) committed at sequence {seq} [{status}]",
+            stats
+                .files
+                .saturating_sub(stats.kept_home + stats.catalogs_kept),
+        ),
+        Some(result),
+    );
+}
+
 pub fn push(
     cfg: &Config,
     dir: &str,
@@ -2042,18 +2190,17 @@ pub fn push(
     let kept_total = stats.kept_home + stats.catalogs_kept;
     let payload_bytes = payload.to_string().len();
     let r = if payload_bytes <= MAX_JSON_PUSH_BYTES {
-        ensure_push_ok(
-            request(
-                cfg,
-                "POST",
-                &format!("/api/hub/brains/{}/push", enc(brain)),
-                Some(&payload),
-                true,
-            ),
-            "push",
-            force,
-            kept_total,
-        )
+        let response = request(
+            cfg,
+            "POST",
+            &format!("/api/hub/brains/{}/push", enc(brain)),
+            Some(&payload),
+            true,
+        );
+        if body_code(&response) == Some("v2_sync_required") {
+            return push_v2(cfg, dir, brain, force, allow_secrets, skip_assets);
+        }
+        ensure_push_ok(response, "push", force, kept_total)
     } else {
         let pack = build_pack(&store)
             .unwrap_or_else(|e| fail(&format!("could not build store pack: {e}"), None));
@@ -2077,16 +2224,17 @@ pub fn push(
                 meta["expected_head_seq"] = json!(baseline.head_seq);
             }
         }
-        let presigned = ensure_ok(
-            request(
-                cfg,
-                "POST",
-                &format!("/api/hub/brains/{}/packs/presign", enc(brain)),
-                Some(&meta),
-                true,
-            ),
-            "prepare pack upload",
+        let response = request(
+            cfg,
+            "POST",
+            &format!("/api/hub/brains/{}/packs/presign", enc(brain)),
+            Some(&meta),
+            true,
         );
+        if body_code(&response) == Some("v2_sync_required") {
+            return push_v2(cfg, dir, brain, force, allow_secrets, skip_assets);
+        }
+        let presigned = ensure_ok(response, "prepare pack upload");
         let url = presigned
             .get("url")
             .and_then(Value::as_str)
@@ -4521,8 +4669,109 @@ pub fn export(
     out_layout(&human, Some(Value::Object(data)));
 }
 
+fn write_v2_checkout(root: &Path, brain: &str) -> Result<(), String> {
+    let value = V2Checkout {
+        v: 2,
+        brain: brain.to_string(),
+    };
+    let mut bytes = serde_json::to_vec(&value)
+        .map_err(|error| format!("cannot encode v2 checkout identity: {error}"))?;
+    bytes.push(b'\n');
+    crate::safe_path::atomic_write(root, V2_CHECKOUT_FILE, &bytes, false, 0o600)
+        .map_err(|error| format!("cannot record v2 checkout identity: {error}"))
+}
+
+fn read_v2_checkout(root: &Path) -> Result<Option<V2Checkout>, String> {
+    let Some(bytes) = crate::safe_path::read_regular(root, V2_CHECKOUT_FILE)
+        .map_err(|error| format!("cannot read v2 checkout identity: {error}"))?
+    else {
+        return Ok(None);
+    };
+    if bytes.len() > 4 * 1024 {
+        return Err("v2 checkout identity is oversized".to_string());
+    }
+    let value: V2Checkout = serde_json::from_slice(&bytes)
+        .map_err(|_| "v2 checkout identity is corrupt".to_string())?;
+    if value.v != 2 || value.brain.is_empty() || value.brain.len() > 200 {
+        return Err("v2 checkout identity is invalid".to_string());
+    }
+    Ok(Some(value))
+}
+
+fn clone_brain_v2(cfg: &Config, brain: &str, dir: Option<String>) {
+    let metadata = ensure_ok(
+        request(
+            cfg,
+            "GET",
+            &format!("/api/hub/brains/{}", enc(brain)),
+            None,
+            true,
+        ),
+        "read brain identity",
+    );
+    let slug = metadata
+        .get("slug")
+        .and_then(Value::as_str)
+        .filter(|slug| valid_brain_slug(slug))
+        .unwrap_or(brain);
+    let dir = dir.unwrap_or_else(|| format!("./{slug}"));
+    let root = normalize(
+        &std::fs::canonicalize(".")
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(&dir),
+    );
+    if std::fs::symlink_metadata(&root).is_ok() {
+        fail(
+            "clone destination already exists; choose a fresh directory",
+            None,
+        );
+    }
+    let result = run_dbmd_sync(
+        cfg,
+        &[
+            brain.to_string(),
+            "--out".to_string(),
+            root.to_string_lossy().into_owned(),
+        ],
+        Path::new("."),
+    );
+    let canonical = std::fs::canonicalize(&root)
+        .unwrap_or_else(|error| fail(&format!("cannot open cloned brain: {error}"), None));
+    let canonical_brain = result.get("brain").and_then(Value::as_str).unwrap_or(brain);
+    write_v2_checkout(&canonical, canonical_brain).unwrap_or_else(|error| {
+        fail(
+            &format!("clone completed but {V2_CHECKOUT_FILE} could not be written: {error}"),
+            Some(result.clone()),
+        )
+    });
+    let files = result.get("files").and_then(Value::as_u64).unwrap_or(0);
+    let seq = result.get("headSeq").and_then(Value::as_u64).unwrap_or(0);
+    out_layout(
+        &format!(
+            "cloned {files} file(s) at sequence {seq} → {}",
+            terminal_safe(&dir)
+        ),
+        Some(result),
+    );
+}
+
 pub fn clone_brain(cfg: &Config, brain: &str, dir: Option<String>) {
-    let snapshot = fetch_snapshot(cfg, brain, None);
+    let first = request(
+        cfg,
+        "GET",
+        &format!(
+            "/api/hub/brains/{}/export{}",
+            enc(brain),
+            snapshot_query(None, false)
+        ),
+        None,
+        true,
+    );
+    if body_code(&first) == Some("v2_sync_required") {
+        return clone_brain_v2(cfg, brain, dir);
+    }
+    let (response, requested) = request_snapshot_from(cfg, brain, None, false, Some(first));
+    let snapshot = parse_snapshot(cfg, response, requested);
     let dir = dir.unwrap_or_else(|| format!("./{}", snapshot.brain_slug));
     let root = normalize(
         &std::fs::canonicalize(".")
@@ -4720,6 +4969,33 @@ pub fn pull(cfg: &Config, dir: Option<String>, force: bool) {
     let dir = dir.unwrap_or_else(|| ".".to_string());
     let root = std::fs::canonicalize(&dir)
         .unwrap_or_else(|error| fail(&format!("cannot open pull directory {dir}: {error}"), None));
+    if let Some(checkout) = read_v2_checkout(&root).unwrap_or_else(|error| fail(&error, None)) {
+        if force {
+            fail(
+                "v2 pull has no force overwrite; resolve the reported paths and retry",
+                Some(json!({ "code": "v2_force_removed" })),
+            );
+        }
+        let result = run_dbmd_sync(
+            cfg,
+            &[
+                checkout.brain,
+                "--out".to_string(),
+                root.to_string_lossy().into_owned(),
+            ],
+            &root,
+        );
+        let files = result.get("files").and_then(Value::as_u64).unwrap_or(0);
+        let seq = result.get("headSeq").and_then(Value::as_u64).unwrap_or(0);
+        let status = result
+            .get("syncStatus")
+            .and_then(Value::as_str)
+            .unwrap_or("synced");
+        return out_layout(
+            &format!("pulled {files} file(s) at sequence {seq} [{status}]"),
+            Some(result),
+        );
+    }
     let held_root = crate::safe_path::SafeDir::open(&root).unwrap_or_else(|error| {
         fail(
             &format!("cannot securely hold pull directory: {error}"),

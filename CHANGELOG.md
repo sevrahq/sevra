@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Sync: new permissioned incremental brains negotiate through a typed hub
+  response and delegate clone, pull, and push to `dbmd`. Sevra retains local
+  secret, path, and asset preflights, records the brain identity locally, and
+  never implements a second v2 merge engine or force-overwrite escape hatch.
+- Compatibility: non-empty v1 brains retain their existing pack/snapshot
+  behavior. The client changes protocol only on `v2_sync_required`, so an
+  arbitrary 404, legacy response, or transport failure cannot trigger a
+  silent fallback.
+
 ## 0.2.18 — 2026-08-19
 
 - Runs: `sevra runs <brain>` shows every configured agent and makes the

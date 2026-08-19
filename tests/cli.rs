@@ -1206,10 +1206,14 @@ fn canonical_base64(value: &[u8]) -> String {
 }
 
 #[test]
-fn push_help_states_replacement_and_the_new_flags() {
+fn push_help_states_incremental_v2_and_legacy_v1_replacement() {
     sevra().args(["push", "--help"]).assert().success().stdout(
-        predicate::str::contains("REPLACES")
-            .and(predicate::str::contains("removed from"))
+        predicate::str::contains("only changed blobs and explicit deletes travel")
+            .and(predicate::str::contains(
+                "Legacy v1 brains retain whole-store replacement",
+            ))
+            .and(predicate::str::contains("--force is refused"))
+            .and(predicate::str::contains("Legacy v1 only"))
             .and(predicate::str::contains("--force"))
             .and(predicate::str::contains("--allow-secrets"))
             .and(predicate::str::contains(".sevralocal"))
@@ -2071,6 +2075,96 @@ fn fake_dbmd(bin_dir: &std::path::Path, emit_json: &str) {
     // the fake bin dir (the canned JSON carries no quotes echo would eat).
     std::fs::write(&path, format!("#!/bin/sh\necho '{emit_json}'\n")).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+fn fake_v2_dbmd(bin_dir: &std::path::Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = bin_dir.join("dbmd");
+    std::fs::write(&path, body).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn v2_push_delegates_only_after_the_hub_selects_v2() {
+    let store = store_dir(&[("DB.md", "---\ntype: database\n---\n# Test\n")]);
+    let bin = tempfile::tempdir().unwrap();
+    let args_log = bin.path().join("args");
+    fake_v2_dbmd(
+        bin.path(),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\necho '{{\"v\":2,\"brain_id\":\"brain-1\",\"seq\":1,\"applied\":1}}'\n",
+            args_log.display()
+        ),
+    );
+    let (base, log, handle) = mock_hub(vec![(
+        409,
+        r#"{"error":"use v2","code":"v2_sync_required"}"#.to_string(),
+    )]);
+
+    let output = sevra()
+        .args(["push", store.path().to_str().unwrap(), "--brain", "b"])
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.path().display()))
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", all_output(&output));
+    assert!(store.path().join(".sevra-v2.json").is_file());
+    let args = std::fs::read_to_string(args_log).unwrap();
+    assert!(args.contains("sync\nb\n--push\n--dir\n.\n"), "{args}");
+    assert!(args.contains("--hub"), "{args}");
+    handle.join().unwrap();
+    let requests = log.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/api/hub/brains/b/push");
+}
+
+#[cfg(unix)]
+#[test]
+fn v2_clone_delegates_after_typed_export_refusal_and_records_identity() {
+    let work = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    fake_v2_dbmd(
+        bin.path(),
+        r#"#!/bin/sh
+out=""
+prior=""
+for arg in "$@"; do
+  if [ "$prior" = "--out" ]; then out="$arg"; fi
+  prior="$arg"
+done
+mkdir -p "$out"
+printf '%s\n' '# Test' > "$out/DB.md"
+printf '%s\n' '{"brain":"brain-1","slug":"b","headSeq":0,"files":1,"dest":"brain","extraLocal":[],"syncStatus":"synced"}'
+"#,
+    );
+    let (base, log, handle) = mock_hub(vec![
+        (
+            409,
+            r#"{"error":"use v2","code":"v2_sync_required"}"#.to_string(),
+        ),
+        (200, r#"{"id":"brain-1","slug":"b"}"#.to_string()),
+    ]);
+
+    let output = sevra()
+        .args(["clone", "b", "brain"])
+        .current_dir(work.path())
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.path().display()))
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", all_output(&output));
+    let marker: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(work.path().join("brain/.sevra-v2.json")).unwrap())
+            .unwrap();
+    assert_eq!(marker["brain"], "brain-1");
+    handle.join().unwrap();
+    let requests = log.lock().unwrap();
+    assert_eq!(requests[0].path, "/api/hub/brains/b/export?format=pack");
+    assert_eq!(requests[1].path, "/api/hub/brains/b");
 }
 
 #[cfg(unix)]
