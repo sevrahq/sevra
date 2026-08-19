@@ -2054,15 +2054,16 @@ fn run_dbmd_sync(cfg: &Config, args: &[String], working_dir: &Path) -> Value {
         .unwrap_or_else(|error| fail(&format!("dbmd sync returned invalid JSON: {error}"), None))
 }
 
-fn push_v2(
-    cfg: &Config,
-    dir: &str,
-    brain: &str,
-    force: bool,
-    allow_secrets: bool,
-    skip_assets: bool,
-) {
-    if force {
+pub struct PushOptions<'a> {
+    pub force: bool,
+    pub allow_secrets: bool,
+    pub skip_assets: bool,
+    pub resume_local_policy: bool,
+    pub confirm_bulk: Option<&'a str>,
+}
+
+fn push_v2(cfg: &Config, dir: &str, brain: &str, options: &PushOptions<'_>) {
+    if options.force {
         fail(
             "v2 sync has no force overwrite; pull, resolve the reported paths, and push a new explicit mutation",
             Some(json!({ "code": "v2_force_removed" })),
@@ -2073,9 +2074,9 @@ fn push_v2(
     }
     let (store, stats) = read_store_checked(dir, true);
     let scope = local::load(Path::new(dir)).unwrap_or_else(|message| fail(&message, None));
-    if !allow_secrets {
+    if !options.allow_secrets {
         let mut hits = scan_store(&store);
-        if !skip_assets {
+        if !options.skip_assets {
             let mut scan = crate::assets::scan_declared_asset_secrets(
                 dir,
                 store.assets.as_deref(),
@@ -2088,26 +2089,31 @@ fn push_v2(
             fail_secret_hits(&hits, dir, None);
         }
     }
-    if store
-        .assets
-        .as_deref()
-        .is_some_and(|manifest| !manifest.trim().is_empty())
+    if options.skip_assets
+        && store
+            .assets
+            .as_deref()
+            .is_some_and(|manifest| !manifest.trim().is_empty())
     {
         fail(
-            "this brain declares assets; v2 asset-root transport must be enabled before Sevra can move those bytes",
-            Some(json!({ "code": "v2_assets_not_enabled" })),
+            "--skip-assets is a legacy v1 option; a v2 commit must preserve the signed asset-root transition",
+            Some(json!({ "code": "v2_skip_assets_removed" })),
         );
     }
-    let result = run_dbmd_sync(
-        cfg,
-        &[
-            brain.to_string(),
-            "--push".to_string(),
-            "--dir".to_string(),
-            ".".to_string(),
-        ],
-        Path::new(dir),
-    );
+    let mut sync_args = vec![
+        brain.to_string(),
+        "--push".to_string(),
+        "--dir".to_string(),
+        ".".to_string(),
+    ];
+    if options.resume_local_policy {
+        sync_args.push("--resume-local-policy".to_string());
+    }
+    if let Some(confirmation) = options.confirm_bulk {
+        sync_args.push("--confirm-bulk".to_string());
+        sync_args.push(confirmation.to_string());
+    }
+    let result = run_dbmd_sync(cfg, &sync_args, Path::new(dir));
     let canonical = std::fs::canonicalize(dir)
         .unwrap_or_else(|error| fail(&format!("cannot record v2 checkout: {error}"), None));
     let canonical_brain = result
@@ -2138,14 +2144,7 @@ fn push_v2(
     );
 }
 
-pub fn push(
-    cfg: &Config,
-    dir: &str,
-    brain: &str,
-    force: bool,
-    allow_secrets: bool,
-    skip_assets: bool,
-) {
+pub fn push(cfg: &Config, dir: &str, brain: &str, options: PushOptions<'_>) {
     if !Path::new(dir).exists() {
         fail(&format!("store directory not found: {dir}"), None);
     }
@@ -2223,9 +2222,9 @@ pub fn push(
     // the first hub request; --skip-assets correctly skips bytes that will not
     // upload during this push.
     let mut asset_secret_scan = None;
-    if !allow_secrets {
+    if !options.allow_secrets {
         let mut hits = scan_store(&store);
-        if !skip_assets {
+        if !options.skip_assets {
             let mut scan = crate::assets::scan_declared_asset_secrets(
                 dir,
                 store.assets.as_deref(),
@@ -2274,7 +2273,7 @@ pub fn push(
     let mut payload = serde_json::to_value(&store).unwrap();
     payload["withheld_paths"] = json!(withheld.paths);
     payload["kept_home_unlinked"] = json!(withheld.unlinked);
-    if force {
+    if options.force {
         payload["allow_shrink"] = json!(true);
     } else if let Some(baseline) = &prior_baseline {
         payload["expected_head_seq"] = json!(baseline.head_seq);
@@ -2293,9 +2292,9 @@ pub fn push(
             true,
         );
         if body_code(&response) == Some("v2_sync_required") {
-            return push_v2(cfg, dir, brain, force, allow_secrets, skip_assets);
+            return push_v2(cfg, dir, brain, &options);
         }
-        ensure_push_ok(response, "push", force, kept_total)
+        ensure_push_ok(response, "push", options.force, kept_total)
     } else {
         let pack = build_pack(&store)
             .unwrap_or_else(|e| fail(&format!("could not build store pack: {e}"), None));
@@ -2314,7 +2313,7 @@ pub fn push(
         let mut meta = json!({ "sha256": sha256, "bytes": pack.len() });
         meta["withheld_paths"] = json!(withheld.paths);
         meta["kept_home_unlinked"] = json!(withheld.unlinked);
-        if !force {
+        if !options.force {
             if let Some(baseline) = &prior_baseline {
                 meta["expected_head_seq"] = json!(baseline.head_seq);
             }
@@ -2327,7 +2326,7 @@ pub fn push(
             true,
         );
         if body_code(&response) == Some("v2_sync_required") {
-            return push_v2(cfg, dir, brain, force, allow_secrets, skip_assets);
+            return push_v2(cfg, dir, brain, &options);
         }
         let presigned = ensure_ok(response, "prepare pack upload");
         let url = presigned
@@ -2341,10 +2340,10 @@ pub fn push(
             &pack,
         );
         let mut commit = meta;
-        if force {
+        if options.force {
             commit["allow_shrink"] = json!(true);
         }
-        commit_pack(cfg, brain, &commit, force, kept_total)
+        commit_pack(cfg, brain, &commit, options.force, kept_total)
     };
     let s = r.get("indexed").cloned().unwrap_or(json!({}));
     let n = |k: &str| s.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
@@ -2476,7 +2475,7 @@ pub fn push(
     // reports missing. Strictly after the commit (the hub refuses undeclared
     // hashes) and skippable for a metadata-only push.
     let manifest_assets = n("assets");
-    if !skip_assets && manifest_assets > 0 {
+    if !options.skip_assets && manifest_assets > 0 {
         let sync = crate::assets::sync_after_push(cfg, brain, dir, scope.as_ref());
         if sync.uploaded > 0 {
             human.push_str(&format!(
@@ -4603,6 +4602,148 @@ fn vault_export_entry(
     (VAULT_EXPORT_FILE.to_string(), bytes)
 }
 
+fn export_v2(
+    cfg: &Config,
+    brain: &str,
+    dir: Option<String>,
+    skip_assets: bool,
+    with_secrets: bool,
+) {
+    if skip_assets {
+        fail(
+            "--skip-assets is a legacy v1 option; a v2 export preserves its signed asset-root view",
+            Some(json!({ "code": "v2_skip_assets_removed" })),
+        );
+    }
+    let metadata = ensure_ok(
+        request(
+            cfg,
+            "GET",
+            &format!("/api/hub/brains/{}", enc(brain)),
+            None,
+            true,
+        ),
+        "read v2 brain identity",
+    );
+    let slug = metadata
+        .get("slug")
+        .and_then(Value::as_str)
+        .filter(|slug| valid_brain_slug(slug))
+        .unwrap_or("brain");
+    let dir = dir.unwrap_or_else(|| format!("./{slug}-export"));
+    let root = normalize(
+        &std::fs::canonicalize(".")
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(&dir),
+    );
+    match std::fs::symlink_metadata(&root) {
+        Ok(_) => fail(
+            "export destination already exists; choose a new directory",
+            None,
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => fail(&format!("cannot inspect export destination: {error}"), None),
+    }
+    let parent_path = root
+        .parent()
+        .unwrap_or_else(|| fail("export destination has no parent directory", None));
+    let target_name = root
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or_else(|| fail("export destination name is not portable UTF-8", None));
+    crate::safe_path::ensure_dir(parent_path, 0o755).unwrap_or_else(|error| {
+        fail(
+            &format!("cannot securely create export parent without following links: {error}"),
+            None,
+        )
+    });
+    let parent = crate::safe_path::SafeDir::open(parent_path).unwrap_or_else(|error| {
+        fail(
+            &format!("cannot securely hold export parent: {error}"),
+            None,
+        )
+    });
+    let mut random = [0_u8; 16];
+    getrandom::getrandom(&mut random)
+        .unwrap_or_else(|_| fail("operating-system randomness unavailable", None));
+    let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+    let stage_name = format!(".sevra-export-{suffix}");
+    let stage_path = parent_path.join(&stage_name);
+    let result = run_dbmd_sync(
+        cfg,
+        &[
+            brain.to_string(),
+            "--out".to_string(),
+            stage_path.to_string_lossy().into_owned(),
+        ],
+        parent_path,
+    );
+    let vault = ensure_ok(
+        request(
+            cfg,
+            "GET",
+            &format!("/api/hub/brains/{}/vault", enc(brain)),
+            None,
+            true,
+        ),
+        "list v2 export vault names",
+    );
+    let names = vault
+        .get("items")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| fail("hub returned malformed vault export metadata", None))
+        .iter()
+        .map(|item| {
+            item.get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| fail("hub returned malformed vault export metadata", None))
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    let vault_response = json!({
+        "brain": result
+            .get("brain")
+            .and_then(Value::as_str)
+            .unwrap_or(brain),
+        "vaultItems": names,
+    });
+    let names = export_vault_names(&vault_response);
+    let (_, vault_bytes) = vault_export_entry(cfg, brain, &vault_response, &names, with_secrets);
+    crate::safe_path::atomic_write(&stage_path, VAULT_EXPORT_FILE, &vault_bytes, false, 0o600)
+        .unwrap_or_else(|error| fail(&format!("cannot finalize v2 vault export: {error}"), None));
+    if let Err(error) = parent.publish_dir_no_replace(&stage_name, target_name) {
+        let rollback = discard_private_stage(&parent, &stage_name);
+        match rollback {
+            Ok(()) => fail(
+                &format!("export destination appeared before atomic publish: {error}"),
+                None,
+            ),
+            Err(rollback_error) => fail(
+                &format!(
+                    "export destination appeared before atomic publish: {error}; stage cleanup also failed: {rollback_error}"
+                ),
+                None,
+            ),
+        }
+    }
+    let files = result.get("files").and_then(Value::as_u64).unwrap_or(0);
+    let seq = result.get("headSeq").and_then(Value::as_u64).unwrap_or(0);
+    let mut data = result.as_object().cloned().unwrap_or_default();
+    data.insert("dir".into(), json!(dir));
+    data.insert("vaultFile".into(), json!(VAULT_EXPORT_FILE));
+    data.insert("vaultNames".into(), json!(names));
+    data.insert("vaultValuesIncluded".into(), json!(with_secrets));
+    out_layout(
+        &format!(
+            "exported {files} file(s) at sequence {seq} → {}\nvault: {} name(s) listed in {VAULT_EXPORT_FILE}; values {}",
+            terminal_safe(&dir),
+            names.len(),
+            if with_secrets { "included (private file; handle as credentials)" } else { "not included" }
+        ),
+        Some(Value::Object(data)),
+    );
+}
+
 pub fn export(
     cfg: &Config,
     brain: &str,
@@ -4610,7 +4751,21 @@ pub fn export(
     skip_assets: bool,
     with_secrets: bool,
 ) {
-    let (r, requested) = request_snapshot(cfg, brain, None, true);
+    let first = request(
+        cfg,
+        "GET",
+        &format!(
+            "/api/hub/brains/{}/export{}",
+            enc(brain),
+            snapshot_query(None, true)
+        ),
+        None,
+        true,
+    );
+    if body_code(&first) == Some("v2_bulk_required") {
+        return export_v2(cfg, brain, dir, skip_assets, with_secrets);
+    }
+    let (r, requested) = request_snapshot_from(cfg, brain, None, true, Some(first));
     if let Some((expected_seq, expected_hash)) = requested {
         let actual_seq = r.get("headSeq").and_then(Value::as_u64);
         let actual_hash = r.get("feedHash").and_then(Value::as_str);

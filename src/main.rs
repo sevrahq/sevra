@@ -124,9 +124,19 @@ enum Commands {
         #[arg(long)]
         allow_secrets: bool,
         /// Skip the post-commit asset byte sync (`assets.jsonl`-declared
-        /// blobs the hub reports missing upload by default)
+        /// blobs the hub reports missing upload by default). Legacy v1 only;
+        /// v2 commits its signed asset root through dbmd.
         #[arg(long)]
         skip_assets: bool,
+        /// Approve paths newly made eligible by a `.sevralocal` change. On v2
+        /// this delegates to dbmd's exact local-policy transition guard.
+        #[arg(long)]
+        resume_local_policy: bool,
+        /// Confirm the exact permissioned bulk preview from the preceding v2
+        /// attempt. Changing the principal, head, permissions, or files makes
+        /// the receipt invalid.
+        #[arg(long, value_name = "ID:DIGEST")]
+        confirm_bulk: Option<String>,
     },
     /// Bring a hosted brain onto this machine for the first time. Link.md v2
     /// delegates verification, scoped materialization, and private baselines
@@ -439,7 +449,20 @@ fn main() {
             force,
             allow_secrets,
             skip_assets,
-        } => commands::push(&cfg, &dir, &brain, force, allow_secrets, skip_assets),
+            resume_local_policy,
+            confirm_bulk,
+        } => commands::push(
+            &cfg,
+            &dir,
+            &brain,
+            commands::PushOptions {
+                force,
+                allow_secrets,
+                skip_assets,
+                resume_local_policy,
+                confirm_bulk: confirm_bulk.as_deref(),
+            },
+        ),
         Commands::Clone { brain, dir } => commands::clone_brain(&cfg, &brain, dir),
         Commands::Pull { dir, force } => commands::pull(&cfg, dir, force),
         Commands::Query {
