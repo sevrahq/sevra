@@ -74,6 +74,10 @@ enum Commands {
     Whoami,
     /// List your brains
     Brains,
+    /// Show a brain's run agents and manual-only schedule state
+    Runs { brain: String },
+    /// Manually queue one Sevra-run agent
+    Run { brain: String, agent: String },
     /// Create a brain
     Create {
         slug: String,
@@ -419,6 +423,8 @@ fn main() {
     match cli.command {
         Commands::Whoami => commands::whoami(&cfg),
         Commands::Brains => commands::brains(&cfg),
+        Commands::Runs { brain } => commands::runs(&cfg, &brain),
+        Commands::Run { brain, agent } => commands::run(&cfg, &brain, &agent),
         Commands::Create {
             slug,
             name,

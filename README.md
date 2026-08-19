@@ -31,6 +31,8 @@ sevra logout                                     revoke a browser-minted key + f
 sevra whoami
 
 sevra brains                                     list your brains
+sevra runs <brain>                               show run agents and the manual-only schedule state
+sevra run <brain> <agent>                        manually queue one Sevra-run agent
 sevra create <slug> [--name] [--scope] [--public]
 sevra delete <brain> [--confirm <slug>]          permanently delete a hosted brain (owner-only)
 sevra clone <brain> [dir]                        records + assets + sync baseline into a fresh dir

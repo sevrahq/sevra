@@ -47,7 +47,12 @@ fn help_lists_commands() {
     let out = sevra().arg("--help").output().unwrap();
     assert!(out.status.success(), "{}", all_output(&out));
     let help = String::from_utf8(out.stdout).unwrap();
-    assert!(help.contains("login") && help.contains("update"));
+    assert!(
+        help.contains("login")
+            && help.contains("runs")
+            && help.contains("run")
+            && help.contains("update")
+    );
     assert!(
         help.lines().count() > 5,
         "trusted clap layout must retain its real line breaks"
@@ -562,6 +567,7 @@ fn respond_json(stream: &mut TcpStream, status: u16, body: &str) {
     let reason = match status {
         200 => "OK",
         201 => "Created",
+        202 => "Accepted",
         400 => "Bad Request",
         429 => "Too Many Requests",
         _ => "Error",
@@ -571,6 +577,57 @@ fn respond_json(stream: &mut TcpStream, status: u16, body: &str) {
         body.len()
     );
     let _ = stream.write_all(msg.as_bytes());
+}
+
+#[test]
+fn runs_show_manual_only_state_and_run_posts_the_agent() {
+    let (base, log, handle) = mock_hub(vec![
+        (
+            200,
+            r#"{"execution":{"automaticSchedulesEnabled":false,"automaticSchedulesStatus":"temporarily_disabled","manualRunsEnabled":true},"agents":[{"name":"curate\u001b[31m","engine":"sevra","enabled":true,"schedule":"0 3 * * *"}],"runs":[],"billing":{"balanceCents":500,"sevraRunsPaused":false}}"#.to_string(),
+        ),
+        (
+            202,
+            r#"{"status":"queued","runId":"01test"}"#.to_string(),
+        ),
+    ]);
+
+    let listed = sevra()
+        .args(["runs", "brain"])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", MOCK_KEY)
+        .output()
+        .unwrap();
+    assert!(listed.status.success(), "{}", all_output(&listed));
+    assert!(!listed.stdout.contains(&0x1b));
+    let human = String::from_utf8(listed.stdout).unwrap();
+    assert!(
+        human.contains("automatic schedules are temporarily off"),
+        "{human}"
+    );
+    assert!(human.contains("manual only"), "{human}");
+    assert!(human.contains("sevra run brain <agent>"), "{human}");
+
+    let queued = sevra()
+        .args(["run", "brain", "curate"])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", MOCK_KEY)
+        .output()
+        .unwrap();
+    assert!(queued.status.success(), "{}", all_output(&queued));
+    assert!(all_output(&queued).contains("queued curate manually on brain"));
+
+    handle.join().unwrap();
+    let requests = log.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].method, "GET");
+    assert_eq!(requests[0].path, "/api/hub/brains/brain/runs");
+    assert_eq!(requests[1].method, "POST");
+    assert_eq!(requests[1].path, "/api/hub/brains/brain/runs");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&requests[1].body).unwrap(),
+        serde_json::json!({ "agent": "curate" })
+    );
 }
 
 /// Serve `responses` in order, one connection each, recording every request.

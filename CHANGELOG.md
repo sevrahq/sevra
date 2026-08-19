@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.18 — 2026-08-19
+
+- Runs: `sevra runs <brain>` shows every configured agent and makes the
+  temporary manual-only schedule policy explicit. `sevra run <brain> <agent>`
+  queues one hosted run on demand, matching the owner dashboard control.
+- Safety: run-list output terminal-escapes every hub-controlled field, and both
+  commands retain machine-readable `--json` output.
+
 ## 0.2.17 — 2026-08-18
 
 - Transfer performance: initial sync and restore now plan assets in windows of

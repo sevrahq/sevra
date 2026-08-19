@@ -1353,6 +1353,104 @@ pub fn brains(cfg: &Config) {
     }
 }
 
+pub fn runs(cfg: &Config, brain: &str) {
+    let r = ensure_ok(
+        request(
+            cfg,
+            "GET",
+            &format!("/api/hub/brains/{}/runs", enc(brain)),
+            None,
+            true,
+        ),
+        "list runs",
+    );
+    if json_mode() {
+        out("", Some(r));
+        return;
+    }
+
+    let automatic = r
+        .pointer("/execution/automaticSchedulesEnabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if automatic {
+        out("automatic schedules are enabled", None);
+    } else {
+        out(
+            &format!(
+                "automatic schedules are temporarily off. Nothing runs from a schedule; use `sevra run {} <agent>` or the dashboard",
+                terminal_safe(brain)
+            ),
+            None,
+        );
+    }
+
+    let agents = r
+        .get("agents")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if agents.is_empty() {
+        out("no run agents are configured on this brain", None);
+        return;
+    }
+    for agent in agents {
+        let name = terminal_safe(str_field(&agent, "name"));
+        let engine = terminal_safe(str_field(&agent, "engine"));
+        let enabled = agent
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let schedule = agent.get("schedule").and_then(Value::as_str);
+        let state = if !enabled {
+            "disabled".to_string()
+        } else if engine == "byo" {
+            "runs on your agent".to_string()
+        } else if let Some(schedule) = schedule {
+            if automatic {
+                format!("scheduled ({})", terminal_safe(schedule))
+            } else {
+                format!(
+                    "manual only; configured schedule {} is temporarily off",
+                    terminal_safe(schedule)
+                )
+            }
+        } else {
+            "manual only".to_string()
+        };
+        out_layout(&format!("{name}\t{engine}\t{state}"), None);
+    }
+}
+
+pub fn run(cfg: &Config, brain: &str, agent: &str) {
+    let body = json!({ "agent": agent });
+    let r = ensure_ok(
+        request(
+            cfg,
+            "POST",
+            &format!("/api/hub/brains/{}/runs", enc(brain)),
+            Some(&body),
+            true,
+        ),
+        "queue run",
+    );
+    let status = str_field(&r, "status");
+    let message = if status == "already_queued" {
+        format!(
+            "{} is already queued on {}",
+            terminal_safe(agent),
+            terminal_safe(brain)
+        )
+    } else {
+        format!(
+            "queued {} manually on {}",
+            terminal_safe(agent),
+            terminal_safe(brain)
+        )
+    };
+    out(&message, Some(r));
+}
+
 pub fn create(cfg: &Config, slug: &str, name: Option<String>, scope: Option<String>, public: bool) {
     let body = json!({
         "slug": slug,
