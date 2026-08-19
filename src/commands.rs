@@ -4381,6 +4381,111 @@ fn entries_from_pack(bytes: Vec<u8>) -> Vec<(String, Vec<u8>)> {
     entries
 }
 
+// Hosted v1 snapshots deliberately omit db.md's derived `index.jsonl`
+// sidecars from the sync wire. Materializing one without rebuilding leaves an
+// otherwise healthy checkout unable to pass `dbmd validate --all` or answer a
+// structured query. Keep that derivation on the client side: dbmd remains the
+// sole format authority, and the source snapshot stays byte-exact.
+//
+// `Ok(false)` means dbmd is not installed. Export still returns the owner's
+// source bytes in that case and says exactly how to finish the cache rebuild.
+// Any other dbmd failure is real and must stop an atomic export/clone before
+// its private stage is published.
+fn rebuild_local_catalogs(root: &Path) -> Result<bool, String> {
+    // Old/pre-standard snapshots can exist without DB.md. Preserve their raw
+    // ownership export; dbmd correctly has nothing it can derive for them.
+    match std::fs::symlink_metadata(root.join("DB.md")) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => return Err("DB.md in the materialized snapshot is not a regular file".to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect DB.md before catalog rebuild: {error}"
+            ))
+        }
+    }
+    let output = match Command::new("dbmd")
+        .args(["index", "rebuild", "--json"])
+        .current_dir(root)
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("could not run dbmd index rebuild: {error}")),
+    };
+    if output.status.success() {
+        return Ok(true);
+    }
+    let detail = String::from_utf8_lossy(&output.stderr);
+    let detail = detail.trim();
+    Err(if detail.is_empty() {
+        "dbmd index rebuild failed without a diagnostic".to_string()
+    } else {
+        format!("dbmd index rebuild failed: {}", terminal_safe(detail))
+    })
+}
+
+// An export/clone staging directory is freshly created, private, and wholly
+// request-owned. Clear it through held directory capabilities so a failed
+// dbmd rebuild or a destination race can remove generated catalogs too,
+// without following a path an attacker swaps underneath us.
+fn clear_private_stage(root: &crate::safe_path::SafeDir) -> Result<(), String> {
+    for entry in root
+        .entries()
+        .map_err(|error| format!("cannot inspect private stage: {error}"))?
+    {
+        let name = entry
+            .name
+            .to_str()
+            .ok_or_else(|| "private stage contains a non-UTF-8 name".to_string())?;
+        match entry.kind {
+            crate::safe_path::EntryKind::File => {
+                if !root
+                    .remove_regular(name)
+                    .map_err(|error| format!("cannot remove private stage file: {error}"))?
+                {
+                    return Err("private stage file disappeared during cleanup".to_string());
+                }
+            }
+            crate::safe_path::EntryKind::Directory => {
+                let child = root
+                    .open_dir(&entry.name)
+                    .map_err(|error| format!("cannot hold private stage directory: {error}"))?;
+                clear_private_stage(&child)?;
+                drop(child);
+                if !root
+                    .remove_empty_dir(name)
+                    .map_err(|error| format!("cannot remove private stage directory: {error}"))?
+                {
+                    return Err("private stage directory disappeared during cleanup".to_string());
+                }
+            }
+            crate::safe_path::EntryKind::Symlink | crate::safe_path::EntryKind::Other => {
+                return Err("private stage gained an unsafe filesystem entry".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn discard_private_stage(
+    parent: &crate::safe_path::SafeDir,
+    stage_name: &str,
+) -> Result<(), String> {
+    let stage = parent
+        .open_dir(std::ffi::OsStr::new(stage_name))
+        .map_err(|error| format!("cannot reopen private stage: {error}"))?;
+    clear_private_stage(&stage)?;
+    drop(stage);
+    if !parent
+        .remove_empty_dir(stage_name)
+        .map_err(|error| format!("cannot remove private stage: {error}"))?
+    {
+        return Err("private stage disappeared during cleanup".to_string());
+    }
+    Ok(())
+}
+
 fn read_bounded(reader: &mut impl Read, max_bytes: u64) -> std::io::Result<Vec<u8>> {
     let mut content = Vec::new();
     reader
@@ -4669,7 +4774,7 @@ pub fn export(
     paths.push(VAULT_EXPORT_FILE.to_string());
     let backups = snapshot_missing_destinations(&paths);
     let created_directories = parent_directories(paths.iter().cloned());
-    let completed = match install_complete_export(
+    match install_complete_export(
         &stage,
         &entries,
         &mut prepared,
@@ -4678,7 +4783,7 @@ pub fn export(
         &[],
         Some(&vault_entry),
     ) {
-        Ok(completed) => completed,
+        Ok(_) => {}
         Err(error) => {
             drop(stage);
             match parent.remove_empty_dir(&stage_name) {
@@ -4690,21 +4795,22 @@ pub fn export(
             }
         }
     };
+    let catalogs_rebuilt = match rebuild_local_catalogs(&parent_path.join(&stage_name)) {
+        Ok(rebuilt) => rebuilt,
+        Err(error) => {
+            drop(stage);
+            match discard_private_stage(&parent, &stage_name) {
+                Ok(()) => fail(&error, None),
+                Err(cleanup_error) => fail(
+                    &format!("{error}; private stage cleanup also failed: {cleanup_error}"),
+                    None,
+                ),
+            }
+        }
+    };
     drop(stage);
     if let Err(error) = parent.publish_dir_no_replace(&stage_name, target_name) {
-        let rollback = parent
-            .open_dir(std::ffi::OsStr::new(&stage_name))
-            .map_err(|open_error| open_error.to_string())
-            .and_then(|stage| {
-                rollback_held_export(&stage, &completed, &created_directories)
-                    .map_err(|rollback_error| rollback_error.to_string())
-            })
-            .and_then(|()| {
-                parent
-                    .remove_empty_dir(&stage_name)
-                    .map(|_| ())
-                    .map_err(|remove_error| remove_error.to_string())
-            });
+        let rollback = discard_private_stage(&parent, &stage_name);
         match rollback {
             Ok(()) => fail(
                 &format!(
@@ -4727,6 +4833,7 @@ pub fn export(
     data.remove("vaultItems");
     data.insert("dir".into(), json!(dir));
     data.insert("fileCount".into(), json!(entries.len()));
+    data.insert("catalogsRebuilt".into(), json!(catalogs_rebuilt));
     data.insert("vaultFile".into(), json!(VAULT_EXPORT_FILE));
     data.insert("vaultNames".into(), json!(vault_names));
     data.insert("vaultValuesIncluded".into(), json!(with_secrets));
@@ -4761,6 +4868,11 @@ pub fn export(
             "not included"
         }
     ));
+    human.push_str(if catalogs_rebuilt {
+        "\ncatalogs: rebuilt locally with dbmd"
+    } else {
+        "\ncatalogs: dbmd is not installed; install it and run `dbmd index rebuild` in the export"
+    });
     out_layout(&human, Some(Value::Object(data)));
 }
 
@@ -4939,7 +5051,7 @@ pub fn clone_brain(cfg: &Config, brain: &str, dir: Option<String>) {
         .collect();
     let backups = snapshot_missing_destinations(&paths);
     let created_directories = parent_directories(paths.iter().cloned());
-    let completed = match install_complete_export(
+    match install_complete_export(
         &stage,
         &entries,
         &mut prepared,
@@ -4948,7 +5060,7 @@ pub fn clone_brain(cfg: &Config, brain: &str, dir: Option<String>) {
         &[],
         Some(&baseline_entry),
     ) {
-        Ok(completed) => completed,
+        Ok(_) => {}
         Err(error) => {
             drop(stage);
             match parent.remove_empty_dir(&stage_name) {
@@ -4960,21 +5072,22 @@ pub fn clone_brain(cfg: &Config, brain: &str, dir: Option<String>) {
             }
         }
     };
+    let catalogs_rebuilt = match rebuild_local_catalogs(&parent_path.join(&stage_name)) {
+        Ok(rebuilt) => rebuilt,
+        Err(error) => {
+            drop(stage);
+            match discard_private_stage(&parent, &stage_name) {
+                Ok(()) => fail(&error, None),
+                Err(cleanup_error) => fail(
+                    &format!("{error}; private stage cleanup also failed: {cleanup_error}"),
+                    None,
+                ),
+            }
+        }
+    };
     drop(stage);
     if let Err(error) = parent.publish_dir_no_replace(&stage_name, target_name) {
-        let rollback = parent
-            .open_dir(std::ffi::OsStr::new(&stage_name))
-            .map_err(|open_error| open_error.to_string())
-            .and_then(|stage| {
-                rollback_held_export(&stage, &completed, &created_directories)
-                    .map_err(|rollback_error| rollback_error.to_string())
-            })
-            .and_then(|()| {
-                parent
-                    .remove_empty_dir(&stage_name)
-                    .map(|_| ())
-                    .map_err(|remove_error| remove_error.to_string())
-            });
+        let rollback = discard_private_stage(&parent, &stage_name);
         match rollback {
             Ok(()) => fail(
                 &format!(
@@ -4998,6 +5111,7 @@ pub fn clone_brain(cfg: &Config, brain: &str, dir: Option<String>) {
     data.insert("dir".into(), json!(dir));
     data.insert("baseline".into(), json!(SYNC_BASELINE_FILE));
     data.insert("fileCount".into(), json!(baseline.paths.len()));
+    data.insert("catalogsRebuilt".into(), json!(catalogs_rebuilt));
     data.insert("assetRestore".into(), restore.to_json());
     let mut human = format!(
         "cloned {} file(s) at feed sequence {} → {}",
@@ -5019,6 +5133,11 @@ pub fn clone_brain(cfg: &Config, brain: &str, dir: Option<String>) {
             baseline.kept_home_unlinked,
         ));
     }
+    human.push_str(if catalogs_rebuilt {
+        "\ncatalogs: rebuilt locally with dbmd"
+    } else {
+        "\ncatalogs: dbmd is not installed; install it and run `dbmd index rebuild` in the clone"
+    });
     out_layout(&human, Some(Value::Object(data)));
 }
 
@@ -5305,6 +5424,15 @@ pub fn pull(cfg: &Config, dir: Option<String>, force: bool) {
         )
     });
 
+    // Source bytes and the sync baseline are already durable at this point.
+    // Refresh the local derived catalogs after the transactional pull; a
+    // missing dbmd is reported as an actionable cache warning, while an
+    // unexpected dbmd failure never misrepresents the source commit as undone.
+    let (catalogs_rebuilt, catalog_rebuild_error) = match rebuild_local_catalogs(&root) {
+        Ok(rebuilt) => (rebuilt, None),
+        Err(error) => (false, Some(error)),
+    };
+
     let restore = prepared.report();
     let mut data = snapshot.response.as_object().cloned().unwrap_or_default();
     data.remove("files");
@@ -5317,6 +5445,10 @@ pub fn pull(cfg: &Config, dir: Option<String>, force: bool) {
     );
     data.insert("removed".into(), json!(remove_paths));
     data.insert("assetRestore".into(), restore.to_json());
+    data.insert("catalogsRebuilt".into(), json!(catalogs_rebuilt));
+    if let Some(error) = &catalog_rebuild_error {
+        data.insert("catalogRebuildError".into(), json!(error));
+    }
     let mut human = format!(
         "pulled feed sequence {} → {} file(s) current",
         next_baseline.head_seq,
@@ -5334,6 +5466,18 @@ pub fn pull(cfg: &Config, dir: Option<String>, force: bool) {
             restore.restored,
             human_size(restore.restored_bytes)
         ));
+    }
+    if catalogs_rebuilt {
+        human.push_str("\ncatalogs: rebuilt locally with dbmd");
+    } else if let Some(error) = &catalog_rebuild_error {
+        human.push_str(&format!(
+            "\ncatalogs: source pull committed, but {}",
+            terminal_safe(error)
+        ));
+    } else {
+        human.push_str(
+            "\ncatalogs: dbmd is not installed; install it and run `dbmd index rebuild` in the clone",
+        );
     }
     out_layout(&human, Some(Value::Object(data)));
 }

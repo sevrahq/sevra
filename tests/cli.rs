@@ -3731,6 +3731,50 @@ fn export_restores_missing_assets_sha_verified() {
     assert_eq!(restored, b"BLOB", "restored bytes match the manifest hash");
 }
 
+#[cfg(unix)]
+#[test]
+fn export_rebuilds_dbmd_catalogs_before_atomic_publish() {
+    let export_body = serde_json::json!({
+        "brain": "brain-1",
+        "slug": "b",
+        "vaultItems": [],
+        "files": [
+            {
+                "path": "DB.md",
+                "content": "---\ntype: db-md\nname: Test\nowner: Test\nscope: test\nsummary: Test store.\n---\n# Test\n"
+            },
+            {
+                "path": "records/notes/fact.md",
+                "content": "---\ntype: note\nsummary: Test fact.\n---\n# Fact\n"
+            }
+        ]
+    })
+    .to_string();
+    let (base, _log, handle) = mock_hub(vec![(200, export_body)]);
+    let work = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    fake_v2_dbmd(
+        bin.path(),
+        "#!/bin/sh\n[ \"$1 $2 $3\" = \"index rebuild --json\" ] || exit 64\nmkdir -p records/notes\nprintf '%s\\n' '{\"path\":\"records/notes/fact.md\"}' > records/notes/index.jsonl\n",
+    );
+    let out = sevra()
+        .args(["export", "b", "out", "--json"])
+        .current_dir(work.path())
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.path().display()))
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", MOCK_KEY)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "export failed: {}", all_output(&out));
+    let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["catalogsRebuilt"], true);
+    assert_eq!(
+        std::fs::read_to_string(work.path().join("out/records/notes/index.jsonl")).unwrap(),
+        "{\"path\":\"records/notes/fact.md\"}\n"
+    );
+    handle.join().unwrap();
+}
+
 #[test]
 fn export_always_writes_a_private_vault_name_manifest_without_values() {
     let export_body = r#"{
