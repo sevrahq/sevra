@@ -1654,7 +1654,7 @@ fn prompt_delete_confirmation(cfg: &Config, brain: &str) -> String {
 
 pub fn delete(cfg: &Config, brain: &str, confirm: Option<String>) {
     let confirm = confirm.unwrap_or_else(|| prompt_delete_confirmation(cfg, brain));
-    let resp = request(
+    let mut resp = request(
         cfg,
         "DELETE",
         &format!("/api/hub/brains/{}", enc(brain)),
@@ -1676,6 +1676,53 @@ pub fn delete(cfg: &Config, brain: &str, confirm: Option<String>) {
                 "delete refused (HTTP 400): {server}\nconfirm with the brain's exact slug: sevra delete {brain} --confirm <slug> (`sevra brains` lists slugs)"
             ),
             resp.body,
+        );
+    }
+    // V2 binds destructive control mutations to the caller, a stable mutation
+    // id, and the exact control revision. Probe the legacy-compatible delete
+    // first so old hubs and v1 brains keep their one-request behavior; only a
+    // typed v2 precondition refusal may trigger the metadata read and retry.
+    if resp.status == 409 && body_code(&resp) == Some("precondition_required") {
+        let info = ensure_ok(
+            request(
+                cfg,
+                "GET",
+                &format!("/api/hub/brains/{}", enc(brain)),
+                None,
+                true,
+            ),
+            "read permissioned deletion precondition",
+        );
+        let profile = info
+            .pointer("/sync/currentWriteProfile")
+            .and_then(Value::as_str);
+        let control_revision = info
+            .pointer("/permissionView/controlRevision")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                fail(
+                    "the hub selected v2 deletion but returned no exact control revision",
+                    Some(info.clone()),
+                )
+            });
+        if profile != Some("v2") {
+            fail(
+                "the hub required permissioned deletion for a brain that did not advertise v2",
+                Some(info),
+            );
+        }
+        let mutation_id = format!("sevra-delete:{}", random_b64url(18));
+        resp = request(
+            cfg,
+            "DELETE",
+            &format!("/api/hub/brains/{}", enc(brain)),
+            Some(&json!({
+                "confirm": confirm,
+                "mutation_id": mutation_id,
+                "expected_control_revision": control_revision,
+            })),
+            true,
         );
     }
     let r = ensure_ok(resp, "delete");

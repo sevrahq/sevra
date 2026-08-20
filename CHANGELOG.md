@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.2.23 — 2026-08-20
+
+- Deletion: v2 brains now retry the typed precondition challenge with a fresh,
+  unguessable mutation id and the exact permissioned control revision. Legacy
+  brains and older hubs keep their existing one-request deletion behavior.
+
 ## 0.2.22 — 2026-08-19
 
 - Permissioned sync: clone, pull, push, and export delegate v2 brains to the

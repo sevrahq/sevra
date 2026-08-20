@@ -1542,6 +1542,55 @@ fn delete_with_confirm_sends_the_slug_and_reports_the_removal() {
 }
 
 #[test]
+fn delete_retries_v2_with_an_exact_control_precondition() {
+    let (base, log, handle) = mock_hub(vec![
+        (
+            409,
+            r#"{"error":"A mutation_id and exact expected_control_revision are required for permissioned deletion.","code":"precondition_required"}"#.to_string(),
+        ),
+        (
+            200,
+            r#"{"id":"01brain","sync":{"currentWriteProfile":"v2"},"permissionView":{"controlRevision":"control:7"}}"#.to_string(),
+        ),
+        (
+            200,
+            r#"{"deleted":true,"brain":"01brain","r2Objects":11}"#.to_string(),
+        ),
+    ]);
+    sevra()
+        .args(["delete", "workbrain", "--confirm", "workbrain", "--json"])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(r#""deleted": true"#));
+    handle.join().unwrap();
+    let reqs = log.lock().unwrap();
+    assert_eq!(reqs.len(), 3);
+    assert_eq!(
+        (reqs[0].method.as_str(), reqs[0].path.as_str()),
+        ("DELETE", "/api/hub/brains/workbrain")
+    );
+    assert_eq!(
+        (reqs[1].method.as_str(), reqs[1].path.as_str()),
+        ("GET", "/api/hub/brains/workbrain")
+    );
+    assert_eq!(
+        (reqs[2].method.as_str(), reqs[2].path.as_str()),
+        ("DELETE", "/api/hub/brains/workbrain")
+    );
+    let body: serde_json::Value = serde_json::from_str(&reqs[2].body).unwrap();
+    assert_eq!(body["confirm"], "workbrain");
+    assert_eq!(body["expected_control_revision"], "control:7");
+    assert!(
+        body["mutation_id"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("sevra-delete:") && value.len() > 24),
+        "mutation id is stable, namespaced, and unguessable: {body}"
+    );
+}
+
+#[test]
 fn delete_maps_the_hubs_confirm_required_refusal() {
     let (base, _log, handle) = mock_hub(vec![(
         400,
