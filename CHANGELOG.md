@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.2.22 — 2026-08-19
+
+- Permissioned sync: clone, pull, push, and export delegate v2 brains to the
+  released `dbmd` engine, including its verified incremental baseline,
+  conflict bundles, atomic local install, and native Windows behavior.
+- Bulk safety: `push` forwards the exact count-only v2 bulk confirmation only
+  when supplied explicitly; there is still no force-overwrite path.
+- Export: permissioned exports use the same exact-commit bulk stream and
+  rebuild only local derived catalogs after verified materialization.
+
 ## 0.2.21 — 2026-08-19
 
 - Runs: automatic schedule state is now reported as enabled when the hub
