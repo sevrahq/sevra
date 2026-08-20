@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## 0.2.24 — 2026-08-20
+
+- Permissioned kept-home state: `sevra push` delegates explicit content,
+  immutable-source, and asset withdrawal to dbmd with a required audit reason.
+  A `.sevralocal` edit alone remains non-destructive, and resumption remains an
+  explicit reviewed action.
+- Alias safety: `sevra rebind` delegates the fail-closed same-slug replacement
+  workflow to dbmd. Ordinary clone, pull, push, and export never silently move
+  a checkout between canonical brain identities.
+- Compatibility: clone surfaces typed v2 delegation failures faithfully, and
+  secret adoption resolves the exact current source before deciding whether an
+  immutable rewrite is necessary.
+- Runs: automatic schedules are reported as temporarily off while manual
+  dashboard, MCP, and CLI starts remain available, matching the current central
+  hub policy.
+
 ## 0.2.23 — 2026-08-20
 
 - Deletion: v2 brains now retry the typed precondition challenge with a fresh,

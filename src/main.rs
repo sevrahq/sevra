@@ -137,6 +137,27 @@ enum Commands {
         /// the receipt invalid.
         #[arg(long, value_name = "ID:DIGEST")]
         confirm_bulk: Option<String>,
+        /// Remove one exact currently hosted path while preserving the local
+        /// kept-home file. Repeatable; requires --withdraw-reason.
+        #[arg(
+            long,
+            value_name = "PATH",
+            action = clap::ArgAction::Append,
+            requires = "withdraw_reason"
+        )]
+        withdraw_from_hosting: Vec<String>,
+        /// Bounded company audit reason for this exact withdrawal batch.
+        #[arg(long, value_name = "REASON", requires = "withdraw_from_hosting")]
+        withdraw_reason: Option<String>,
+    },
+    /// Rebind one reused mutable brain alias after reviewing both canonical ids.
+    /// Both trust histories remain pinned; this never deletes local state.
+    Rebind {
+        brain: String,
+        #[arg(long, value_name = "OLD_BRAIN_ULID")]
+        from: String,
+        #[arg(long, value_name = "NEW_BRAIN_ULID")]
+        to: String,
     },
     /// Bring a hosted brain onto this machine for the first time. Link.md v2
     /// delegates verification, scoped materialization, and private baselines
@@ -451,6 +472,8 @@ fn main() {
             skip_assets,
             resume_local_policy,
             confirm_bulk,
+            withdraw_from_hosting,
+            withdraw_reason,
         } => commands::push(
             &cfg,
             &dir,
@@ -461,8 +484,11 @@ fn main() {
                 skip_assets,
                 resume_local_policy,
                 confirm_bulk: confirm_bulk.as_deref(),
+                withdraw_from_hosting: &withdraw_from_hosting,
+                withdraw_reason: withdraw_reason.as_deref(),
             },
         ),
+        Commands::Rebind { brain, from, to } => commands::rebind_brain(&cfg, &brain, &from, &to),
         Commands::Clone { brain, dir } => commands::clone_brain(&cfg, &brain, dir),
         Commands::Pull { dir, force } => commands::pull(&cfg, dir, force),
         Commands::Query {

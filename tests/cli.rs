@@ -584,11 +584,11 @@ fn agents_and_runs_have_distinct_truthful_surfaces_and_run_posts_the_agent() {
     let (base, log, handle) = mock_hub(vec![
         (
             200,
-            r#"{"execution":{"automaticSchedulesEnabled":true,"automaticSchedulesStatus":"enabled","manualRunsEnabled":true},"configurationIssues":[{"sourceDocPath":"records/broken.md","message":"agent name is required"}],"agents":[{"name":"curate\u001b[31m","engine":"sevra","enabled":true,"schedule":"0 3 * * *","model":"claude-haiku-4-5-20251001","sourceDocPath":"records/agent.md","flags":[]}],"runs":[],"billing":{"balanceCents":500,"sevraRunsPaused":false}}"#.to_string(),
+            r#"{"execution":{"automaticSchedulesEnabled":false,"automaticSchedulesStatus":"temporarily_disabled","manualRunsEnabled":true},"configurationIssues":[{"sourceDocPath":"records/broken.md","message":"agent name is required"}],"agents":[{"name":"curate\u001b[31m","engine":"sevra","enabled":true,"schedule":"0 3 * * *","model":"claude-haiku-4-5-20251001","sourceDocPath":"records/agent.md","flags":[]}],"runs":[],"billing":{"balanceCents":500,"sevraRunsPaused":false}}"#.to_string(),
         ),
         (
             200,
-            r#"{"execution":{"automaticSchedulesEnabled":true,"automaticSchedulesStatus":"enabled","manualRunsEnabled":true},"agents":[],"runs":[{"id":"01run","agent":"curate\u001b[31m","trigger":"manual","status":"failed","queuedAt":"2026-08-19T12:00:00.000Z","creditsDebitedCents":2,"error":"model unavailable\u001b[31m","outcome":null}],"billing":{"balanceCents":498,"sevraRunsPaused":false}}"#.to_string(),
+            r#"{"execution":{"automaticSchedulesEnabled":false,"automaticSchedulesStatus":"temporarily_disabled","manualRunsEnabled":true},"agents":[],"runs":[{"id":"01run","agent":"curate\u001b[31m","trigger":"manual","status":"failed","queuedAt":"2026-08-19T12:00:00.000Z","creditsDebitedCents":2,"error":"model unavailable\u001b[31m","outcome":null}],"billing":{"balanceCents":498,"sevraRunsPaused":false}}"#.to_string(),
         ),
         (
             202,
@@ -605,8 +605,14 @@ fn agents_and_runs_have_distinct_truthful_surfaces_and_run_posts_the_agent() {
     assert!(agents.status.success(), "{}", all_output(&agents));
     assert!(!agents.stdout.contains(&0x1b));
     let human = String::from_utf8(agents.stdout).unwrap();
-    assert!(human.contains("automatic schedules are enabled"), "{human}");
-    assert!(human.contains("scheduled (0 3 * * *)"), "{human}");
+    assert!(
+        human.contains("automatic schedules are temporarily off"),
+        "{human}"
+    );
+    assert!(
+        human.contains("manual only; saved schedule 0 3 * * * is temporarily off"),
+        "{human}"
+    );
     assert!(human.contains("records/agent.md"), "{human}");
     assert!(
         human.contains("configuration issue in records/broken.md"),
@@ -1400,7 +1406,11 @@ fn push_refuses_secrets_before_any_request_and_never_echoes_them() {
     let all = all_output(&out);
     assert!(all.contains("AWS access key id"), "names the kind: {all}");
     assert!(all.contains("note.md"), "names the file: {all}");
-    assert!(all.contains("rotate"), "remediation line: {all}");
+    assert!(all.contains("incident policy"), "remediation line: {all}");
+    assert!(
+        !all.contains("rotate at the issuer"),
+        "Sevra must not prescribe issuer action from a pattern match: {all}"
+    );
     assert!(
         !all.contains(&key),
         "the matched value must never print: {all}"
@@ -2247,7 +2257,7 @@ printf '%s\n' '{"brain":"brain-1","slug":"b","headSeq":0,"files":1,"dest":"brain
     let (base, log, handle) = mock_hub(vec![
         (
             409,
-            r#"{"error":"use v2","code":"v2_sync_required"}"#.to_string(),
+            r#"{"error":"use v2 bulk","code":"v2_bulk_required"}"#.to_string(),
         ),
         (200, r#"{"id":"brain-1","slug":"b"}"#.to_string()),
     ]);
@@ -2269,6 +2279,88 @@ printf '%s\n' '{"brain":"brain-1","slug":"b","headSeq":0,"files":1,"dest":"brain
     let requests = log.lock().unwrap();
     assert_eq!(requests[0].path, "/api/hub/brains/b/export?format=pack");
     assert_eq!(requests[1].path, "/api/hub/brains/b");
+}
+
+#[cfg(unix)]
+#[test]
+fn v2_push_delegates_exact_withdrawals_and_reason_to_dbmd() {
+    let store = store_dir(&[("DB.md", "---\ntype: database\n---\n# Test\n")]);
+    let bin = tempfile::tempdir().unwrap();
+    let args_log = bin.path().join("args");
+    fake_v2_dbmd(
+        bin.path(),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\necho '{{\"v\":2,\"brain_id\":\"brain-1\",\"seq\":2,\"applied\":1}}'\n",
+            args_log.display()
+        ),
+    );
+    let (base, _log, handle) = mock_hub(vec![(
+        409,
+        r#"{"error":"use v2","code":"v2_sync_required"}"#.to_string(),
+    )]);
+    let output = sevra()
+        .args([
+            "push",
+            store.path().to_str().unwrap(),
+            "--brain",
+            "b",
+            "--withdraw-from-hosting",
+            "sources/private.md",
+            "--withdraw-reason",
+            "approved company retention change",
+        ])
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.path().display()))
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", all_output(&output));
+    let args = std::fs::read_to_string(args_log).unwrap();
+    assert!(
+        args.contains("--withdraw-from-hosting\nsources/private.md\n"),
+        "{args}"
+    );
+    assert!(
+        args.contains("--withdraw-reason\napproved company retention change\n"),
+        "{args}"
+    );
+    handle.join().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn alias_rebind_is_a_thin_exact_dbmd_delegation() {
+    let bin = tempfile::tempdir().unwrap();
+    let args_log = bin.path().join("args");
+    fake_v2_dbmd(
+        bin.path(),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\necho '{{\"v\":2,\"outcome\":\"alias_rebound\"}}'\n",
+            args_log.display()
+        ),
+    );
+    let output = sevra()
+        .args([
+            "rebind",
+            "company",
+            "--from",
+            "01j5qc3v9k4ym8rwbn2tqe6f7d",
+            "--to",
+            "01j5qc3v9k4ym8rwbn2tqe6f7e",
+        ])
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.path().display()))
+        .env("SEVRA_HUB_URL", "http://127.0.0.1:9")
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", all_output(&output));
+    let args = std::fs::read_to_string(args_log).unwrap();
+    assert!(
+        args.contains(
+            "sync\ncompany\nrebind\n--from\n01j5qc3v9k4ym8rwbn2tqe6f7d\n--to\n01j5qc3v9k4ym8rwbn2tqe6f7e\n"
+        ),
+        "{args}"
+    );
 }
 
 #[cfg(unix)]
@@ -2449,6 +2541,49 @@ fn secrets_quarantine_closure_without_dbmd_fails_before_writing() {
 }
 
 // --- secrets adopt: vault-first, resumable migration -------------------------
+
+#[test]
+fn secrets_adopt_uses_v2_checkout_identity_and_refuses_immutable_source_before_vault() {
+    let key = format!("AKIA{}", "A".repeat(16));
+    let store = store_dir(&[(
+        "sources/private.md",
+        &format!(
+            "---\ntype: note\ncreated: 2026-08-20\nupdated: 2026-08-20\nsummary: evidence\n---\naws key: {key}\n"
+        ),
+    )]);
+    std::fs::write(
+        store.path().join(".sevra-v2.json"),
+        b"{\"v\":2,\"brain\":\"01j5qc3v9k4ym8rwbn2tqe6f7d\"}\n",
+    )
+    .unwrap();
+    let (base, log, handle) = mock_hub(vec![(
+        200,
+        r#"{"brain":"01j5qc3v9k4ym8rwbn2tqe6f7d","storageProfile":"v2","document":{"path":"sources/private.md"}}"#.to_string(),
+    )]);
+    let output = sevra()
+        .args(["--json", "secrets", "adopt", store.path().to_str().unwrap()])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let all = all_output(&output);
+    assert!(
+        all.contains("immutable hosted evidence")
+            && all.contains("immutable_source_remediation_required"),
+        "{all}"
+    );
+    assert!(!all.contains(&key), "secret value must never print: {all}");
+    assert!(!all.contains("no .sevra-sync.json"), "{all}");
+    let requests = log.lock().unwrap();
+    assert_eq!(requests.len(), 1, "must stop before vault: {requests:?}");
+    assert_eq!(
+        requests[0].path,
+        "/api/hub/brains/01j5qc3v9k4ym8rwbn2tqe6f7d/resolve?path=sources%2Fprivate.md"
+    );
+    drop(requests);
+    handle.join().unwrap();
+}
 
 #[test]
 fn secrets_adopt_deduplicates_rewrites_and_unquarantines_exact_paths() {
@@ -3438,8 +3573,10 @@ fn push_refuses_a_secret_in_manifest_bound_asset_bytes_before_any_request() {
     );
     assert!(
         all.contains("Already-pushed bytes persist")
-            && all.contains("Rotate at the issuer immediately")
-            && all.contains("sevra delete"),
+            && all.contains("Current-state withdrawal")
+            && all.contains("historical purge")
+            && all.contains("incident policy")
+            && !all.contains("Rotate at the issuer immediately"),
         "the refusal carries precise existing-data remediation: {all}"
     );
 }

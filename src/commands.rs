@@ -1789,7 +1789,7 @@ fn fail_snapshot_limit(problem: &str, largest: &[(String, u64)], data: Value) ->
 
 /// How many secret hits a refusal shows before eliding.
 const SECRET_HITS_SHOWN: usize = 20;
-const EXISTING_BYTES_REMEDIATION: &str = "Already-pushed bytes persist in retained packs; a kept-home asset remains declared, so its blob is not swept; retention-locked backups persist for about 31 days. Rotate at the issuer immediately. Byte erasure requires `sevra delete`, completion of the sweep and backup-retention window, then a fresh push.";
+const EXISTING_BYTES_REMEDIATION: &str = "Already-pushed bytes persist in retained history; a kept-home asset remains declared, so its blob is not swept; retention-locked backups persist for about 31 days. Current-state withdrawal, historical purge, and whole-brain deletion are separate permissioned actions with different retention effects. A pattern match alone cannot determine whether issuer-side action is warranted.";
 
 /// The hit list block shared by push's refusal and `secrets scan`: each hit
 /// as `path — kind`, never a matched value (paths that themselves match are
@@ -1839,7 +1839,7 @@ fn fail_secret_hits(
     );
     msg.push_str(&secret_hits_block(hits));
     msg.push_str(&format!(
-        "\nrotate anything that ever lived here; keep live secrets in a password manager and references to them in the brain.\n{EXISTING_BYTES_REMEDIATION}\nways out, in order: `sevra secrets adopt {dir}` (move markdown literals into the brain vault) · `sevra secrets quarantine {dir}` (only when the whole file is secret or an asset) · edit deliberately · `--allow-secrets` (push verbatim)"
+        "\nHandle any value that may have left this machine under your company's incident policy; Sevra does not prescribe issuer action from a pattern match. Keep live values in the brain vault and references in the brain.\n{EXISTING_BYTES_REMEDIATION}\nways out, in order: `sevra secrets adopt {dir}` (move markdown literals into the brain vault) · `sevra secrets quarantine {dir}` (only when the whole file is secret or an asset) · edit deliberately · `--allow-secrets` (push verbatim)"
     ));
     let mut data = secret_hits_data(hits);
     if let (Some(scan), Some(object)) = (asset_scan, data.as_object_mut()) {
@@ -1853,6 +1853,47 @@ fn body_code(r: &HubResponse) -> Option<&str> {
         .as_ref()
         .and_then(|b| b.get("code"))
         .and_then(|c| c.as_str())
+}
+
+fn v2_source_is_currently_hosted(cfg: &Config, brain: &str, path: &str) -> bool {
+    let response = request(
+        cfg,
+        "GET",
+        &format!("/api/hub/brains/{}/resolve?path={}", enc(brain), enc(path)),
+        None,
+        true,
+    );
+    match response.status {
+        200 => {
+            let served = response
+                .body
+                .as_ref()
+                .and_then(|body| body.pointer("/document/path"))
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| {
+                    fail(
+                        "hub returned an invalid source coordinate during vault adoption",
+                        None,
+                    )
+                });
+            if served != path {
+                fail(
+                    "hub returned a different source coordinate during vault adoption",
+                    None,
+                );
+            }
+            true
+        }
+        // The v2 resolve surface deliberately makes absent and unreadable
+        // coordinates indistinguishable. Either way, rewriting this local
+        // source cannot replace hosted evidence through the later permissioned
+        // sync gate.
+        404 => false,
+        _ => {
+            let _ = ensure_ok(response, "check immutable source before vault adoption");
+            unreachable!("ensure_ok rejects every non-success response")
+        }
+    }
 }
 
 /// `ensure_ok` for the push verbs, with the shrink guard mapped: without
@@ -2107,6 +2148,32 @@ pub struct PushOptions<'a> {
     pub skip_assets: bool,
     pub resume_local_policy: bool,
     pub confirm_bulk: Option<&'a str>,
+    pub withdraw_from_hosting: &'a [String],
+    pub withdraw_reason: Option<&'a str>,
+}
+
+pub fn rebind_brain(cfg: &Config, brain: &str, from: &str, to: &str) {
+    let result = run_dbmd_sync(
+        cfg,
+        &[
+            brain.to_string(),
+            "rebind".to_string(),
+            "--from".to_string(),
+            from.to_string(),
+            "--to".to_string(),
+            to.to_string(),
+        ],
+        Path::new("."),
+    );
+    out_layout(
+        &format!(
+            "rebound {} from {} to {}; both canonical trust histories remain pinned",
+            terminal_safe(brain),
+            terminal_safe(from),
+            terminal_safe(to)
+        ),
+        Some(result),
+    );
 }
 
 fn push_v2(cfg: &Config, dir: &str, brain: &str, options: &PushOptions<'_>) {
@@ -2159,6 +2226,14 @@ fn push_v2(cfg: &Config, dir: &str, brain: &str, options: &PushOptions<'_>) {
     if let Some(confirmation) = options.confirm_bulk {
         sync_args.push("--confirm-bulk".to_string());
         sync_args.push(confirmation.to_string());
+    }
+    for path in options.withdraw_from_hosting {
+        sync_args.push("--withdraw-from-hosting".to_string());
+        sync_args.push(path.clone());
+    }
+    if let Some(reason) = options.withdraw_reason {
+        sync_args.push("--withdraw-reason".to_string());
+        sync_args.push(reason.to_string());
     }
     let result = run_dbmd_sync(cfg, &sync_args, Path::new(dir));
     let canonical = std::fs::canonicalize(dir)
@@ -5176,7 +5251,10 @@ pub fn clone_brain(cfg: &Config, brain: &str, dir: Option<String>) {
         None,
         true,
     );
-    if body_code(&first) == Some("v2_sync_required") {
+    if matches!(
+        body_code(&first),
+        Some("v2_sync_required" | "v2_bulk_required")
+    ) {
         return clone_brain_v2(cfg, brain, dir);
     }
     let (response, requested) = request_snapshot_from(cfg, brain, None, false, Some(first));
@@ -6426,12 +6504,26 @@ pub fn secrets_adopt(cfg: &Config, dir: Option<String>) {
     if recover_pull_transaction(&root).unwrap_or_else(|error| fail(&error, None)) {
         note("recovered an interrupted pull before adopting credentials");
     }
-    let baseline = load_sync_baseline(&root_path)
-        .unwrap_or_else(|error| fail(&error, None))
+    let legacy_baseline = load_sync_baseline(&root_path).unwrap_or_else(|error| fail(&error, None));
+    let v2_checkout = read_v2_checkout(&root_path).unwrap_or_else(|error| fail(&error, None));
+    if legacy_baseline
+        .as_ref()
+        .zip(v2_checkout.as_ref())
+        .is_some_and(|(legacy, v2)| legacy.brain_id != v2.brain)
+    {
+        fail(
+            "the legacy and v2 checkout markers name different brains; refusing an ambiguous vault destination",
+            None,
+        );
+    }
+    let brain_id = legacy_baseline
+        .as_ref()
+        .map(|baseline| baseline.brain_id.clone())
+        .or_else(|| v2_checkout.as_ref().map(|checkout| checkout.brain.clone()))
         .unwrap_or_else(|| {
             fail(
                 &format!(
-                    "{dir} has no {SYNC_BASELINE_FILE}; clone or push the brain once before `sevra secrets adopt` so the vault destination is unambiguous"
+                    "{dir} has no {SYNC_BASELINE_FILE} or {V2_CHECKOUT_FILE}; clone or push the brain once before `sevra secrets adopt` so the vault destination is unambiguous"
                 ),
                 None,
             )
@@ -6440,11 +6532,11 @@ pub fn secrets_adopt(cfg: &Config, dir: Option<String>) {
         .unwrap_or_else(|error| fail(&error, None))
         .unwrap_or_else(|| AdoptJournal {
             version: 1,
-            brain_id: baseline.brain_id.clone(),
+            brain_id: brain_id.clone(),
             mappings: BTreeMap::new(),
             paths: BTreeSet::new(),
         });
-    if journal.brain_id != baseline.brain_id {
+    if journal.brain_id != brain_id {
         fail(
             &format!(
                 "{ADOPT_JOURNAL_FILE} belongs to a different brain; refusing to move credentials"
@@ -6569,6 +6661,23 @@ pub fn secrets_adopt(cfg: &Config, dir: Option<String>) {
         );
     }
 
+    if v2_checkout.is_some() {
+        let immutable_source = by_path.keys().find(|path| {
+            path.starts_with("sources/") && v2_source_is_currently_hosted(cfg, &brain_id, path)
+        });
+        if let Some(path) = immutable_source {
+            fail(
+                &format!(
+                    "adopt refused before vault access: {} is immutable hosted evidence. Withdraw or purge its current hosted coordinate with the required company authority, then append a new redacted source with provenance",
+                    terminal_safe(path)
+                ),
+                Some(json!({
+                    "code": "immutable_source_remediation_required",
+                    "path": path,
+                })),
+            );
+        }
+    }
     for path in by_path.keys() {
         journal.paths.insert(path.clone());
         if path.starts_with("sources/") {
@@ -6611,7 +6720,7 @@ pub fn secrets_adopt(cfg: &Config, dir: Option<String>) {
     for (hash, value) in &mut values {
         let final_name = commit_adopt_value(
             cfg,
-            &baseline.brain_id,
+            &brain_id,
             hash,
             &value.bytes,
             &value.base_name,
@@ -6746,7 +6855,7 @@ pub fn secrets_adopt(cfg: &Config, dir: Option<String>) {
     out_layout(
         &human,
         Some(json!({
-            "brain": baseline.brain_id,
+            "brain": brain_id,
             "vaultItems": journal.mappings.values().collect::<Vec<_>>(),
             "distinctValues": values.len(),
             "replacements": replacement_count,
@@ -6767,7 +6876,7 @@ pub fn secrets_adopt(cfg: &Config, dir: Option<String>) {
 // ever edits is `.sevralocal`, and only by appending.
 
 /// The forward-only truth, stated on every quarantine run.
-const FORWARD_ONLY_NOTE: &str = "kept-home is forward-only — marking changes future snapshots and erases nothing by itself. Files already pushed remain in retained packs; a kept-home asset remains declared, so its blob is not swept; retention-locked backups persist for about 31 days. Rotate at the issuer immediately. Byte erasure requires `sevra delete`, completion of the sweep and backup-retention window, then a fresh push";
+const FORWARD_ONLY_NOTE: &str = "kept-home is forward-only: marking changes future sync transport and erases nothing by itself. Files already hosted remain in retained history; a kept-home asset remains declared, so its blob is not swept; retention-locked backups persist for about 31 days. Current-state withdrawal and historical erasure are separate permissioned actions. Sevra does not infer issuer action from a pattern match";
 
 /// `secrets scan [dir]` — the push secret scan, read-only: report what a
 /// push of <dir> would refuse on, in exactly the push-refusal shape. Exit 1
@@ -6818,7 +6927,7 @@ pub fn secrets_scan(dir: Option<String>) {
     );
     msg.push_str(&secret_hits_block(&hits));
     msg.push_str(&format!(
-        "\nrotate anything that ever lived here; keep live secrets in a password manager and references to them in the brain.\n{EXISTING_BYTES_REMEDIATION}\nmove markdown literals into the brain vault: `sevra secrets adopt {dir}`. Quarantine only when the whole file is secret or an asset: `sevra secrets quarantine {dir}`. Or edit deliberately"
+        "\nHandle any value that may have left this machine under your company's incident policy; Sevra does not prescribe issuer action from a pattern match. Keep live values in the brain vault and references in the brain.\n{EXISTING_BYTES_REMEDIATION}\nmove markdown literals into the brain vault: `sevra secrets adopt {dir}`. Quarantine only when the whole file is secret or an asset: `sevra secrets quarantine {dir}`. Or edit deliberately"
     ));
     let mut data = secret_hits_data(&hits);
     if let Some(object) = data.as_object_mut() {
@@ -7021,7 +7130,7 @@ pub fn secrets_quarantine(dir: Option<String>, dry_run: bool, closure: bool) {
             human.push_str(&format!("\n  … and {} more file(s)", dangling.len() - 5));
         }
         human.push_str(
-            "\nto keep the graph whole instead: rotate the credential at its issuer, redact the file, and un-mark it",
+            "\nto keep the graph whole instead: redact the file and un-mark it; handle any already-hosted value under your company's incident policy",
         );
     }
     for (kind, path) in &warnings {
