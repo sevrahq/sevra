@@ -2283,6 +2283,63 @@ printf '%s\n' '{"brain":"brain-1","slug":"b","headSeq":0,"files":1,"dest":"brain
 
 #[cfg(unix)]
 #[test]
+fn v2_export_keeps_the_cross_protocol_file_count_contract() {
+    let work = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    fake_v2_dbmd(
+        bin.path(),
+        r#"#!/bin/sh
+out=""
+prior=""
+for arg in "$@"; do
+  if [ "$prior" = "--out" ]; then out="$arg"; fi
+  prior="$arg"
+done
+mkdir -p "$out/records"
+printf '%s\n' '# Test' > "$out/DB.md"
+printf '%s\n' '# One' > "$out/records/one.md"
+printf '%s\n' '{"brain":"brain-1","headSeq":7,"files":2,"dest":"stage","extraLocal":[],"syncStatus":"synced"}'
+"#,
+    );
+    let (base, log, handle) = mock_hub(vec![
+        (
+            409,
+            r#"{"error":"use v2 bulk","code":"v2_bulk_required"}"#.to_string(),
+        ),
+        (200, r#"{"id":"brain-1","slug":"b"}"#.to_string()),
+        (200, r#"{"items":[]}"#.to_string()),
+    ]);
+
+    let output = sevra()
+        .args(["export", "b", "out", "--json"])
+        .current_dir(work.path())
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.path().display()))
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", all_output(&output));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["fileCount"], 2);
+    assert_eq!(result["files"], 2, "retain the delegated dbmd field");
+    assert_eq!(result["headSeq"], 7);
+    assert_eq!(
+        std::fs::read_to_string(work.path().join("out/records/one.md")).unwrap(),
+        "# One\n"
+    );
+    handle.join().unwrap();
+    let requests = log.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[0].path,
+        "/api/hub/brains/b/export?format=pack&includeVaultNames=1"
+    );
+    assert_eq!(requests[1].path, "/api/hub/brains/b");
+    assert_eq!(requests[2].path, "/api/hub/brains/b/vault");
+}
+
+#[cfg(unix)]
+#[test]
 fn v2_push_delegates_exact_withdrawals_and_reason_to_dbmd() {
     let store = store_dir(&[("DB.md", "---\ntype: database\n---\n# Test\n")]);
     let bin = tempfile::tempdir().unwrap();

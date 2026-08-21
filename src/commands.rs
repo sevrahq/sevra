@@ -4852,6 +4852,7 @@ fn export_v2(
     let seq = result.get("headSeq").and_then(Value::as_u64).unwrap_or(0);
     let mut data = result.as_object().cloned().unwrap_or_default();
     data.insert("dir".into(), json!(dir));
+    data.insert("fileCount".into(), json!(files));
     data.insert("vaultFile".into(), json!(VAULT_EXPORT_FILE));
     data.insert("vaultNames".into(), json!(names));
     data.insert("vaultValuesIncluded".into(), json!(with_secrets));

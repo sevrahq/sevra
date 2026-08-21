@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.2.25 — 2026-08-21
+
+- Export compatibility: delegated v2 exports now report `fileCount` in JSON,
+  matching v1 exports while retaining dbmd's `files` count for existing v2
+  consumers.
+
 ## 0.2.24 — 2026-08-20
 
 - Permissioned kept-home state: `sevra push` delegates explicit content,
