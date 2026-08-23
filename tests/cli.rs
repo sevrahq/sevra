@@ -2714,6 +2714,7 @@ fn secrets_quarantine_closure_without_dbmd_fails_before_writing() {
 
 // --- secrets adopt: vault-first, resumable migration -------------------------
 
+#[cfg(unix)]
 #[test]
 fn secrets_adopt_uses_v2_checkout_identity_and_refuses_immutable_source_before_vault() {
     let key = format!("AKIA{}", "A".repeat(16));
@@ -2728,13 +2729,19 @@ fn secrets_adopt_uses_v2_checkout_identity_and_refuses_immutable_source_before_v
         b"{\"v\":2,\"brain\":\"01j5qc3v9k4ym8rwbn2tqe6f7d\"}\n",
     )
     .unwrap();
-    let (base, log, handle) = mock_hub(vec![(
-        200,
-        r#"{"brain":"01j5qc3v9k4ym8rwbn2tqe6f7d","storageProfile":"v2","document":{"path":"sources/private.md"}}"#.to_string(),
-    )]);
+    let bin = tempfile::tempdir().unwrap();
+    let args_log = bin.path().join("args");
+    fake_v2_dbmd(
+        bin.path(),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\necho '{{\"brain\":\"01j5qc3v9k4ym8rwbn2tqe6f7d\",\"document\":{{\"path\":\"sources/private.md\"}}}}'\n",
+            args_log.display()
+        ),
+    );
     let output = sevra()
         .args(["--json", "secrets", "adopt", store.path().to_str().unwrap()])
-        .env("SEVRA_HUB_URL", &base)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.path().display()))
+        .env("SEVRA_HUB_URL", "https://hub.example")
         .env("SEVRA_API_KEY", "x")
         .output()
         .unwrap();
@@ -2747,14 +2754,56 @@ fn secrets_adopt_uses_v2_checkout_identity_and_refuses_immutable_source_before_v
     );
     assert!(!all.contains(&key), "secret value must never print: {all}");
     assert!(!all.contains("no .sevra-sync.json"), "{all}");
-    let requests = log.lock().unwrap();
-    assert_eq!(requests.len(), 1, "must stop before vault: {requests:?}");
+    let args = std::fs::read_to_string(args_log).unwrap();
     assert_eq!(
-        requests[0].path,
-        "/api/hub/brains/01j5qc3v9k4ym8rwbn2tqe6f7d/resolve?path=sources%2Fprivate.md"
+        args,
+        "--json\nresolve\n@01j5qc3v9k4ym8rwbn2tqe6f7d/sources/private.md\n--hub\nhttps://hub.example\n"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn secrets_adopt_delegates_typed_v2_absence_then_vaults_and_rewrites() {
+    let token = format!("sk-proj-{}", "v".repeat(24));
+    let store = store_dir(&[(
+        "sources/private.md",
+        &note_markdown(&format!("api_key: {token}")),
+    )]);
+    std::fs::write(
+        store.path().join(".sevra-v2.json"),
+        b"{\"v\":2,\"brain\":\"01j5qc3v9k4ym8rwbn2tqe6f7d\"}\n",
+    )
+    .unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let args_log = bin.path().join("args");
+    fake_v2_dbmd(
+        bin.path(),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s\\n' '{{\"error\":{{\"code\":\"NOT_FOUND\",\"message\":\"record not found\"}}}}' >&2\nexit 1\n",
+            args_log.display()
+        ),
+    );
+    let (base, log, handle) = mock_hub(vec![(201, r#"{"ok":true,"created":true}"#.to_string())]);
+    let output = sevra()
+        .args(["--json", "secrets", "adopt", store.path().to_str().unwrap()])
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.path().display()))
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", all_output(&output));
+    assert!(!all_output(&output).contains(&token));
+    let requests = log.lock().unwrap();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert_eq!(requests[0].method, "POST");
+    assert!(requests[0].path.ends_with("/vault"));
     drop(requests);
     handle.join().unwrap();
+    let args = std::fs::read_to_string(args_log).unwrap();
+    assert!(args.contains("resolve\n@01j5qc3v9k4ym8rwbn2tqe6f7d/sources/private.md\n"));
+    let rewritten = std::fs::read_to_string(store.path().join("sources/private.md")).unwrap();
+    assert!(!rewritten.contains(&token));
+    assert!(rewritten.contains("$API_KEY"));
 }
 
 #[test]

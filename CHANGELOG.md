@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.2.27 — 2026-08-23
+
+- Secret adoption: immutable-source preflight now delegates exact signed v2
+  tree proofs to `dbmd` instead of cold-staging the whole brain through the
+  document resolver. Large company brains remain bounded by source count and
+  path depth, while `sevra` remains a thin product wrapper over link.md.
+
 ## 0.2.26 — 2026-08-23
 
 - Secrets: `sevra secrets status` shows one metadata-only view of declared,

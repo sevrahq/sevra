@@ -1855,45 +1855,80 @@ fn body_code(r: &HubResponse) -> Option<&str> {
         .and_then(|c| c.as_str())
 }
 
-fn v2_source_is_currently_hosted(cfg: &Config, brain: &str, path: &str) -> bool {
-    let response = request(
-        cfg,
-        "GET",
-        &format!("/api/hub/brains/{}/resolve?path={}", enc(brain), enc(path)),
-        None,
-        true,
-    );
-    match response.status {
-        200 => {
-            let served = response
-                .body
-                .as_ref()
-                .and_then(|body| body.pointer("/document/path"))
-                .and_then(Value::as_str)
-                .unwrap_or_else(|| {
-                    fail(
-                        "hub returned an invalid source coordinate during vault adoption",
-                        None,
-                    )
-                });
-            if served != path {
+/// Return the first source `dbmd resolve` proves present in the signed v2
+/// content tree. `sevra` deliberately does not reimplement the link.md head,
+/// proof, trust-pin, or download machinery: dbmd owns the wire protocol and
+/// makes an absent exact path a typed `NOT_FOUND`. Unlike the old hub document
+/// resolver, this work is proportional to source count and path depth and
+/// never cold-stages the whole brain.
+fn v2_first_currently_hosted_source<'a>(
+    cfg: &Config,
+    brain: &str,
+    working_dir: &Path,
+    paths: impl Iterator<Item = &'a String>,
+) -> Option<&'a String> {
+    let key = cfg
+        .key
+        .as_deref()
+        .unwrap_or_else(|| fail(NOT_LOGGED_IN, None));
+    for path in paths {
+        let output = Command::new("dbmd")
+            .arg("--json")
+            .arg("resolve")
+            .arg(format!("@{brain}/{path}"))
+            .arg("--hub")
+            .arg(&cfg.hub)
+            .env("DBMD_HUB_KEY", key)
+            .env_remove("DBMD_HUB_URL")
+            .env_remove("DBMD_HUB_CREDENTIAL_ORIGIN")
+            .current_dir(working_dir)
+            .output()
+            .unwrap_or_else(|error| {
                 fail(
-                    "hub returned a different source coordinate during vault adoption",
+                    &format!(
+                        "could not run dbmd resolve (install it from https://www.sevrahq.com/install): {error}"
+                    ),
+                    None,
+                )
+            });
+        if output.status.success() {
+            let result: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
+                fail(
+                    "dbmd resolve returned invalid JSON while checking immutable source",
+                    None,
+                )
+            });
+            if result.pointer("/document/path").and_then(Value::as_str) != Some(path) {
+                fail(
+                    "dbmd resolve returned a different source coordinate during vault adoption",
                     None,
                 );
             }
-            true
+            return Some(path);
         }
-        // The v2 resolve surface deliberately makes absent and unreadable
-        // coordinates indistinguishable. Either way, rewriting this local
-        // source cannot replace hosted evidence through the later permissioned
-        // sync gate.
-        404 => false,
-        _ => {
-            let _ = ensure_ok(response, "check immutable source before vault adoption");
-            unreachable!("ensure_ok rejects every non-success response")
+        let structured = serde_json::from_slice::<Value>(&output.stderr).ok();
+        if structured
+            .as_ref()
+            .and_then(|error| error.pointer("/error/code"))
+            .and_then(Value::as_str)
+            == Some("NOT_FOUND")
+        {
+            continue;
         }
+        let message = structured
+            .as_ref()
+            .and_then(|error| error.pointer("/error/message"))
+            .and_then(Value::as_str)
+            .unwrap_or("dbmd resolve failed without a structured error");
+        fail(
+            &format!(
+                "could not check immutable source before vault adoption: {}",
+                terminal_safe(message)
+            ),
+            structured,
+        );
     }
+    None
 }
 
 /// `ensure_ok` for the push verbs, with the shrink guard mapped: without
@@ -6775,9 +6810,12 @@ pub fn secrets_adopt(cfg: &Config, dir: Option<String>) {
     }
 
     if v2_checkout.is_some() {
-        let immutable_source = by_path.keys().find(|path| {
-            path.starts_with("sources/") && v2_source_is_currently_hosted(cfg, &brain_id, path)
-        });
+        let immutable_source = v2_first_currently_hosted_source(
+            cfg,
+            &brain_id,
+            &root_path,
+            by_path.keys().filter(|path| path.starts_with("sources/")),
+        );
         if let Some(path) = immutable_source {
             fail(
                 &format!(
