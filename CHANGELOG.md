@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.26 — 2026-08-23
+
 - Secrets: `sevra secrets status` shows one metadata-only view of declared,
   provisioned, bound, and last-used vault names. Values never enter the
   response path.
