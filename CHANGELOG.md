@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Secrets: `sevra secrets status` shows one metadata-only view of declared,
+  provisioned, bound, and last-used vault names. Values never enter the
+  response path.
+- Secret scanning: the public, versioned pattern contract now covers both
+  vendor-shaped credential bytes and conservative credential-related filename
+  tokens. Suspect filename segments are redacted from output while quarantine
+  retains the exact private local path.
+
 ## 0.2.25 — 2026-08-21
 
 - Export compatibility: delegated v2 exports now report `fileCount` in JSON,

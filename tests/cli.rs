@@ -283,6 +283,7 @@ fn secrets_help_lists_actions_and_hides_the_argv_trap() {
         .success()
         .stdout(
             predicate::str::contains("list")
+                .and(predicate::str::contains("status"))
                 .and(predicate::str::contains("set"))
                 .and(predicate::str::contains("get"))
                 .and(predicate::str::contains("rm"))
@@ -496,6 +497,13 @@ fn secrets_list_get_and_rm_hold_the_error_contract() {
         .failure()
         .stdout(predicate::str::contains("\"error\""));
     sevra()
+        .args(["secrets", "status", "b", "--json"])
+        .env("SEVRA_HUB_URL", "http://localhost:9")
+        .env("SEVRA_API_KEY", "x")
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("\"error\""));
+    sevra()
         .args(["secrets", "get", "b", "API_KEY", "--json"])
         .env("SEVRA_HUB_URL", "http://localhost:9")
         .env("SEVRA_API_KEY", "x")
@@ -509,6 +517,51 @@ fn secrets_list_get_and_rm_hold_the_error_contract() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("hub unreachable"));
+}
+
+#[test]
+fn secrets_status_renders_the_metadata_only_diff() {
+    let body = serde_json::json!({
+        "status": [
+            {
+                "name": "API_KEY",
+                "declaredBy": [{"kind": "function", "name": "lookup"}],
+                "provisioned": false,
+                "consumers": [],
+                "lastUsedAt": null
+            },
+            {
+                "name": "CRM_TOKEN",
+                "declaredBy": [{"kind": "agent", "name": "curator"}],
+                "provisioned": true,
+                "consumers": ["agent:curator"],
+                "lastUsedAt": "2026-08-23T00:00:00.000Z"
+            }
+        ],
+        "sweep": {"state": "clean", "findingCount": 0}
+    })
+    .to_string();
+    let (base, log, handle) = mock_hub(vec![(200, body)]);
+    let out = sevra()
+        .args(["secrets", "status", "brain-one"])
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", all_output(&out));
+    let all = all_output(&out);
+    assert!(all.contains("API_KEY"), "{all}");
+    assert!(all.contains("needs value"), "{all}");
+    assert!(all.contains("function:lookup"), "{all}");
+    assert!(all.contains("CRM_TOKEN"), "{all}");
+    assert!(all.contains("ready"), "{all}");
+    assert!(all.contains("agent:curator"), "{all}");
+    assert!(all.contains("never"), "{all}");
+    handle.join().unwrap();
+    let requests = log.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "GET");
+    assert_eq!(requests[0].path, "/api/hub/brains/brain-one/secrets");
 }
 
 // --- device-flow sign-in (`sevra login` with no key), on a mock loopback hub -
@@ -1507,6 +1560,33 @@ fn push_flags_a_secret_in_a_file_name_without_reprinting_it() {
     assert!(
         !all.contains(&token),
         "a secret-bearing path must print redacted: {all}"
+    );
+}
+
+#[test]
+fn push_flags_a_credential_related_filename_without_reprinting_the_segment() {
+    let filename = "password-private-note.md";
+    let t = store_dir(&[(filename, "clean content")]);
+    let out = sevra()
+        .args(["push", t.path().to_str().unwrap(), "--brain", "b"])
+        .env("SEVRA_HUB_URL", "http://localhost:9")
+        .env("SEVRA_API_KEY", "x")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let all = all_output(&out);
+    assert!(
+        all.contains("credential-related filename"),
+        "names the suspicion class: {all}"
+    );
+    assert!(all.contains("file's name"), "says where it sits: {all}");
+    assert!(
+        !all.contains(filename),
+        "a suspect filename segment must print redacted: {all}"
+    );
+    assert!(
+        !all.contains("hub unreachable"),
+        "the path gate must run before network I/O: {all}"
     );
 }
 

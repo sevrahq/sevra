@@ -315,6 +315,8 @@ fn install_verified(dir: &str, expected_sha256: &str) -> Result<(), String> {
 enum SecretsAction {
     /// List vault item names (never values)
     List { brain: String },
+    /// Show declared, provisioned, and used secret names (never values)
+    Status { brain: String },
     /// Store or rotate one vault item. The VALUE is read from stdin — hidden
     /// prompt on a TTY, piped otherwise (one trailing newline trimmed) —
     /// never from the command line, never echoed.
@@ -526,6 +528,7 @@ fn main() {
         Commands::Unpublish { brain } => commands::unpublish(&cfg, &brain),
         Commands::Secrets { action } => match action {
             SecretsAction::List { brain } => commands::secrets_list(&cfg, &brain),
+            SecretsAction::Status { brain } => commands::secrets_status(&cfg, &brain),
             SecretsAction::Set {
                 brain,
                 name,

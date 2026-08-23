@@ -5915,6 +5915,92 @@ pub fn secrets_list(cfg: &Config, brain: &str) {
     }
 }
 
+/// One owner-only view of secret names across declarations, vault custody,
+/// consumer bindings, and use. The hub response contains metadata only; this
+/// command never asks for, receives, or prints a vault value.
+pub fn secrets_status(cfg: &Config, brain: &str) {
+    let r = ensure_ok(
+        request(
+            cfg,
+            "GET",
+            &format!("/api/hub/brains/{}/secrets", enc(brain)),
+            None,
+            true,
+        ),
+        "secrets status",
+    );
+    if json_mode() {
+        out("", Some(r));
+        return;
+    }
+
+    let rows = r
+        .get("status")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if rows.is_empty() {
+        out(
+            "no secret names are declared or stored — declare `secrets:` on a function or agent, or pipe a value to `sevra secrets set`",
+            None,
+        );
+        return;
+    }
+
+    let mut lines = Vec::with_capacity(rows.len() + 1);
+    lines.push("NAME\tSTATE\tDECLARED BY\tCONSUMERS\tLAST USED".to_string());
+    for row in rows {
+        let name = row
+            .get("name")
+            .and_then(Value::as_str)
+            .map(terminal_safe)
+            .unwrap_or_else(|| "?".into());
+        let provisioned = row
+            .get("provisioned")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let declared_by = row
+            .get("declaredBy")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        let kind = item.get("kind")?.as_str()?;
+                        let consumer = item.get("name")?.as_str()?;
+                        Some(terminal_safe(&format!("{kind}:{consumer}")))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "stored only".into());
+        let consumers = row
+            .get("consumers")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(terminal_safe)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "none".into());
+        let last_used = row
+            .get("lastUsedAt")
+            .and_then(Value::as_str)
+            .map(terminal_safe)
+            .unwrap_or_else(|| "never".into());
+        let state = if provisioned { "ready" } else { "needs value" };
+        lines.push(format!(
+            "{name}\t{state}\t{declared_by}\t{consumers}\t{last_used}"
+        ));
+    }
+    out_layout(&lines.join("\n"), Some(r));
+}
+
 pub fn secrets_set(cfg: &Config, brain: &str, name: &str, value_in_argv: bool) {
     if value_in_argv {
         // The trap arguments exist so this refusal happens WITHOUT echoing
@@ -6566,7 +6652,10 @@ pub fn secrets_adopt(cfg: &Config, dir: Option<String>) {
     let store_hits = scan_store(&store);
     let mut unsupported: Vec<SecretHit> = store_hits
         .into_iter()
-        .filter(|hit| hit.in_path || hit.store_path == "assets.jsonl")
+        .filter(|hit| {
+            (hit.in_path && hit.kind != crate::scan::PATH_HEURISTIC_KIND)
+                || hit.store_path == "assets.jsonl"
+        })
         .collect();
     unsupported.append(&mut asset_scan.hits);
     if !unsupported.is_empty() {

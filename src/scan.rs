@@ -35,6 +35,28 @@ const PATTERNS: &[(&str, &str)] = &[
     ("1Password share link", r"share\.1password\.com/s#"),
 ];
 
+pub(crate) const PATH_HEURISTIC_KIND: &str = "credential-related filename";
+const PATH_SINGLE_TOKENS: &[&str] = &[
+    "password",
+    "passwords",
+    "passwd",
+    "passwds",
+    "credential",
+    "credentials",
+    "secret",
+    "secrets",
+];
+const PATH_TOKEN_PAIRS: &[(&str, &str)] = &[
+    ("api", "key"),
+    ("api", "keys"),
+    ("access", "key"),
+    ("access", "keys"),
+    ("private", "key"),
+    ("private", "keys"),
+    ("app", "password"),
+    ("app", "passwords"),
+];
+
 pub struct SecretHit {
     /// The file's path, redacted wherever the path itself matched — safe to
     /// print even when the secret sits in the filename.
@@ -150,6 +172,37 @@ fn matching_patterns(text: &str) -> Vec<usize> {
         .collect()
 }
 
+fn suspicious_path_segment(segment: &str) -> bool {
+    let stem = segment
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(segment);
+    let tokens: Vec<String> = stem
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase())
+        .collect();
+    tokens
+        .iter()
+        .any(|token| PATH_SINGLE_TOKENS.contains(&token.as_str()))
+        || tokens
+            .windows(2)
+            .any(|pair| PATH_TOKEN_PAIRS.contains(&(pair[0].as_str(), pair[1].as_str())))
+}
+
+fn redact_suspicious_path_segments(path: &str) -> String {
+    path.split('/')
+        .map(|segment| {
+            if suspicious_path_segment(segment) {
+                "\u{2026}"
+            } else {
+                segment
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Exact value spans for `secrets adopt`. Unlike the refusal scanner's
 /// kind-only result, this enumerates every occurrence and expands the two
 /// prefix patterns to the complete credential: the full 1Password share URL
@@ -213,11 +266,12 @@ pub(crate) fn content_secret_spans(text: &str) -> Result<Vec<SecretSpan>, String
 /// when its filename itself carries a credential.
 pub(crate) fn scan_path(path: &str) -> Vec<SecretHit> {
     let matches = matching_patterns(path);
-    if matches.is_empty() {
+    let heuristic = path.split('/').any(suspicious_path_segment);
+    if matches.is_empty() && !heuristic {
         return Vec::new();
     }
-    let shown = redact_path(path);
-    matches
+    let shown = redact_suspicious_path_segments(&redact_path(path));
+    let mut hits: Vec<SecretHit> = matches
         .into_iter()
         .map(|index| SecretHit {
             path: shown.clone(),
@@ -225,7 +279,16 @@ pub(crate) fn scan_path(path: &str) -> Vec<SecretHit> {
             kind: PATTERNS[index].0,
             in_path: true,
         })
-        .collect()
+        .collect();
+    if heuristic {
+        hits.push(SecretHit {
+            path: shown,
+            store_path: path.to_string(),
+            kind: PATH_HEURISTIC_KIND,
+            in_path: true,
+        });
+    }
+    hits
 }
 
 /// Scan UTF-8 file bytes while reporting only the (possibly redacted) path
@@ -289,6 +352,71 @@ mod tests {
     fn kinds_in(text: String) -> Vec<&'static str> {
         let store = store_of(vec![("note.md", text)]);
         scan_store(&store).iter().map(|h| h.kind).collect()
+    }
+
+    #[test]
+    fn public_pattern_spec_is_the_executable_scanner_contract() {
+        let spec: serde_json::Value =
+            serde_json::from_str(include_str!("../spec/secret-patterns-v1.json")).unwrap();
+        assert_eq!(spec["version"], 1);
+        let patterns = spec["contentPatterns"].as_array().unwrap();
+        assert_eq!(patterns.len(), PATTERNS.len());
+        for (index, (kind, regex)) in PATTERNS.iter().enumerate() {
+            assert_eq!(patterns[index]["kind"], *kind);
+            assert_eq!(patterns[index]["regex"], *regex);
+            assert_eq!(patterns[index]["rightBoundary"], right_boundary(index));
+        }
+        let heuristic = &spec["pathHeuristic"];
+        assert_eq!(heuristic["kind"], PATH_HEURISTIC_KIND);
+        let singles: Vec<&str> = heuristic["singleTokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        assert_eq!(singles, PATH_SINGLE_TOKENS);
+        let pairs: Vec<(&str, &str)> = heuristic["tokenPairs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|pair| {
+                let pair = pair.as_array().unwrap();
+                (pair[0].as_str().unwrap(), pair[1].as_str().unwrap())
+            })
+            .collect();
+        assert_eq!(pairs, PATH_TOKEN_PAIRS);
+    }
+
+    #[test]
+    fn credential_related_filenames_are_suspect_without_exposing_the_segment() {
+        for path in [
+            "records/password-hunter.md",
+            "sources/config-secrets-example-json.md",
+            "assets/private_key.txt",
+            "records/app-password.md",
+        ] {
+            let hits = scan_path(path);
+            assert!(
+                hits.iter().any(|hit| hit.kind == PATH_HEURISTIC_KIND),
+                "heuristic missed {path}"
+            );
+            assert_eq!(hits[0].store_path, path);
+            assert!(hits[0].path.contains('\u{2026}'));
+            assert!(!hits[0].path.contains(path.rsplit('/').next().unwrap()));
+        }
+    }
+
+    #[test]
+    fn credential_filename_heuristic_avoids_adjacent_concepts() {
+        for path in [
+            "records/passwordless-auth.md",
+            "records/secretariat.md",
+            "sources/tokenization.md",
+            "records/api-client.md",
+            "records/key-design.md",
+        ] {
+            assert!(scan_path(path).is_empty(), "false positive on {path}");
+        }
     }
 
     #[test]
