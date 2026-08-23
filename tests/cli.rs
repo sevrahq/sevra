@@ -1239,6 +1239,39 @@ fn mcp_tools_call_reaches_the_hub_with_the_stored_bearer() {
 }
 
 #[test]
+fn mcp_secret_status_uses_owner_bearer_and_returns_metadata_only() {
+    let (base, log, handle) = mock_hub(vec![(
+        200,
+        r#"{"items":[{"name":"CRM_TOKEN","provisioned":false}],"sweep":{"state":"current","fileCount":0}}"#
+            .to_string(),
+    )]);
+    let out = sevra()
+        .arg("mcp")
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", "sevra_account_mcp")
+        .write_stdin(concat!(
+            r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"secrets_status","arguments":{"brain":"work"}}}"#,
+            "\n"
+        ))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", all_output(&out));
+    handle.join().unwrap();
+    let reqs = log.lock().unwrap();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].method, "GET");
+    assert_eq!(reqs[0].path, "/api/hub/brains/work/secrets");
+    assert_eq!(
+        reqs[0].authorization.as_deref(),
+        Some("Bearer sevra_account_mcp")
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(r#""isError":false"#), "{stdout}");
+    assert!(stdout.contains("CRM_TOKEN"), "{stdout}");
+    assert!(!stdout.contains("valueBase64"), "{stdout}");
+}
+
+#[test]
 fn mcp_start_run_posts_the_exact_agent_with_the_stored_bearer() {
     let (base, log, handle) = mock_hub(vec![(
         202,

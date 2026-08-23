@@ -61,14 +61,14 @@ fn log(msg: &str) {
 
 // --- tool definitions (the tight surface) ------------------------------------
 
-fn tools() -> Value {
-    json!([
-        {
+fn tools(owner_metadata: bool) -> Value {
+    let mut tools = vec![
+        json!({
             "name": "list_brains",
             "description": "List the brains you can access (id, slug, name, scope). Call this first to get a brain id for the other tools.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
-        },
-        {
+        }),
+        json!({
             "name": "search_brain",
             "description": "Search a brain's records and sources. Full-text `q` (ranked) and/or structured filters (type, layer, meta_type, tag). Returns a catalog of matches (path, title, summary) — retrieve full text with get_record.",
             "inputSchema": {
@@ -85,8 +85,8 @@ fn tools() -> Value {
                 "required": ["brain"],
                 "additionalProperties": false,
             },
-        },
-        {
+        }),
+        json!({
             "name": "get_record",
             "description": "Fetch one record/source in full (frontmatter + body) by its db.md id or its store path. The @brain/id resolution.",
             "inputSchema": {
@@ -99,8 +99,8 @@ fn tools() -> Value {
                 "required": ["brain"],
                 "additionalProperties": false,
             },
-        },
-        {
+        }),
+        json!({
             "name": "graph",
             "description": "The wiki-link neighborhood of a record: what it links to (outlinks) and what links to it (backlinks), each with the neighbor's title/summary and whether the link resolves.",
             "inputSchema": {
@@ -113,8 +113,8 @@ fn tools() -> Value {
                 "required": ["brain", "path"],
                 "additionalProperties": false,
             },
-        },
-        {
+        }),
+        json!({
             "name": "list_runs",
             "description": "List a brain's configured run agents, schedules, source paths, validation flags, automatic/manual execution policy, credit state, and recent run outcomes. Call this before start_run to discover the exact agent name.",
             "inputSchema": {
@@ -125,8 +125,8 @@ fn tools() -> Value {
                 "required": ["brain"],
                 "additionalProperties": false,
             },
-        },
-        {
+        }),
+        json!({
             "name": "start_run",
             "description": "Queue one enabled Sevra-run agent now, alongside any configured automatic schedule. This can spend the brain owner's run credits.",
             "inputSchema": {
@@ -138,8 +138,26 @@ fn tools() -> Value {
                 "required": ["brain", "agent"],
                 "additionalProperties": false,
             },
-        },
-    ])
+        }),
+    ];
+    if owner_metadata {
+        tools.insert(
+            5,
+            json!({
+                "name": "secrets_status",
+                "description": "Show one owned brain's secret posture: declared names, whether each value is stored, bound consumers, last use, and the hosted-content sweep. Values are never returned.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "brain": { "type": "string", "description": "Owned brain id or slug." },
+                    },
+                    "required": ["brain"],
+                    "additionalProperties": false,
+                },
+            }),
+        );
+    }
+    Value::Array(tools)
 }
 
 // --- helpers -----------------------------------------------------------------
@@ -190,7 +208,18 @@ fn qs(pairs: &[(&str, Option<String>)]) -> String {
 /// Dispatch one tool call to the hub API. Returns an MCP tool result — a hub
 /// error becomes an isError result the model can read; `Err` is reserved for
 /// an internal client failure (surfaced as -32603 by the shell).
-fn call_tool(name: &str, args: &Value, client: &dyn McpHubClient) -> Result<Value, String> {
+fn call_tool(
+    name: &str,
+    args: &Value,
+    client: &dyn McpHubClient,
+    owner_metadata: bool,
+) -> Result<Value, String> {
+    if name == "secrets_status" && !owner_metadata {
+        return Ok(tool_result(
+            &json!({ "error": "secrets_status requires a signed-in owner connection" }),
+            true,
+        ));
+    }
     let brain = str_arg(args.get("brain"));
     if name != "list_brains" && brain.is_none() {
         return Ok(tool_result(
@@ -244,6 +273,7 @@ fn call_tool(name: &str, args: &Value, client: &dyn McpHubClient) -> Result<Valu
             ))?
         }
         "list_runs" => client.get(&format!("/api/hub/brains/{b}/runs"))?,
+        "secrets_status" => client.get(&format!("/api/hub/brains/{b}/secrets"))?,
         "start_run" => {
             let agent = owned("agent");
             if agent.is_none() {
@@ -286,7 +316,11 @@ fn call_tool(name: &str, args: &Value, client: &dyn McpHubClient) -> Result<Valu
 
 /// Handle one JSON-RPC message. `Ok(None)` = a notification (no id — e.g.
 /// notifications/initialized), which gets no reply.
-fn handle_mcp_request(msg: &Value, client: &dyn McpHubClient) -> Result<Option<Value>, String> {
+fn handle_mcp_request(
+    msg: &Value,
+    client: &dyn McpHubClient,
+    owner_metadata: bool,
+) -> Result<Option<Value>, String> {
     let id = msg.get("id").cloned().unwrap_or(Value::Null);
     let is_notification = id.is_null();
     let params = msg.get("params");
@@ -310,14 +344,14 @@ fn handle_mcp_request(msg: &Value, client: &dyn McpHubClient) -> Result<Option<V
         }
         Some("notifications/initialized") | Some("notifications/cancelled") => Ok(None),
         Some("ping") => Ok(Some(ok(id, json!({})))),
-        Some("tools/list") => Ok(Some(ok(id, json!({ "tools": tools() })))),
+        Some("tools/list") => Ok(Some(ok(id, json!({ "tools": tools(owner_metadata) })))),
         Some("tools/call") => {
             let Some(name) = str_arg(params.and_then(|p| p.get("name"))) else {
                 return Ok(Some(err(id, -32602, "tools/call requires a tool name")));
             };
             let empty = json!({});
             let args = params.and_then(|p| p.get("arguments")).unwrap_or(&empty);
-            let result = call_tool(name, args, client)?;
+            let result = call_tool(name, args, client, owner_metadata)?;
             Ok(Some(ok(id, result)))
         }
         _ => {
@@ -339,11 +373,11 @@ fn handle_mcp_request(msg: &Value, client: &dyn McpHubClient) -> Result<Option<V
 /// One stdin line → at most one response frame. Parse failures answer
 /// -32700; an internal handler failure answers -32603 (requests only —
 /// notifications stay silent even when handling them failed).
-fn handle_line(line: &str, client: &dyn McpHubClient) -> Option<Value> {
+fn handle_line(line: &str, client: &dyn McpHubClient, owner_metadata: bool) -> Option<Value> {
     let Ok(msg) = serde_json::from_str::<Value>(line) else {
         return Some(err(Value::Null, -32700, "Parse error"));
     };
-    match handle_mcp_request(&msg, client) {
+    match handle_mcp_request(&msg, client, owner_metadata) {
         Ok(resp) => resp,
         Err(e) => {
             log(&format!("handler error: {e}"));
@@ -483,7 +517,7 @@ pub fn serve(cfg: &Config) {
         if line.is_empty() {
             continue;
         }
-        if let Some(resp) = handle_line(line, &client) {
+        if let Some(resp) = handle_line(line, &client, cfg.key.is_some()) {
             // One compact frame per line, flushed immediately: on a pipe,
             // stdout is block-buffered and the client is waiting on this
             // reply — an unflushed partial write would hang the session.
@@ -551,7 +585,7 @@ mod tests {
     }
 
     fn handle(msg: Value, client: &dyn McpHubClient) -> Option<Value> {
-        handle_mcp_request(&msg, client).expect("no internal error")
+        handle_mcp_request(&msg, client, true).expect("no internal error")
     }
 
     /// The pretty-JSON text block of a tool result, parsed back to a Value.
@@ -660,6 +694,7 @@ mod tests {
                 "get_record",
                 "graph",
                 "list_runs",
+                "secrets_status",
                 "start_run"
             ]
         );
@@ -673,10 +708,41 @@ mod tests {
             json!(["brain", "path"])
         );
         assert_eq!(tools[4]["inputSchema"]["required"], json!(["brain"]));
+        assert_eq!(tools[5]["inputSchema"]["required"], json!(["brain"]));
         assert_eq!(
-            tools[5]["inputSchema"]["required"],
+            tools[6]["inputSchema"]["required"],
             json!(["brain", "agent"])
         );
+    }
+
+    #[test]
+    fn owner_secret_status_is_hidden_without_a_credential_and_refused_if_called() {
+        let mock = Mock::with(200, json!({}));
+        let listed = handle_mcp_request(
+            &json!({ "jsonrpc": "2.0", "id": 5, "method": "tools/list" }),
+            &mock,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        let names: Vec<&str> = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert!(!names.contains(&"secrets_status"));
+
+        let called = handle_mcp_request(
+            &json!({ "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+                "params": { "name": "secrets_status", "arguments": { "brain": "work" } } }),
+            &mock,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(called["result"]["isError"], true);
+        assert!(mock.calls().is_empty());
     }
 
     #[test]
@@ -811,6 +877,24 @@ mod tests {
     }
 
     #[test]
+    fn secrets_status_reads_owner_metadata_without_values() {
+        let body = json!({
+            "items": [{ "name": "CRM_TOKEN", "provisioned": false }],
+            "sweep": { "state": "current", "fileCount": 0 }
+        });
+        let mock = Mock::with(200, body.clone());
+        let resp = handle(
+            json!({ "jsonrpc": "2.0", "id": 16, "method": "tools/call",
+                    "params": { "name": "secrets_status", "arguments": { "brain": "work" } } }),
+            &mock,
+        )
+        .unwrap();
+        assert_eq!(mock.calls(), ["/api/hub/brains/work/secrets"]);
+        assert_eq!(resp["result"]["isError"], false);
+        assert_eq!(tool_text(&resp), body);
+    }
+
+    #[test]
     fn start_run_requires_an_agent_then_posts_it() {
         let mock = Mock::with(202, json!({ "status": "queued", "runId": "01run" }));
         let missing = handle(
@@ -903,7 +987,7 @@ mod tests {
     #[test]
     fn parse_errors_answer_32700_with_a_null_id() {
         let mock = Mock::with(200, json!({}));
-        let resp = handle_line("{not json", &mock).unwrap();
+        let resp = handle_line("{not json", &mock, true).unwrap();
         assert_eq!(resp["error"]["code"], -32700);
         assert_eq!(resp["error"]["message"], "Parse error");
         assert_eq!(resp["id"], Value::Null);
@@ -933,12 +1017,12 @@ mod tests {
     fn internal_errors_answer_32603_for_requests_and_silence_for_notifications() {
         let mock = Mock::failing("boom");
         let line = r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"list_brains","arguments":{}}}"#;
-        let resp = handle_line(line, &mock).unwrap();
+        let resp = handle_line(line, &mock, true).unwrap();
         assert_eq!(resp["error"]["code"], -32603);
         assert_eq!(resp["error"]["message"], "Internal error");
         assert_eq!(resp["id"], 9);
         // The same failure on an id-less message writes nothing.
         let line = r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"list_brains","arguments":{}}}"#;
-        assert!(handle_line(line, &mock).is_none());
+        assert!(handle_line(line, &mock, true).is_none());
     }
 }
