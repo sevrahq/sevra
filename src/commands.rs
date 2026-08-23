@@ -5935,20 +5935,19 @@ pub fn secrets_status(cfg: &Config, brain: &str) {
     }
 
     let rows = r
-        .get("status")
+        .get("items")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    if rows.is_empty() {
-        out(
-            "no secret names are declared or stored — declare `secrets:` on a function or agent, or pipe a value to `sevra secrets set`",
-            None,
-        );
-        return;
-    }
-
     let mut lines = Vec::with_capacity(rows.len() + 1);
-    lines.push("NAME\tSTATE\tDECLARED BY\tCONSUMERS\tLAST USED".to_string());
+    if rows.is_empty() {
+        lines.push(
+            "no secret names are declared or stored — declare `secrets:` on a function or agent, or pipe a value to `sevra secrets set`"
+                .to_string(),
+        );
+    } else {
+        lines.push("NAME\tSTATE\tDECLARED BY\tCONSUMERS\tLAST USED".to_string());
+    }
     for row in rows {
         let name = row
             .get("name")
@@ -5997,6 +5996,30 @@ pub fn secrets_status(cfg: &Config, brain: &str) {
         lines.push(format!(
             "{name}\t{state}\t{declared_by}\t{consumers}\t{last_used}"
         ));
+    }
+    if let Some(sweep) = r.get("sweep") {
+        let state = sweep
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("not_scanned");
+        let findings = sweep
+            .get("findingCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let summary = match state {
+            "current" if findings == 0 => {
+                "checked — no recognizable credential patterns found".to_string()
+            }
+            "current" => format!(
+                "{findings} finding{} need review (matched values stay hidden)",
+                if findings == 1 { "" } else { "s" }
+            ),
+            "indexing" => "waiting for the hosted index".to_string(),
+            "stale" => "changed since its last check".to_string(),
+            "failed" => "needs another check".to_string(),
+            _ => "not checked yet".to_string(),
+        };
+        lines.push(format!("\nHOSTED COPY\t{summary}"));
     }
     out_layout(&lines.join("\n"), Some(r));
 }

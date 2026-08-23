@@ -522,7 +522,7 @@ fn secrets_list_get_and_rm_hold_the_error_contract() {
 #[test]
 fn secrets_status_renders_the_metadata_only_diff() {
     let body = serde_json::json!({
-        "status": [
+        "items": [
             {
                 "name": "API_KEY",
                 "declaredBy": [{"kind": "function", "name": "lookup"}],
@@ -538,7 +538,7 @@ fn secrets_status_renders_the_metadata_only_diff() {
                 "lastUsedAt": "2026-08-23T00:00:00.000Z"
             }
         ],
-        "sweep": {"state": "clean", "findingCount": 0}
+        "sweep": {"state": "current", "fileCount": 0, "findingCount": 0}
     })
     .to_string();
     let (base, log, handle) = mock_hub(vec![(200, body)]);
@@ -557,6 +557,8 @@ fn secrets_status_renders_the_metadata_only_diff() {
     assert!(all.contains("ready"), "{all}");
     assert!(all.contains("agent:curator"), "{all}");
     assert!(all.contains("never"), "{all}");
+    assert!(all.contains("HOSTED COPY"), "{all}");
+    assert!(all.contains("no recognizable credential patterns"), "{all}");
     handle.join().unwrap();
     let requests = log.lock().unwrap();
     assert_eq!(requests.len(), 1);
