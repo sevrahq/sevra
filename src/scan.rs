@@ -329,6 +329,13 @@ pub fn scan_store(store: &Store) -> Vec<SecretHit> {
 mod tests {
     use super::*;
     use crate::store::StoreFile;
+    use sha2::{Digest, Sha256};
+
+    // The hub vendors this exact public contract. Changing the scanner spec is
+    // therefore a coordinated protocol change: update the hub copy and its
+    // pinned source commit before accepting a new digest here.
+    const SECRET_PATTERN_SPEC_SHA256: &str =
+        "25db586d9de8525497f8de9a3467cf107b68f41ac43718dd0e2443d9acee663c";
 
     /// Fixture tokens are BUILT at runtime so no secret-shaped literal ever
     /// sits in this source file (repo scanners would rightly flag them).
@@ -356,8 +363,12 @@ mod tests {
 
     #[test]
     fn public_pattern_spec_is_the_executable_scanner_contract() {
-        let spec: serde_json::Value =
-            serde_json::from_str(include_str!("../spec/secret-patterns-v1.json")).unwrap();
+        let bytes = include_bytes!("../spec/secret-patterns-v1.json");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(bytes)),
+            SECRET_PATTERN_SPEC_SHA256
+        );
+        let spec: serde_json::Value = serde_json::from_slice(bytes).unwrap();
         assert_eq!(spec["version"], 1);
         let patterns = spec["contentPatterns"].as_array().unwrap();
         assert_eq!(patterns.len(), PATTERNS.len());
