@@ -6,7 +6,7 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
-use std::sync::OnceLock;
+use std::sync::{mpsc, OnceLock};
 
 use serde_json::Value;
 
@@ -20,6 +20,14 @@ use crate::output::fail;
 const MAX_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
 const CONNECT_ATTEMPTS: usize = 3;
 const CONNECT_RETRY_BACKOFF_MS: [u64; CONNECT_ATTEMPTS - 1] = [100, 300];
+// Socket read deadlines are necessary but not sufficient: a platform TLS
+// stack can remain parked after the peer has closed its socket. Run every hub
+// exchange behind an independent wall-clock fence so a command can never hang
+// beyond the declared request budget. The default admits two failed 10-second
+// connects plus the 120-second read window and scheduling slack. A verb-level
+// timeout receives the same connect/scheduling slack.
+const DEFAULT_REQUEST_HARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(155);
+const REQUEST_HARD_TIMEOUT_SLACK: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The bearer key must never travel in cleartext; only loopback hosts may skip
 /// TLS (local dev against `npm run dev`).
@@ -512,9 +520,50 @@ fn request_inner(
         None
     };
     let encoded_body = body.map(Value::to_string);
+    let hard_timeout = timeout
+        .map(|deadline| deadline.saturating_add(REQUEST_HARD_TIMEOUT_SLACK))
+        .unwrap_or(DEFAULT_REQUEST_HARD_TIMEOUT);
+    let cfg = cfg.clone();
+    let method = method.to_string();
+    run_with_hard_deadline(hard_timeout, move || {
+        request_inner_blocking(cfg, method, url, encoded_body, credential, timeout)
+    })
+}
+
+fn run_with_hard_deadline<T: Send + 'static>(
+    timeout: std::time::Duration,
+    operation: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("sevra-hub-request".into())
+        .spawn(move || {
+            let _ = sender.send(operation());
+        })
+        .map_err(|error| format!("could not start the bounded hub request: {error}"))?;
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "hub request exceeded its hard wall-clock deadline ({}s)",
+            timeout.as_secs()
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err("bounded hub request ended without a result".into())
+        }
+    }
+}
+
+fn request_inner_blocking(
+    cfg: Config,
+    method: String,
+    url: String,
+    encoded_body: Option<String>,
+    credential: Option<String>,
+    timeout: Option<std::time::Duration>,
+) -> Result<HubResponse, String> {
     let http = agent();
     let result = with_connect_retries(|| {
-        let mut req = http.request(method, &url);
+        let mut req = http.request(&method, &url);
         if let Some(timeout) = timeout {
             req = req.timeout(timeout);
         }
@@ -535,13 +584,13 @@ fn request_inner(
         Err(error) => match *error {
             ureq::Error::Status(code, resp) => {
                 // An HTTP status IS a hub answer — never a transport failure.
-                return finish_response(cfg, code, resp);
+                return finish_response(&cfg, code, resp);
             }
             ureq::Error::Transport(t) => return Err(t.to_string()),
         },
     };
     let status = resp.status();
-    finish_response(cfg, status, resp)
+    finish_response(&cfg, status, resp)
 }
 
 fn finish_response(cfg: &Config, status: u16, resp: ureq::Response) -> Result<HubResponse, String> {
@@ -687,6 +736,24 @@ mod tests {
             "the request-level deadline must be honored"
         );
         server.join().unwrap();
+    }
+
+    #[test]
+    fn hard_deadline_returns_even_when_blocking_operation_ignores_it() {
+        let started = std::time::Instant::now();
+        let result = run_with_hard_deadline(Duration::from_millis(40), || {
+            thread::sleep(Duration::from_millis(250));
+            Ok::<_, String>(())
+        });
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("hard wall-clock deadline"),
+            "the failure must name the independent hard deadline"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "the caller must return while the blocking worker is still parked"
+        );
     }
 
     #[test]

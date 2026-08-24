@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.2.28 — 2026-08-24
+
+- Transport: every hub request now has an independent hard wall-clock fence.
+  A platform TLS socket that remains parked after its peer closes can no longer
+  hang `sevra push` or another command beyond the declared request budget.
+
 ## 0.2.27 — 2026-08-23
 
 - Secret adoption: immutable-source preflight now delegates exact signed v2
