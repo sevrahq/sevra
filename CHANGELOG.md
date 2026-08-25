@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.2.31 — 2026-08-25
+
+- Hosted reads: `query`, `get`, `graph`, and their MCP equivalents now wait
+  through the one explicitly retryable application state emitted while a new
+  brain's immutable read checkpoint is being prepared. The client honors the
+  hub's `Retry-After` response inside the existing bounded read deadline; all
+  other permission, validation, transport, and server errors still return
+  immediately.
+
 ## 0.2.30 — 2026-08-25
 
 - Hosted reads: `query`, `get`, `graph`, and their MCP equivalents now admit

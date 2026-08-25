@@ -17,8 +17,8 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::config::{self, Config, DEFAULT_HUB};
 use crate::hub::{
-    ensure_ok, get_presigned, put_presigned, request, request_with_timeout, HubResponse,
-    HOSTED_BRAIN_READ_TIMEOUT, NOT_LOGGED_IN,
+    ensure_ok, get_presigned, hosted_brain_read, put_presigned, request, request_with_timeout,
+    HubResponse, NOT_LOGGED_IN,
 };
 use crate::local;
 use crate::output::{fail, json_mode, note, out, out_layout, terminal_safe, usage_fail};
@@ -2766,13 +2766,10 @@ pub fn query(
         .collect::<Vec<_>>()
         .join("&");
     let r = ensure_ok(
-        request_with_timeout(
+        hosted_brain_read(
             cfg,
-            "GET",
             &format!("/api/hub/brains/{}/query?{qs}", enc(brain)),
-            None,
             true,
-            HOSTED_BRAIN_READ_TIMEOUT,
         ),
         "query",
     );
@@ -2817,17 +2814,14 @@ pub fn get(cfg: &Config, brain: &str, reference: &str) {
         "id"
     };
     let r = ensure_ok(
-        request_with_timeout(
+        hosted_brain_read(
             cfg,
-            "GET",
             &format!(
                 "/api/hub/brains/{}/resolve?{key}={}",
                 enc(brain),
                 enc(reference)
             ),
-            None,
             true,
-            HOSTED_BRAIN_READ_TIMEOUT,
         ),
         "get",
     );
@@ -2858,18 +2852,15 @@ pub fn graph(cfg: &Config, brain: &str, path: &str, dir: Option<String>) {
     // clap's value_parser already constrained --dir to in|out|both.
     let dir = dir.unwrap_or_else(|| "both".into());
     let r = ensure_ok(
-        request_with_timeout(
+        hosted_brain_read(
             cfg,
-            "GET",
             &format!(
                 "/api/hub/brains/{}/graph?path={}&dir={}",
                 enc(brain),
                 enc(path),
                 enc(&dir)
             ),
-            None,
             true,
-            HOSTED_BRAIN_READ_TIMEOUT,
         ),
         "graph",
     );

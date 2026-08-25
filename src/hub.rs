@@ -11,7 +11,7 @@ use std::sync::{mpsc, OnceLock};
 use serde_json::Value;
 
 use crate::config::{config_path, Config};
-use crate::output::fail;
+use crate::output::{fail, note};
 
 /// The most the CLI will buffer from one hub response. ureq's `into_string()`
 /// stops at 10 MB, which a large brain's `export` legitimately exceeds — so
@@ -32,6 +32,7 @@ const REQUEST_HARD_TIMEOUT_SLACK: std::time::Duration = std::time::Duration::fro
 /// dbmd can answer. The matching hub routes have an 800-second hard ceiling;
 /// these verbs opt into that ceiling without weakening ordinary API calls.
 pub const HOSTED_BRAIN_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(800);
+const HOSTED_BRAIN_READ_RETRY_MIN: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// The bearer key must never travel in cleartext; only loopback hosts may skip
 /// TLS (local dev against `npm run dev`).
@@ -372,6 +373,9 @@ pub const NOT_LOGGED_IN: &str =
 pub struct HubResponse {
     pub status: u16,
     pub body: Option<Value>,
+    /// Parsed delta-seconds from Retry-After. Only the narrow hosted-read
+    /// checkpoint loop consumes it; every other response remains one-shot.
+    pub retry_after_seconds: Option<u64>,
     /// The first ~200 chars of the response text (control chars flattened) —
     /// surfaced on errors that carry no JSON `error`, so a proxy page or an
     /// HTML answer is debuggable instead of an opaque "unknown error".
@@ -487,20 +491,6 @@ pub fn try_request(
     request_inner(cfg, method, path, body, auth, None)
 }
 
-/// Result-returning counterpart to `request_with_timeout`, used by the
-/// long-lived MCP server so a transport failure becomes a model-visible tool
-/// error instead of terminating the process.
-pub fn try_request_with_timeout(
-    cfg: &Config,
-    method: &str,
-    path: &str,
-    body: Option<&Value>,
-    auth: bool,
-    timeout: std::time::Duration,
-) -> Result<HubResponse, String> {
-    request_inner(cfg, method, path, body, auth, Some(timeout))
-}
-
 /// A hub request with a verb-specific total deadline. Pack commit performs
 /// server-side unpack, validation, indexing, and durable publication under a
 /// 300-second route budget, so the ordinary 120-second read window is too
@@ -516,6 +506,57 @@ pub fn request_with_timeout(
     match request_inner(cfg, method, path, body, auth, Some(timeout)) {
         Ok(resp) => resp,
         Err(t) => fail(&format!("hub unreachable at {}: {}", cfg.hub, t), None),
+    }
+}
+
+fn is_read_checkpoint_pending(response: &HubResponse) -> bool {
+    response.status == 503
+        && response
+            .body
+            .as_ref()
+            .and_then(|body| body.get("code"))
+            .and_then(Value::as_str)
+            == Some("read_checkpoint_pending")
+}
+
+/// Query, resolve, and graph have one explicitly retryable application state:
+/// a committed v2 brain whose immutable read checkpoint is still being built.
+/// Retry only that typed 503, honor Retry-After, and keep the entire wait plus
+/// subsequent cold-stage request inside the verb's existing total budget.
+pub fn try_hosted_brain_read(cfg: &Config, path: &str, auth: bool) -> Result<HubResponse, String> {
+    let started = std::time::Instant::now();
+    loop {
+        let remaining = HOSTED_BRAIN_READ_TIMEOUT.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(format!(
+                "hosted brain read exceeded its {}s readiness and execution deadline",
+                HOSTED_BRAIN_READ_TIMEOUT.as_secs()
+            ));
+        }
+        let response = request_inner(cfg, "GET", path, None, auth, Some(remaining))?;
+        if !is_read_checkpoint_pending(&response) {
+            return Ok(response);
+        }
+        let delay = std::time::Duration::from_secs(response.retry_after_seconds.unwrap_or(1))
+            .max(HOSTED_BRAIN_READ_RETRY_MIN);
+        let remaining = HOSTED_BRAIN_READ_TIMEOUT.saturating_sub(started.elapsed());
+        if delay >= remaining {
+            return Ok(response);
+        }
+        note(&format!(
+            "the brain's hosted read checkpoint is being prepared; retrying in {}s",
+            delay.as_secs_f64()
+        ));
+        std::thread::sleep(delay);
+    }
+}
+
+/// Process-exiting counterpart for one-shot CLI commands. MCP uses the
+/// Result-returning form so a network failure remains a tool error.
+pub fn hosted_brain_read(cfg: &Config, path: &str, auth: bool) -> HubResponse {
+    match try_hosted_brain_read(cfg, path, auth) {
+        Ok(response) => response,
+        Err(error) => fail(&format!("hub unreachable at {}: {}", cfg.hub, error), None),
     }
 }
 
@@ -616,6 +657,9 @@ fn finish_response(cfg: &Config, status: u16, resp: ureq::Response) -> Result<Hu
     // deploy-coupled): the CLI learns the latest release from the hub and
     // signed-self-updates when behind.
     crate::update::maybe_auto_update(cfg);
+    let retry_after_seconds = resp
+        .header("retry-after")
+        .and_then(|value| value.trim().parse::<u64>().ok());
     let mut buf = Vec::new();
     if let Err(e) = resp
         .into_reader()
@@ -638,6 +682,7 @@ fn finish_response(cfg: &Config, status: u16, resp: ureq::Response) -> Result<Hu
     Ok(HubResponse {
         status,
         body: parsed,
+        retry_after_seconds,
         snippet: snippet_of(&text),
     })
 }
@@ -752,6 +797,68 @@ mod tests {
         assert!(
             result.is_err(),
             "the request-level deadline must be honored"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn hosted_read_retries_only_the_typed_checkpoint_pending_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for (status, retry_after, body) in [
+                (
+                    "503 Service Unavailable",
+                    "Retry-After: 0\r\n",
+                    r#"{"error":"checkpoint is being prepared","code":"read_checkpoint_pending"}"#,
+                ),
+                ("200 OK", "", r#"{"ok":true}"#),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request_bytes = [0_u8; 1024];
+                let _ = stream.read(&mut request_bytes).unwrap();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{retry_after}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        let cfg = Config {
+            hub: format!("http://{address}"),
+            key: None,
+        };
+
+        let response = try_hosted_brain_read(&cfg, "/graph", false).unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, Some(serde_json::json!({ "ok": true })));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn hosted_read_does_not_retry_an_untyped_503() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request_bytes = [0_u8; 1024];
+            let _ = stream.read(&mut request_bytes).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 30\r\nConnection: close\r\n\r\n{\"error\":\"runner unavailable\"}",
+                )
+                .unwrap();
+        });
+        let cfg = Config {
+            hub: format!("http://{address}"),
+            key: None,
+        };
+
+        let response = try_hosted_brain_read(&cfg, "/graph", false).unwrap();
+        assert_eq!(response.status, 503);
+        assert_eq!(
+            response.body,
+            Some(serde_json::json!({ "error": "runner unavailable" }))
         );
         server.join().unwrap();
     }

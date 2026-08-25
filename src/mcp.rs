@@ -437,14 +437,7 @@ struct ApiClient<'a> {
 impl McpHubClient for ApiClient<'_> {
     fn get(&self, path: &str) -> Result<HubGet, String> {
         let response = if is_hosted_brain_read(path) {
-            hub::try_request_with_timeout(
-                self.cfg,
-                "GET",
-                path,
-                None,
-                self.cfg.key.is_some(),
-                hub::HOSTED_BRAIN_READ_TIMEOUT,
-            )
+            hub::try_hosted_brain_read(self.cfg, path, self.cfg.key.is_some())
         } else {
             hub::try_request(self.cfg, "GET", path, None, self.cfg.key.is_some())
         };
