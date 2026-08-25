@@ -28,6 +28,10 @@ const CONNECT_RETRY_BACKOFF_MS: [u64; CONNECT_ATTEMPTS - 1] = [100, 300];
 // timeout receives the same connect/scheduling slack.
 const DEFAULT_REQUEST_HARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(155);
 const REQUEST_HARD_TIMEOUT_SLACK: std::time::Duration = std::time::Duration::from_secs(30);
+/// Query, resolve, and graph may cold-stage a maximum-size hosted brain before
+/// dbmd can answer. The matching hub routes have an 800-second hard ceiling;
+/// these verbs opt into that ceiling without weakening ordinary API calls.
+pub const HOSTED_BRAIN_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(800);
 
 /// The bearer key must never travel in cleartext; only loopback hosts may skip
 /// TLS (local dev against `npm run dev`).
@@ -481,6 +485,20 @@ pub fn try_request(
     auth: bool,
 ) -> Result<HubResponse, String> {
     request_inner(cfg, method, path, body, auth, None)
+}
+
+/// Result-returning counterpart to `request_with_timeout`, used by the
+/// long-lived MCP server so a transport failure becomes a model-visible tool
+/// error instead of terminating the process.
+pub fn try_request_with_timeout(
+    cfg: &Config,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    auth: bool,
+    timeout: std::time::Duration,
+) -> Result<HubResponse, String> {
+    request_inner(cfg, method, path, body, auth, Some(timeout))
 }
 
 /// A hub request with a verb-specific total deadline. Pack commit performs

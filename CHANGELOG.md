@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.2.30 — 2026-08-25
+
+- Hosted reads: `query`, `get`, `graph`, and their MCP equivalents now admit
+  the hub's bounded cold-stage window for a maximum-size brain. Ordinary API
+  calls keep their tighter network deadline, so only commands that may need to
+  materialize an immutable checkpoint receive the larger budget.
+
 ## 0.2.29 — 2026-08-25
 
 - Alias safety: `sevra rebind` now places the shared hub option before dbmd's

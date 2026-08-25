@@ -436,7 +436,19 @@ struct ApiClient<'a> {
 
 impl McpHubClient for ApiClient<'_> {
     fn get(&self, path: &str) -> Result<HubGet, String> {
-        match hub::try_request(self.cfg, "GET", path, None, self.cfg.key.is_some()) {
+        let response = if is_hosted_brain_read(path) {
+            hub::try_request_with_timeout(
+                self.cfg,
+                "GET",
+                path,
+                None,
+                self.cfg.key.is_some(),
+                hub::HOSTED_BRAIN_READ_TIMEOUT,
+            )
+        } else {
+            hub::try_request(self.cfg, "GET", path, None, self.cfg.key.is_some())
+        };
+        match response {
             Ok(r) => Ok(HubGet {
                 status: r.status,
                 body: r.body.unwrap_or(Value::Null),
@@ -462,6 +474,11 @@ impl McpHubClient for ApiClient<'_> {
             }),
         }
     }
+}
+
+fn is_hosted_brain_read(path: &str) -> bool {
+    let route = path.split_once('?').map_or(path, |(route, _)| route);
+    route.ends_with("/query") || route.ends_with("/resolve") || route.ends_with("/graph")
 }
 
 /// `sevra mcp`: serve until stdin closes. Exits 0 when the client hangs up.
@@ -586,6 +603,18 @@ mod tests {
 
     fn handle(msg: Value, client: &dyn McpHubClient) -> Option<Value> {
         handle_mcp_request(&msg, client, true).expect("no internal error")
+    }
+
+    #[test]
+    fn only_store_execution_reads_receive_the_cold_stage_budget() {
+        assert!(is_hosted_brain_read("/api/hub/brains/b/query?q=x"));
+        assert!(is_hosted_brain_read("/api/hub/brains/b/resolve?id=x"));
+        assert!(is_hosted_brain_read(
+            "/api/hub/brains/b/graph?path=records%2Fa.md"
+        ));
+        assert!(!is_hosted_brain_read("/api/hub/brains"));
+        assert!(!is_hosted_brain_read("/api/hub/brains/b/runs"));
+        assert!(!is_hosted_brain_read("/api/hub/brains/b/query-extra"));
     }
 
     /// The pretty-JSON text block of a tool result, parsed back to a Value.
