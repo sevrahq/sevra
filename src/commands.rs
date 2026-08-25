@@ -2626,6 +2626,37 @@ pub fn push(cfg: &Config, dir: &str, brain: &str, options: PushOptions<'_>) {
             obj.insert("catalogsKeptHome".into(), json!(stats.catalogs_kept));
         }
     }
+    // Files that travel by neither lane. Not an error — the push is correct
+    // and complete for everything that HAS a lane — but never silent: a
+    // binary nobody declared stays on this machine while the push reports
+    // success, and the only signal used to be its absence months later.
+    if stats.unaccounted > 0 {
+        human.push_str(&format!(
+            "\n{} file(s) travelled by neither lane — not markdown, not declared in assets.jsonl:",
+            stats.unaccounted
+        ));
+        for path in &stats.unaccounted_sample {
+            human.push_str(&format!("\n  {path}"));
+        }
+        if stats.unaccounted > stats.unaccounted_sample.len() {
+            human.push_str(&format!(
+                "\n  … and {} more",
+                stats.unaccounted - stats.unaccounted_sample.len()
+            ));
+        }
+        human.push_str(
+            "\n  run `dbmd assets scan` to declare them, or add them to .sevralocal to keep them home on purpose",
+        );
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert(
+                "unaccounted".into(),
+                json!({
+                    "count": stats.unaccounted,
+                    "sample": stats.unaccounted_sample,
+                }),
+            );
+        }
+    }
 
     // The byte half of the asset story: the snapshot just ingested the
     // manifest, so every declared hash is now uploadable — ship what the hub

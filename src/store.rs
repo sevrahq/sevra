@@ -6,6 +6,7 @@
 //! root (see `crate::local`) keeps matching files home: excluded from the
 //! collected store, counted separately in the stats.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
@@ -182,6 +183,14 @@ pub fn build_pack(store: &Store) -> std::io::Result<Vec<u8>> {
 /// How many of the largest files the walk keeps for limit-refusal reporting.
 const LARGEST_TRACKED: usize = 10;
 
+/// How many unaccounted paths the walk names in its report. Enough to act on;
+/// the count is always exact regardless.
+const UNACCOUNTED_SAMPLE: usize = 10;
+
+/// A manifest longer than this is not read for declaration purposes. The push
+/// enforces the real ceiling; this only bounds the walk's own memory.
+const MANIFEST_SCAN_LINES: usize = 200_000;
+
 /// What the walk saw: every file that counts toward the hub's snapshot
 /// limits, whether or not its content was read. O(1) memory over any store
 /// size — a cap refusal can name honest totals and the biggest offenders
@@ -201,6 +210,17 @@ pub struct WalkStats {
     /// active — catalogs carry every file's name/title/summary, kept-home
     /// files included, and the hub rebuilds its own from what rides.
     pub catalogs_kept: usize,
+    /// Files that reach the hub through NEITHER lane: not markdown (so not in
+    /// the snapshot), not declared in `assets.jsonl` (so not in the asset
+    /// lane), and not kept home on purpose. Binaries are supposed to travel as
+    /// declared assets; an undeclared one silently never leaves the machine,
+    /// which is the class the 2026-07-28 incident named — "0 assets" meant no
+    /// manifest, and every binary stayed home while the push reported success.
+    /// Counting them is what makes the skip say its own name.
+    pub unaccounted: usize,
+    /// A bounded sample of those paths, so a report can name files instead of
+    /// only counting them. O(1) memory over any store size, like `largest`.
+    pub unaccounted_sample: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -237,6 +257,7 @@ fn walk(
     prefix: &str,
     st: &mut WalkState,
     scope: Option<&LocalScope>,
+    declared: &BTreeSet<String>,
 ) -> std::io::Result<()> {
     for entry in dir.entries()? {
         let name = entry.name.to_str().ok_or_else(|| {
@@ -264,7 +285,7 @@ fn walk(
                 let child = dir.open_dir(&entry.name).map_err(|error| {
                     std::io::Error::new(error.kind(), format!("{rel}: {error}"))
                 })?;
-                walk(&child, &rel, st, scope)?;
+                walk(&child, &rel, st, scope, declared)?;
             }
             crate::safe_path::EntryKind::File => {
                 let counts = rel == "assets.jsonl" || rel.to_lowercase().ends_with(".md");
@@ -272,6 +293,24 @@ fn walk(
                     // (`index.jsonl` never reaches the collected store on any
                     // path: it is not `.md` and only the ROOT `assets.jsonl`
                     // counts.)
+                    //
+                    // Skipping is correct — packs are markdown-only by design
+                    // and binaries ride the asset lane — but skipping in
+                    // SILENCE is not. A file declared in `assets.jsonl` is
+                    // accounted for; one kept home was a deliberate choice;
+                    // anything else would leave the machine's disk and never
+                    // arrive anywhere, with the push still reporting success.
+                    // Name it, and let the caller decide.
+                    let deliberate = rel == "index.jsonl"
+                        || rel.rsplit('/').next() == Some("index.jsonl")
+                        || declared.contains(&rel)
+                        || scope.is_some_and(|scope| scope.keeps_home(&rel));
+                    if !deliberate {
+                        st.stats.unaccounted += 1;
+                        if st.stats.unaccounted_sample.len() < UNACCOUNTED_SAMPLE {
+                            st.stats.unaccounted_sample.push(rel.clone());
+                        }
+                    }
                     continue;
                 }
                 if let Some(scope) = scope {
@@ -341,6 +380,35 @@ fn walk(
 /// vault is never read into memory before a post-hoc check. On the cap
 /// refusal the walk continues without reading, so `StoreError::OverCap`
 /// carries the store's true totals and its largest files.
+/// Store-relative paths declared in the root `assets.jsonl`.
+///
+/// Read leniently and on purpose: a malformed or absent manifest is the push's
+/// error to report, never the walk's to fail on. Anything unparseable yields
+/// no declarations, so the walk reports MORE files as unaccounted, never
+/// fewer — the honest direction for a warning whose job is to break silence.
+fn declared_asset_paths(dir: &str) -> BTreeSet<String> {
+    let mut declared = BTreeSet::new();
+    let Ok(bytes) = fs::read(Path::new(dir).join("assets.jsonl")) else {
+        return declared;
+    };
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return declared;
+    };
+    for line in text.lines().take(MANIFEST_SCAN_LINES) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if let Some(path) = value.get("path").and_then(|p| p.as_str()) {
+            declared.insert(path.to_string());
+        }
+    }
+    declared
+}
+
 pub fn read_store(dir: &str, max_bytes: u64) -> Result<(Store, WalkStats), StoreError> {
     let scope = crate::local::load(Path::new(dir)).map_err(StoreError::Scope)?;
     read_store_impl(dir, max_bytes, scope.as_ref())
@@ -370,13 +438,15 @@ fn read_store_impl(
             largest: Vec::new(),
             kept_home: 0,
             catalogs_kept: 0,
+            unaccounted: 0,
+            unaccounted_sample: Vec::new(),
         },
         // budget hits zero exactly when the running total EXCEEDS max_bytes —
         // a store of exactly max_bytes raw bytes is still allowed through to
         // the exact JSON-size check in `push`.
         budget: max_bytes.saturating_add(1),
     };
-    match walk(&root, "", &mut st, scope) {
+    match walk(&root, "", &mut st, scope, &declared_asset_paths(dir)) {
         Ok(()) if st.budget == 0 => Err(StoreError::OverCap(st.stats)),
         Ok(()) => Ok((st.store, st.stats)),
         Err(e) => Err(StoreError::Io(e)),
@@ -394,6 +464,90 @@ mod tests {
         let p = dir.join(rel);
         fs::create_dir_all(p.parent().unwrap()).unwrap();
         fs::write(p, content).unwrap();
+    }
+
+    #[test]
+    fn an_undeclared_binary_is_named_rather_than_silently_skipped() {
+        let t = tempfile::tempdir().unwrap();
+        write(t.path(), "a.md", b"alpha");
+        write(t.path(), "sources/report.pdf", b"%PDF-1.4");
+        write(t.path(), "sources/photo.png", b"\x89PNG");
+
+        let (store, stats) = read_store(t.path().to_str().unwrap(), 1 << 20).unwrap();
+
+        // The snapshot is unchanged — packs stay markdown-only.
+        assert_eq!(
+            store.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            ["a.md"]
+        );
+        // …but the push can no longer claim success in silence about them.
+        assert_eq!(stats.unaccounted, 2);
+        let mut sample = stats.unaccounted_sample.clone();
+        sample.sort();
+        assert_eq!(sample, ["sources/photo.png", "sources/report.pdf"]);
+    }
+
+    #[test]
+    fn a_declared_asset_is_accounted_for_and_never_warned_about() {
+        let t = tempfile::tempdir().unwrap();
+        write(t.path(), "a.md", b"alpha");
+        write(t.path(), "sources/report.pdf", b"%PDF-1.4");
+        write(t.path(), "sources/photo.png", b"\x89PNG");
+        // Only the PDF is declared; the PNG is not.
+        write(
+            t.path(),
+            "assets.jsonl",
+            br#"{"path":"sources/report.pdf","sha256":"ab","bytes":8}"#,
+        );
+
+        let (_, stats) = read_store(t.path().to_str().unwrap(), 1 << 20).unwrap();
+
+        assert_eq!(stats.unaccounted, 1);
+        assert_eq!(stats.unaccounted_sample, ["sources/photo.png"]);
+    }
+
+    #[test]
+    fn a_malformed_manifest_warns_more_never_less() {
+        let t = tempfile::tempdir().unwrap();
+        write(t.path(), "a.md", b"alpha");
+        write(t.path(), "sources/report.pdf", b"%PDF-1.4");
+        write(t.path(), "assets.jsonl", b"this is not jsonl {{{");
+
+        // The walk does not fail on it — that is the push's error to report —
+        // and it declares nothing, so the file is still named.
+        let (_, stats) = read_store(t.path().to_str().unwrap(), 1 << 20).unwrap();
+        assert_eq!(stats.unaccounted, 1);
+    }
+
+    #[test]
+    fn deliberate_absences_are_not_warnings() {
+        let t = tempfile::tempdir().unwrap();
+        write(t.path(), "a.md", b"alpha");
+        // A derived catalog sidecar never rides on any path.
+        write(t.path(), "index.jsonl", b"{}");
+        write(t.path(), "records/index.jsonl", b"{}");
+        // A file the owner deliberately kept home is a choice, not a surprise.
+        write(t.path(), "sources/secret.pem", b"key");
+        write(t.path(), ".sevralocal", b"sources/secret.pem\n");
+
+        let (_, stats) = read_store(t.path().to_str().unwrap(), 1 << 20).unwrap();
+
+        assert_eq!(stats.unaccounted, 0);
+        assert!(stats.unaccounted_sample.is_empty());
+    }
+
+    #[test]
+    fn the_named_sample_is_bounded_while_the_count_stays_exact() {
+        let t = tempfile::tempdir().unwrap();
+        write(t.path(), "a.md", b"alpha");
+        for i in 0..25 {
+            write(t.path(), &format!("sources/blob{i}.bin"), b"x");
+        }
+
+        let (_, stats) = read_store(t.path().to_str().unwrap(), 1 << 20).unwrap();
+
+        assert_eq!(stats.unaccounted, 25);
+        assert_eq!(stats.unaccounted_sample.len(), UNACCOUNTED_SAMPLE);
     }
 
     #[test]

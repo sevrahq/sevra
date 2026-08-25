@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Push: files that travel by neither lane are named instead of silently
+  skipped. A file that is not markdown, not declared in `assets.jsonl`, not
+  kept home by `.sevralocal`, and not a derived `index.jsonl` sidecar now
+  surfaces as an exact count plus a bounded path sample, with the two exits
+  stated (`dbmd assets scan` to declare it, or `.sevralocal` to keep it home
+  on purpose). What rides is byte-identical; only the silence changed.
+
 ## 0.2.28 — 2026-08-24
 
 - Transport: every hub request now has an independent hard wall-clock fence.
