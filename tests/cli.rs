@@ -2342,8 +2342,10 @@ fn v2_push_delegates_only_after_the_hub_selects_v2() {
     assert!(output.status.success(), "{}", all_output(&output));
     assert!(store.path().join(".sevra-v2.json").is_file());
     let args = std::fs::read_to_string(args_log).unwrap();
-    assert!(args.contains("sync\nb\n--push\n--dir\n.\n"), "{args}");
-    assert!(args.contains("--hub"), "{args}");
+    assert_eq!(
+        args,
+        format!("--json\nsync\n--hub\n{base}\nb\n--push\n--dir\n.\n")
+    );
     handle.join().unwrap();
     let requests = log.lock().unwrap();
     assert_eq!(requests.len(), 1);
@@ -2504,6 +2506,7 @@ fn v2_push_delegates_exact_withdrawals_and_reason_to_dbmd() {
 fn alias_rebind_is_a_thin_exact_dbmd_delegation() {
     let bin = tempfile::tempdir().unwrap();
     let args_log = bin.path().join("args");
+    let base = "http://127.0.0.1:9";
     fake_v2_dbmd(
         bin.path(),
         &format!(
@@ -2521,17 +2524,17 @@ fn alias_rebind_is_a_thin_exact_dbmd_delegation() {
             "01j5qc3v9k4ym8rwbn2tqe6f7e",
         ])
         .env("PATH", format!("{}:/usr/bin:/bin", bin.path().display()))
-        .env("SEVRA_HUB_URL", "http://127.0.0.1:9")
+        .env("SEVRA_HUB_URL", base)
         .env("SEVRA_API_KEY", "x")
         .output()
         .unwrap();
     assert!(output.status.success(), "{}", all_output(&output));
     let args = std::fs::read_to_string(args_log).unwrap();
-    assert!(
-        args.contains(
-            "sync\ncompany\nrebind\n--from\n01j5qc3v9k4ym8rwbn2tqe6f7d\n--to\n01j5qc3v9k4ym8rwbn2tqe6f7e\n"
-        ),
-        "{args}"
+    assert_eq!(
+        args,
+        format!(
+            "--json\nsync\n--hub\n{base}\ncompany\nrebind\n--from\n01j5qc3v9k4ym8rwbn2tqe6f7d\n--to\n01j5qc3v9k4ym8rwbn2tqe6f7e\n"
+        )
     );
 }
 

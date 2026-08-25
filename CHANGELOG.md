@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.2.29 — 2026-08-25
+
+- Alias safety: `sevra rebind` now places the shared hub option before dbmd's
+  `rebind` subcommand, matching dbmd's command grammar instead of handing the
+  subcommand an option it cannot parse.
 - Push: files that travel by neither lane are named instead of silently
   skipped. A file that is not markdown, not declared in `assets.jsonl`, not
   kept home by `.sevralocal`, and not a derived `index.jsonl` sidecar now

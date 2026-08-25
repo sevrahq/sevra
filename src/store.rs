@@ -477,7 +477,11 @@ mod tests {
 
         // The snapshot is unchanged — packs stay markdown-only.
         assert_eq!(
-            store.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            store
+                .files
+                .iter()
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>(),
             ["a.md"]
         );
         // …but the push can no longer claim success in silence about them.
