@@ -14,6 +14,7 @@ mod hub;
 mod local;
 mod mcp;
 mod output;
+mod package;
 mod safe_path;
 mod scan;
 mod signing;
@@ -171,6 +172,34 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+    /// Inspect private Link.md v2 conflict bundles for a local brain checkout.
+    Conflicts {
+        /// db.md store containing `.dbmd/conflicts/`
+        dir: Option<String>,
+        /// Remove expired and interrupted bundles
+        #[arg(long)]
+        prune: bool,
+        /// Also remove completed unexpired bundles; requires --prune
+        #[arg(long, requires = "prune")]
+        all: bool,
+    },
+    /// Resolve one exact Link.md v2 conflict bundle through Sevra's stored
+    /// login. Exactly one resolution choice is required; this never acts as force.
+    Resolve {
+        bundle: String,
+        /// db.md store containing the private conflict bundle
+        #[arg(long, default_value = ".")]
+        dir: String,
+        #[arg(long, conflicts_with_all = ["take_remote", "from_file"])]
+        keep_local: bool,
+        #[arg(long, conflicts_with_all = ["keep_local", "from_file"])]
+        take_remote: bool,
+        /// Bounded, no-follow UTF-8 merged candidate; only for a one-path bundle
+        #[arg(long = "from", value_name = "SAFE_FILE", conflicts_with_all = ["keep_local", "take_remote"])]
+        from_file: Option<String>,
+        #[arg(long, value_name = "ID:DIGEST")]
+        confirm_bulk: Option<String>,
+    },
     /// Query a brain by text + frontmatter filters
     Query {
         /// The brain (with --brain given, this positional is the search text)
@@ -249,6 +278,13 @@ enum Commands {
         /// Include vault values in the private `.sevra-vault.json` export file
         #[arg(long)]
         with_secrets: bool,
+    },
+    /// Checkpoint, pull, verify, or restore a dependency-aware brain package. The db.md
+    /// store remains the semantic core; governed companion files ride the
+    /// existing content-addressed asset lane and restore to their runtime paths.
+    Package {
+        #[command(subcommand)]
+        action: PackageAction,
     },
     /// Validate a store (wraps `dbmd validate --all`)
     Validate { dir: Option<String> },
@@ -384,6 +420,48 @@ enum SecretsAction {
     },
 }
 
+#[derive(Subcommand)]
+enum PackageAction {
+    /// Snapshot one closure profile and push it atomically with the brain.
+    Checkpoint {
+        /// Workspace containing its brain at `db/`
+        workspace: String,
+        #[arg(long)]
+        brain: String,
+        #[arg(long, default_value = "working")]
+        profile: String,
+        /// Preserve the existing push override for secret-shaped brain text.
+        /// Companion content remains independently scanned and cannot bypass
+        /// its package policy with this flag.
+        #[arg(long)]
+        allow_secrets: bool,
+        #[arg(long, value_name = "ID:DIGEST")]
+        confirm_bulk: Option<String>,
+    },
+    /// Clone a v2 brain into `<workspace>/db`, restore its packaged companion
+    /// files around it, and emit an honest closure report.
+    Restore {
+        brain: String,
+        workspace: String,
+        #[arg(long, default_value = "working")]
+        profile: String,
+    },
+    /// Incrementally pull the brain and reconcile clean companion changes
+    /// against the private applied-package receipt.
+    Pull {
+        /// Existing package workspace containing its brain at `db/`
+        workspace: String,
+        #[arg(long, default_value = "working")]
+        profile: String,
+    },
+    /// Verify package objects, restored paths, dependencies, and snapshot root.
+    Verify {
+        workspace: String,
+        #[arg(long, default_value = "working")]
+        profile: String,
+    },
+}
+
 fn main() {
     // Sweep any `<exe>.old.<pid>` leftover a previous Windows self-swap
     // parked (the old exe stays delete-locked until its process exits, so
@@ -454,6 +532,12 @@ fn main() {
             no_browser,
         } => return commands::login(hub.clone(), key.clone(), *no_browser),
         Commands::Logout => return commands::logout(),
+        Commands::Package {
+            action: PackageAction::Verify { workspace, profile },
+        } => return package::verify_command(workspace.clone(), profile.clone()),
+        Commands::Conflicts { dir, prune, all } => {
+            return commands::sync_conflicts(dir.clone(), *prune, *all)
+        }
         Commands::Validate { dir } => return commands::validate(dir.clone()),
         Commands::Version => return update::cmd_version(),
         _ => {}
@@ -495,11 +579,35 @@ fn main() {
                 confirm_bulk: confirm_bulk.as_deref(),
                 withdraw_from_hosting: &withdraw_from_hosting,
                 withdraw_reason: withdraw_reason.as_deref(),
+                package_report: None,
             },
         ),
         Commands::Rebind { brain, from, to } => commands::rebind_brain(&cfg, &brain, &from, &to),
         Commands::Clone { brain, dir } => commands::clone_brain(&cfg, &brain, dir),
         Commands::Pull { dir, force } => commands::pull(&cfg, dir, force),
+        Commands::Resolve {
+            bundle,
+            dir,
+            keep_local,
+            take_remote,
+            from_file,
+            confirm_bulk,
+        } => {
+            if usize::from(keep_local) + usize::from(take_remote) + usize::from(from_file.is_some())
+                != 1
+            {
+                usage_fail("resolve requires exactly one of --keep-local, --take-remote, or --from <safe-file>");
+            }
+            commands::sync_resolve(
+                &cfg,
+                &bundle,
+                &dir,
+                keep_local,
+                take_remote,
+                from_file.as_deref(),
+                confirm_bulk.as_deref(),
+            )
+        }
         Commands::Query {
             brain,
             text,
@@ -568,11 +676,37 @@ fn main() {
             skip_assets,
             with_secrets,
         } => commands::export(&cfg, &brain, dir, skip_assets, with_secrets),
+        Commands::Package { action } => match action {
+            PackageAction::Checkpoint {
+                workspace,
+                brain,
+                profile,
+                allow_secrets,
+                confirm_bulk,
+            } => package::checkpoint_command(
+                &cfg,
+                workspace,
+                brain,
+                profile,
+                allow_secrets,
+                confirm_bulk,
+            ),
+            PackageAction::Restore {
+                brain,
+                workspace,
+                profile,
+            } => package::restore_command(&cfg, brain, workspace, profile),
+            PackageAction::Pull { workspace, profile } => {
+                package::pull_command(&cfg, workspace, profile)
+            }
+            PackageAction::Verify { .. } => unreachable!(),
+        },
         Commands::Update => update::cmd_update(&cfg),
         // handled above
         Commands::Login { .. }
         | Commands::InstallVerified { .. }
         | Commands::Logout
+        | Commands::Conflicts { .. }
         | Commands::Validate { .. }
         | Commands::Version => unreachable!(),
     }

@@ -192,6 +192,26 @@ mod platform {
         dir.sync_all()
     }
 
+    pub(super) fn create_symlink(root: &Path, rel: &str, target: &str) -> io::Result<()> {
+        let components = parts(rel)?;
+        let parent = open_parent(root, &components, true)?;
+        let name = c_name(
+            components
+                .last()
+                .expect("parts rejects an empty relative path"),
+        )?;
+        let target = CString::new(target.as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "symlink target contains NUL")
+        })?;
+        // SAFETY: `parent` is a held no-follow directory capability and both
+        // strings are live NUL-terminated byte sequences. `symlinkat` never
+        // replaces an existing destination.
+        if unsafe { libc::symlinkat(target.as_ptr(), parent.as_raw_fd(), name.as_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        parent.sync_all()
+    }
+
     fn open_dir_at(parent: RawFd, name: &OsStr) -> io::Result<fs::File> {
         let name = c_name(name)?;
         // SAFETY: the parent descriptor is held by the caller and `name` is a
@@ -342,6 +362,40 @@ mod platform {
                 ));
             }
             Ok(file)
+        }
+
+        pub(super) fn read_symlink(&self, name: &OsStr) -> io::Result<OsString> {
+            let name = c_name(name)?;
+            let mut capacity = 256_usize;
+            loop {
+                let mut bytes = vec![0_u8; capacity];
+                // SAFETY: the directory descriptor and NUL-terminated name are
+                // held for this call, and `bytes` exposes `capacity` writable
+                // bytes. readlinkat reads the link itself and never follows it.
+                let read = unsafe {
+                    libc::readlinkat(
+                        self.file.as_raw_fd(),
+                        name.as_ptr(),
+                        bytes.as_mut_ptr().cast(),
+                        bytes.len(),
+                    )
+                };
+                if read < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let read = read as usize;
+                if read < bytes.len() {
+                    bytes.truncate(read);
+                    return Ok(OsStr::from_bytes(&bytes).to_os_string());
+                }
+                if capacity >= 64 * 1024 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "symlink target exceeds 64 KiB",
+                    ));
+                }
+                capacity *= 2;
+            }
         }
 
         pub(super) fn create_dir(&self, name: &str, mode: u32) -> io::Result<Self> {
@@ -1050,6 +1104,13 @@ mod platform {
             Ok(file_from_handle(handle))
         }
 
+        pub(super) fn read_symlink(&self, _name: &std::ffi::OsStr) -> io::Result<OsString> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "secure symlink capture is unsupported on Windows",
+            ))
+        }
+
         pub(super) fn create_dir(&self, name: &str, _mode: u32) -> io::Result<Self> {
             let components = parts(name)?;
             if components.len() != 1 {
@@ -1561,6 +1622,13 @@ mod platform {
         fs::remove_file(tombstone)?;
         Ok(true)
     }
+
+    pub(super) fn create_symlink(_root: &Path, _rel: &str, _target: &str) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "secure symlink restoration is unsupported on Windows",
+        ))
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1611,6 +1679,13 @@ mod platform {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "secure directory traversal is unsupported on this platform",
+            ))
+        }
+
+        pub(super) fn read_symlink(&self, _name: &std::ffi::OsStr) -> io::Result<OsString> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "secure symlink capture is unsupported on this platform",
             ))
         }
 
@@ -1739,6 +1814,13 @@ mod platform {
             "secure relative filesystem access is unsupported on this platform",
         ))
     }
+
+    pub(super) fn create_symlink(_root: &Path, _rel: &str, _target: &str) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "secure symlink restoration is unsupported on this platform",
+        ))
+    }
 }
 
 pub fn read_regular(root: &Path, rel: &str) -> io::Result<Option<Vec<u8>>> {
@@ -1766,6 +1848,10 @@ impl SafeDir {
 
     pub fn open_file(&self, name: &std::ffi::OsStr) -> io::Result<fs::File> {
         self.0.open_file(name)
+    }
+
+    pub fn read_symlink(&self, name: &std::ffi::OsStr) -> io::Result<OsString> {
+        self.0.read_symlink(name)
     }
 
     pub fn create_dir(&self, name: &str, mode: u32) -> io::Result<Self> {
@@ -1851,6 +1937,13 @@ impl SafeDir {
 
 pub fn ensure_dir(path: &Path, mode: u32) -> io::Result<()> {
     platform::ensure_dir(path, mode)
+}
+
+/// Create one relative symlink beneath `root` without following or replacing
+/// any destination component. The caller validates that `target` resolves
+/// inside the restored workspace.
+pub fn create_symlink(root: &Path, rel: &str, target: &str) -> io::Result<()> {
+    platform::create_symlink(root, rel, target)
 }
 
 pub fn atomic_write(

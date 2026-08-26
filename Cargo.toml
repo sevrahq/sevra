@@ -58,6 +58,9 @@ globset = { version = "0.4", default-features = false }
 # canonical aliases must collapse before case comparison or macOS can silently
 # install two hosted paths onto one inode.
 unicode-normalization = "0.1"
+# RFC3339 timestamps in signed brain-package snapshot records. Formatting only;
+# no locale or timezone database enters the binary.
+time = { version = "0.3", default-features = false, features = ["formatting"] }
 [target.'cfg(unix)'.dependencies]
 # Capability-style traversal for local scope and asset paths: checking
 # symlink_metadata and then opening has a race, so the kernel enforces each

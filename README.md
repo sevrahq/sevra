@@ -61,6 +61,18 @@ sevra secrets quarantine [dir] [--dry-run] [--closure]   keep hit files home in 
 sevra inbox list|drain <brain>                   read the evidence inbox (drain = full JSON)
 sevra export <brain> [dir] [--with-secrets]      write your brain back to disk (you own it)
 
+sevra package checkpoint <workspace> --brain <brain> [--profile working]
+                                                    snapshot companions + run signed incremental sync
+sevra package restore <brain> <fresh-workspace> [--profile working]
+                                                    clone the brain + restore companions safely
+sevra package pull <workspace> [--profile working]
+                                                    incrementally reconcile brain + companions
+sevra package verify <workspace> [--profile working]
+                                                    verify closure locally; start nothing
+sevra conflicts [db-dir] [--prune] [--all]       inspect/prune private v2 conflict bundles
+sevra resolve <bundle> --dir <db-dir> (--keep-local|--take-remote|--from <file>)
+                                                    resolve through the stored Sevra login
+
 sevra validate [dir]                             wraps `dbmd validate --all`
 sevra version
 sevra update                                     signed self-update; checks dbmd too
@@ -68,7 +80,117 @@ sevra update                                     signed self-update; checks dbmd
 
 Config lives at `~/.sevra/config.json` (written 0600). Env `SEVRA_HUB_URL` / `SEVRA_API_KEY` override it.
 
-Sevra negotiates the link.md profile with each brain. New brains use permissioned incremental v2; retained v1 brains stay readable and require an explicit verified bridge before they can change. For v2, Sevra keeps its product preflights, then delegates the wire operation to `dbmd`: the neutral client computes a private three-way baseline, uploads only changed blobs, submits one atomic signed brain commit, and verifies the accepted head before advancing local state. Deletes, renames, and restores are explicit operations with per-path authorization and expected prior hashes. Disjoint edits from two machines can rebase; competing edits to the same path stop with a conflict. `.sevra-v2.json` records only the hosted brain identity; the richer verification baseline stays outside the store in dbmd's private state. There is no force overwrite on v2.
+## Brain packages
+
+A brain package gives a hosted brain an honest, incremental recovery closure
+without turning Sevra back into a machine host. The canonical profile lives in
+the brain at `records/operational/sevra-package-profile.md` as one strict
+`sevra-package-v1` JSON block. It names small path-dependent companions such as
+agent bootstrap files, skills, scripts, templates, and service definitions,
+plus typed `git`, `secret`, `path`, `live`, and `external` dependencies.
+Git receipts bind a credential-free remote locator, not the moving current
+commit. This avoids a self-reference when the generated package record is
+committed to that same repository. Exact recovery bytes come from the signed
+brain and companion-object roots; Git remains a typed source of history.
+Transient worktree dirt is not a separate snapshot input: selected dirty files
+are captured by content, while unselected files are outside the declared
+closure. Repeated checkpoints therefore stay stable.
+
+```sevra-package-v1
+{
+  "version": 1,
+  "profiles": {
+    "working": {
+      "include": [
+        { "path": "CLAUDE.md" },
+        { "path": ".claude/skills", "allow_unscanned_binary": false },
+        { "path": "scripts" }
+      ],
+      "exclude": ["scripts/__pycache__"],
+      "allow_secret_named_paths": [],
+      "dependencies": [
+        { "id": "repository-history", "kind": "git", "path": ".", "remote": "origin" },
+        { "id": "private-brain-policy", "kind": "path", "path": "db/.sevralocal", "impact": "semantic" },
+        { "id": "provider-key", "kind": "secret", "name": "OPENAI_API_KEY" },
+        { "id": "browser-session", "kind": "live", "locator": "signed-in Chrome profile" }
+      ]
+    }
+  }
+}
+```
+
+Every field is closed-schema. Dependencies are optional unless `required` is
+set to `true`; required gaps stop checkpoint/verify. Dependency `impact`
+defaults to `operational`; use `semantic` only when its absence means the
+restored db.md brain itself is partial. Binary companions require
+an explicit per-include opt-in because their content cannot be secret-scanned.
+
+`package checkpoint` reads companions without following symlinks, scans UTF-8
+content and names for credentials, records portable modes and contained
+symlinks, and stores each unique byte sequence at
+`sources/sevra-package/objects/<sha256>.blob`. Those generated objects are
+declared through db.md's ordinary asset manifest. Link.md v2 therefore uploads
+only missing hashes and signs the semantic content root and asset root through
+the same incremental history; there is no package archive, second baseline, or
+parallel sync protocol. Normally the logical operation creates one atomic
+commit. If `DB.md` changes with content, dbmd first lands and verifies the
+contract-only head, then recomputes and commits the remaining tree under that
+contract. The generated object directory must be Git-ignored.
+
+`package restore` requires a fresh workspace and builds the complete result in
+an unpredictable private sibling directory. It clones the brain into `db/`,
+verifies the signed snapshot root and every object, materializes files without
+overwriting divergent paths, recreates only contained symlinks, and writes a
+names-only vault receipt before atomically publishing the workspace without
+replacement. Any pre-publication failure removes the private stage, including
+a failed clone, so a failed cold restore does not strand a hidden brain copy.
+It then uses db.md's explicit local-only baseline relocation to
+move the verified incremental baseline from the vanished stage path to the
+published `db/` path; the next ordinary `sevra pull` therefore remains
+incremental and cannot mistake the moved checkout for a concurrent edit. A
+long cold restore emits bounded liveness updates on stderr while
+keeping JSON stdout machine-readable. It never retrieves secret values, runs a
+script, starts a service, logs into an account, or claims that a live dependency
+was restored. `package verify` repeats the byte, mode, symlink, object, profile,
+and dependency checks locally and exits nonzero only for corrupt/missing
+packaged state or unresolved dependencies marked `required`; optional gaps stay
+visible in the structured receipt. `complete` means the verified package is
+safe to use under its required closure; `brainComplete` additionally requires
+every semantic dependency, while `operationalReady` is strictest and is false
+until every declared optional live/path/external check is resolved too. The
+receipt lists `semanticUnresolvedDependencies` explicitly, so a hosted-only
+copy cannot hide intentionally withheld brain content behind package success.
+
+`package pull` is the ongoing operation for a restored working package. It
+first performs the ordinary verified incremental db.md pull, then compares the
+new signed package snapshot with a private, mode-600 applied-snapshot receipt.
+Only file companions that still match their previous package coordinate are
+updated or deleted. Divergent local companions are preserved and named; a
+changed symlink topology requires a fresh restore. Updates use a private backup
+journal and roll back after an interruption before the applied receipt
+advances. A per-workspace OS lock serializes that entire lifecycle, including
+recovery and the underlying brain pull. The receipt, lock, and journal live as
+dot-prefixed local state inside `db/`, never ride sync, and must be Git-ignored.
+Plain `sevra pull` remains semantic-store-only; agents maintaining a working
+closure use `sevra package pull`.
+
+Checkpoint, restore, and package pull emit a bounded 30-second liveness signal
+on stderr during long verification/network phases. JSON stdout remains exactly
+one machine-readable receipt, so agents can wait without guessing whether a
+large brain operation is stalled.
+
+Plain `push`, `clone`, and `export` retain their memory-store meaning. Package
+commands are explicit because a customer may want semantic portability without
+installing executable companions on the destination machine.
+
+If a checkpoint meets a competing edit, it stops before overwriting anything
+and returns the exact bundle id. `sevra conflicts <db-dir>` inspects the private
+bundle and `sevra resolve <bundle> --dir <db-dir>` applies one explicit reviewed
+choice using the existing Sevra login; agents never need to extract a bearer
+credential or drop down to dbmd solely for authentication. Resolution remains
+Link.md v2's exact-head operation and never acts as force.
+
+Sevra negotiates the link.md profile with each brain. New brains use permissioned incremental v2; retained v1 brains stay readable and require an explicit verified bridge before they can change. For v2, Sevra keeps its product preflights, then delegates the wire operation to `dbmd`: the neutral client computes a private three-way baseline, uploads only changed blobs, submits the signed logical mutation, and verifies every accepted head before advancing local state. Ordinary mutations are one atomic commit; a simultaneous `DB.md` change is automatically phased into a verified contract commit followed by the recomputed content/assets commit. Deletes, renames, and restores are explicit operations with per-path authorization and expected prior hashes. Disjoint edits from two machines can rebase; competing edits to the same path stop with a conflict. `.sevra-v2.json` records only the hosted brain identity; the richer verification baseline stays outside the store in dbmd's private state. There is no force overwrite on v2.
 
 V1 brains retain the snapshot protocol below until they receive an explicit verified bridge. The hub returns the stable `v2_sync_required` code when a v2 brain reaches a v1 transfer endpoint, and Sevra delegates only on that exact response. This prevents a v1 snapshot head and a v2 incremental head from advancing independently. Signed v2 asset-root changes are delegated too; `--skip-assets` is v1-only. A destructive or exposure-changing v2 operation can stop with `BULK_PREVIEW_REQUIRED`; inspect its count-only impact receipt and repeat the same command with `--confirm-bulk <id>:<digest>`. The receipt cannot approve changed files, a new head, another principal, or changed permissions.
 

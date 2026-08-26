@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+- Brain packages: `package checkpoint`, `restore`, and `verify` add an explicit
+  working-closure layer above a db.md store. Companion files become immutable
+  content-addressed assets in the existing signed v2 history; unchanged hashes
+  do not upload again. Profiles and snapshot receipts live inside the brain,
+  while secrets remain names-only and live systems remain unresolved. Git
+  dependencies bind a credential-free remote rather than moving `HEAD`, so a
+  tracked generated snapshot cannot make its own identity change forever.
+- Package safety: no-follow capture, bounded files/totals, contained symlinks,
+  conservative secret scanning, Git-ignored object caches, private-stage atomic
+  fresh-destination restore with failure cleanup, no-overwrite materialization,
+  bounded restore liveness updates, and no script/service execution.
+- Package receipts separate verified required-closure `complete` from stricter
+  `operationalReady`, which remains false while any declared optional path,
+  live system, external custody, or browser state is unresolved.
+- Package dependencies now declare `impact: semantic|operational` (defaulting
+  to operational). Receipts expose `brainComplete` and the exact
+  `semanticUnresolvedDependencies`, preventing a byte-complete companion
+  package from implying that deliberately withheld db.md content was restored.
+- Fresh package restore relocates db.md's private path-bound incremental
+  baseline immediately after atomic workspace publication. The relocation
+  re-verifies the moved store and never overwrites an existing baseline, so the
+  next ordinary pull stays incremental instead of producing first-pull
+  conflicts for records changed after the restore.
+- `sevra package pull <workspace>` completes the ongoing working-closure UX:
+  it runs the ordinary incremental brain pull, three-way compares companions
+  against a private applied-snapshot receipt, updates only clean changed file
+  coordinates through a recoverable backup journal under a per-workspace OS
+  lock, preserves divergent local work, and reports package, brain, and
+  operational closure separately.
+- Long checkpoint, restore, and package-pull phases emit bounded stderr
+  heartbeats while preserving a single JSON receipt on stdout.
+- Conflict UX: `sevra conflicts` inspects/prunes private v2 bundles and
+  `sevra resolve` delegates one explicit reviewed choice through the stored
+  Sevra login without exposing a bearer credential or adding force semantics.
+
 ## 0.2.33 — 2026-08-25
 
 - Portable secret-asset adoption now declares the sanitized derivative as the

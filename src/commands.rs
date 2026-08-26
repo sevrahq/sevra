@@ -2160,11 +2160,20 @@ fn withheld_push_metadata(
     }
 }
 
-fn run_dbmd_sync(cfg: &Config, args: &[String], working_dir: &Path) -> Value {
-    let key = cfg
-        .key
-        .as_deref()
-        .unwrap_or_else(|| fail(NOT_LOGGED_IN, None));
+pub(crate) struct DbmdSyncError {
+    pub message: String,
+    pub details: Option<Value>,
+}
+
+pub(crate) fn try_run_dbmd_sync(
+    cfg: &Config,
+    args: &[String],
+    working_dir: &Path,
+) -> Result<Value, DbmdSyncError> {
+    let key = cfg.key.as_deref().ok_or_else(|| DbmdSyncError {
+        message: NOT_LOGGED_IN.to_string(),
+        details: None,
+    })?;
     let output = Command::new("dbmd")
         .arg("--json")
         .arg("sync")
@@ -2176,24 +2185,145 @@ fn run_dbmd_sync(cfg: &Config, args: &[String], working_dir: &Path) -> Value {
         .env_remove("DBMD_HUB_CREDENTIAL_ORIGIN")
         .current_dir(working_dir)
         .output()
-        .unwrap_or_else(|error| {
-            fail(
-                &format!(
-                    "could not run dbmd sync (install it from https://www.sevrahq.com/install): {error}"
-                ),
-                None,
-            )
-        });
+        .map_err(|error| DbmdSyncError {
+            message: format!(
+                "could not run dbmd sync (install it from https://www.sevrahq.com/install): {error}"
+            ),
+            details: None,
+        })?;
     if !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr);
         let structured = serde_json::from_slice::<Value>(&output.stderr).ok();
+        let dbmd_message = structured
+            .as_ref()
+            .and_then(|value| value.pointer("/error/message"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| String::from_utf8_lossy(&output.stderr).trim().to_string());
+        let native_hint = structured
+            .as_ref()
+            .filter(|value| value.pointer("/error/code").and_then(Value::as_str) == Some("SYNC_CONFLICT"))
+            .and_then(|value| value.pointer("/error/details/bundle").and_then(Value::as_str))
+            .map(|bundle| {
+                format!(
+                    "\ninspect with `sevra conflicts {}`; resolve with `sevra resolve {} --dir {} --keep-local`, `--take-remote`, or `--from <safe-file>`",
+                    terminal_safe(&working_dir.to_string_lossy()),
+                    terminal_safe(bundle),
+                    terminal_safe(&working_dir.to_string_lossy()),
+                )
+            })
+            .unwrap_or_default();
+        return Err(DbmdSyncError {
+            message: format!(
+                "dbmd sync failed: {}{}",
+                terminal_safe(dbmd_message.trim()),
+                native_hint
+            ),
+            details: structured,
+        });
+    }
+    serde_json::from_slice(&output.stdout).map_err(|error| DbmdSyncError {
+        message: format!("dbmd sync returned invalid JSON: {error}"),
+        details: None,
+    })
+}
+
+pub(crate) fn run_dbmd_sync(cfg: &Config, args: &[String], working_dir: &Path) -> Value {
+    match try_run_dbmd_sync(cfg, args, working_dir) {
+        Ok(value) => value,
+        Err(error) => fail(&error.message, error.details),
+    }
+}
+
+fn run_dbmd_sync_leaf(
+    cfg: Option<&Config>,
+    leaf_args: &[String],
+    working_dir: &Path,
+    purpose: &str,
+) -> Value {
+    let mut command = Command::new("dbmd");
+    command.arg("--json").arg("sync").args(leaf_args);
+    if let Some(cfg) = cfg {
+        let key = cfg
+            .key
+            .as_deref()
+            .unwrap_or_else(|| fail(NOT_LOGGED_IN, None));
+        // dbmd's sync leaf commands own their hub option, so it must follow
+        // the leaf name rather than the parent `sync` command.
+        command
+            .arg("--hub")
+            .arg(&cfg.hub)
+            .env("DBMD_HUB_KEY", key)
+            .env_remove("DBMD_HUB_URL")
+            .env_remove("DBMD_HUB_CREDENTIAL_ORIGIN");
+    }
+    let output = command.current_dir(working_dir).output().unwrap_or_else(|error| {
         fail(
-            &format!("dbmd sync failed: {}", terminal_safe(message.trim())),
+            &format!(
+                "could not run dbmd {purpose} (install it from https://www.sevrahq.com/install): {error}"
+            ),
+            None,
+        )
+    });
+    if !output.status.success() {
+        let structured = serde_json::from_slice::<Value>(&output.stderr).ok();
+        let message = structured
+            .as_ref()
+            .and_then(|value| value.pointer("/error/message"))
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| std::str::from_utf8(&output.stderr).unwrap_or("dbmd failed"));
+        fail(
+            &format!("dbmd {purpose} failed: {}", terminal_safe(message.trim())),
             structured,
         );
     }
-    serde_json::from_slice(&output.stdout)
-        .unwrap_or_else(|error| fail(&format!("dbmd sync returned invalid JSON: {error}"), None))
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        fail(
+            &format!("dbmd {purpose} returned invalid JSON: {error}"),
+            None,
+        )
+    })
+}
+
+pub fn sync_conflicts(dir: Option<String>, prune: bool, all: bool) {
+    let dir = dir.unwrap_or_else(|| ".".into());
+    let mut args = vec!["conflicts".into(), "--dir".into(), dir];
+    if prune {
+        args.push("--prune".into());
+    }
+    if all {
+        args.push("--all".into());
+    }
+    let result = run_dbmd_sync_leaf(None, &args, Path::new("."), "conflicts");
+    let count = result.get("bundles").and_then(Value::as_u64).unwrap_or(0);
+    out_layout(&format!("{count} private conflict bundle(s)"), Some(result));
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn sync_resolve(
+    cfg: &Config,
+    bundle: &str,
+    dir: &str,
+    keep_local: bool,
+    take_remote: bool,
+    from_file: Option<&str>,
+    confirm_bulk: Option<&str>,
+) {
+    let mut args = vec!["resolve".into(), bundle.into(), "--dir".into(), dir.into()];
+    if keep_local {
+        args.push("--keep-local".into());
+    } else if take_remote {
+        args.push("--take-remote".into());
+    } else if let Some(path) = from_file {
+        args.extend(["--from".into(), path.into()]);
+    }
+    if let Some(confirm) = confirm_bulk {
+        args.extend(["--confirm-bulk".into(), confirm.into()]);
+    }
+    let result = run_dbmd_sync_leaf(Some(cfg), &args, Path::new("."), "conflict resolution");
+    out_layout(
+        &format!("resolved conflict bundle {}", terminal_safe(bundle)),
+        Some(result),
+    );
 }
 
 pub struct PushOptions<'a> {
@@ -2204,6 +2334,10 @@ pub struct PushOptions<'a> {
     pub confirm_bulk: Option<&'a str>,
     pub withdraw_from_hosting: &'a [String],
     pub withdraw_reason: Option<&'a str>,
+    /// Optional recovery-closure receipt for `sevra package checkpoint`.
+    /// This changes presentation only; the signed package records and assets
+    /// are already part of the ordinary v2 commit.
+    pub package_report: Option<&'a crate::package::PackageReport>,
 }
 
 pub fn rebind_brain(cfg: &Config, brain: &str, from: &str, to: &str) {
@@ -2289,7 +2423,7 @@ fn push_v2(cfg: &Config, dir: &str, brain: &str, options: &PushOptions<'_>) {
         sync_args.push("--withdraw-reason".to_string());
         sync_args.push(reason.to_string());
     }
-    let result = run_dbmd_sync(cfg, &sync_args, Path::new(dir));
+    let mut result = run_dbmd_sync(cfg, &sync_args, Path::new(dir));
     let canonical = std::fs::canonicalize(dir)
         .unwrap_or_else(|error| fail(&format!("cannot record v2 checkout: {error}"), None));
     let canonical_brain = result
@@ -2309,15 +2443,33 @@ fn push_v2(cfg: &Config, dir: &str, brain: &str, options: &PushOptions<'_>) {
         .get("sync_status")
         .and_then(Value::as_str)
         .unwrap_or("synced");
-    out_layout(
-        &format!(
-            "synced {} riding file(s); {applied} change(s) committed at sequence {seq} [{status}]",
-            stats
-                .files
-                .saturating_sub(stats.kept_home + stats.catalogs_kept),
-        ),
-        Some(result),
+    let mut human = format!(
+        "synced {} riding file(s); {applied} change(s) committed at sequence {seq} [{status}]",
+        stats
+            .files
+            .saturating_sub(stats.kept_home + stats.catalogs_kept),
     );
+    if let Some(package) = options.package_report {
+        human.push_str(&format!(
+            "\npackage: {} snapshot {} ({} file(s), {} symlink(s), {})",
+            terminal_safe(&package.profile),
+            terminal_safe(&package.snapshot_root),
+            package.files,
+            package.symlinks,
+            if package.changed {
+                "updated"
+            } else {
+                "unchanged"
+            },
+        ));
+        if let Some(object) = result.as_object_mut() {
+            object.insert(
+                "package".into(),
+                serde_json::to_value(package).expect("package report serializes"),
+            );
+        }
+    }
+    out_layout(&human, Some(result));
 }
 
 pub fn push(cfg: &Config, dir: &str, brain: &str, options: PushOptions<'_>) {
@@ -4668,7 +4820,7 @@ fn clear_private_stage(root: &crate::safe_path::SafeDir) -> Result<(), String> {
     Ok(())
 }
 
-fn discard_private_stage(
+pub(crate) fn discard_private_stage(
     parent: &crate::safe_path::SafeDir,
     stage_name: &str,
 ) -> Result<(), String> {
@@ -5233,7 +5385,7 @@ pub fn export(
     out_layout(&human, Some(Value::Object(data)));
 }
 
-fn write_v2_checkout(root: &Path, brain: &str) -> Result<(), String> {
+pub(crate) fn write_v2_checkout(root: &Path, brain: &str) -> Result<(), String> {
     let value = V2Checkout {
         v: 2,
         brain: brain.to_string(),

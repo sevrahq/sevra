@@ -51,11 +51,103 @@ fn help_lists_commands() {
         help.contains("login")
             && help.contains("runs")
             && help.contains("run")
+            && help.contains("package")
+            && help.contains("conflicts")
+            && help.contains("resolve")
             && help.contains("update")
     );
     assert!(
         help.lines().count() > 5,
         "trusted clap layout must retain its real line breaks"
+    );
+}
+
+#[test]
+fn package_help_exposes_the_complete_agent_workflow() {
+    sevra()
+        .args(["package", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("checkpoint"))
+        .stdout(predicate::str::contains("restore"))
+        .stdout(predicate::str::contains("pull"))
+        .stdout(predicate::str::contains("verify"));
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_package_restore_removes_its_private_stage() {
+    let bin = tempfile::tempdir().unwrap();
+    fake_v2_dbmd(
+        bin.path(),
+        "#!/bin/sh\nprintf '%s\\n' '{\"error\":{\"code\":\"TEST_FAILURE\",\"message\":\"synthetic clone failure\"}}' >&2\nexit 1\n",
+    );
+    let parent = tempfile::tempdir().unwrap();
+    let destination = parent.path().join("restored");
+    let output = sevra()
+        .args([
+            "package",
+            "restore",
+            "brain-slug",
+            destination.to_str().unwrap(),
+            "--json",
+        ])
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.path().display()))
+        .env("SEVRA_HUB_URL", "https://hub.example")
+        .env("SEVRA_API_KEY", "stored-secret")
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{}", all_output(&output));
+    assert!(!destination.exists());
+    assert!(std::fs::read_dir(parent.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".sevra-restore-")
+    }));
+}
+
+#[test]
+fn resolve_requires_one_explicit_reviewed_choice() {
+    sevra()
+        .args(["resolve", "01m0zc5pprbeekpjvb68dmpfzq", "--json"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("exactly one"));
+}
+
+#[cfg(unix)]
+#[test]
+fn resolve_delegates_with_the_stored_login_and_leaf_scoped_hub() {
+    let bin = tempfile::tempdir().unwrap();
+    let args_log = bin.path().join("args");
+    fake_v2_dbmd(
+        bin.path(),
+        &format!(
+            "#!/bin/sh\n[ \"$DBMD_HUB_KEY\" = \"stored-secret\" ] || exit 65\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s\\n' '{{\"resolved\":true}}'\n",
+            args_log.display()
+        ),
+    );
+    let output = sevra()
+        .args([
+            "resolve",
+            "01m0zc5pprbeekpjvb68dmpfzq",
+            "--dir",
+            "db",
+            "--keep-local",
+            "--json",
+        ])
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.path().display()))
+        .env("SEVRA_HUB_URL", "https://hub.example")
+        .env("SEVRA_API_KEY", "stored-secret")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", all_output(&output));
+    assert!(!all_output(&output).contains("stored-secret"));
+    assert_eq!(
+        std::fs::read_to_string(args_log).unwrap(),
+        "--json\nsync\nresolve\n01m0zc5pprbeekpjvb68dmpfzq\n--dir\ndb\n--keep-local\n--hub\nhttps://hub.example\n"
     );
 }
 
