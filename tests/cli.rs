@@ -2315,6 +2315,34 @@ fn fake_v2_dbmd(bin_dir: &std::path::Path, body: &str) {
 }
 
 #[cfg(unix)]
+fn fake_asset_adopt_dbmd(bin_dir: &std::path::Path) {
+    fake_v2_dbmd(
+        bin_dir,
+        r#"#!/bin/sh
+if [ "$1" = "assets" ] && [ "$2" = "refresh" ] && [ "$3" = "--help" ]; then
+  exit 0
+fi
+if [ "$1" = "--json" ] && [ "$2" = "write" ]; then
+  asset=''
+  for arg in "$@"; do
+    case "$arg" in asset=*) asset=${arg#asset=} ;; esac
+  done
+  wrapper='sources/redacted-assets/2026/08/portable.md'
+  mkdir -p 'sources/redacted-assets/2026/08'
+  printf '%s\n' '---' 'type: note' 'id: 01kxrwrfj75t95dccf2vqekzw3' 'created: 2026-08-25T00:00:00Z' 'updated: 2026-08-25T00:00:00Z' 'summary: Portable sanitized derivative' "asset: $asset" '---' 'Portable derivative.' > "$wrapper"
+  printf '{"written":"%s","type":"note"}\n' "$wrapper"
+  exit 0
+fi
+if [ "$1" = "--json" ] && [ "$2" = "assets" ] && [ "$3" = "refresh" ]; then
+  printf '{"path":"%s","wrote":true}\n' "$4"
+  exit 0
+fi
+exit 64
+"#,
+    );
+}
+
+#[cfg(unix)]
 #[test]
 fn v2_push_delegates_only_after_the_hub_selects_v2() {
     let store = store_dir(&[("DB.md", "---\ntype: database\n---\n# Test\n")]);
@@ -3058,8 +3086,257 @@ fn secrets_adopt_never_overwrites_a_different_existing_vault_value() {
     assert!(!content.contains(&token));
 }
 
+#[cfg(unix)]
 #[test]
-fn secrets_adopt_refuses_asset_hits_before_vault_access() {
+fn secrets_adopt_vaults_text_asset_values_and_builds_a_portable_derivative() {
+    let token = format!("xoxb-{}", "1".repeat(10));
+    let original = format!("{{\"slack_token\":\"{token}\",\"copy\":\"{token}\"}}\n");
+    let hash = format!("{:x}", Sha256::digest(original.as_bytes()));
+    let manifest = format!(
+        "{{\"path\":\"sources/imports/_files/config.json\",\"sha256\":\"{hash}\",\"bytes\":{},\"media_type\":\"application/json\",\"wrappers\":[\"sources/imports/config.md\"],\"required\":true}}\n",
+        original.len()
+    );
+    let wrapper = note_markdown("Imported configuration evidence.").replace(
+        "---\nImported",
+        "asset: sources/imports/_files/config.json\n---\nImported",
+    );
+    let db = "---\ntype: db-md\nscope: synthetic-adopt\nowner: test@sevrahq.com\n---\n# Synthetic adoption brain\n";
+    let t = store_dir(&[
+        ("DB.md", db),
+        ("sources/imports/config.md", &wrapper),
+        ("sources/imports/_files/config.json", &original),
+        ("assets.jsonl", &manifest),
+    ]);
+    let bin = tempfile::tempdir().unwrap();
+    fake_asset_adopt_dbmd(bin.path());
+    let (base, log, handle) = mock_hub(vec![(201, r#"{"ok":true,"created":true}"#.to_string())]);
+    let output = sevra()
+        .args([
+            "--json",
+            "secrets",
+            "adopt",
+            t.path().to_str().unwrap(),
+            "--brain",
+            "brain-1",
+        ])
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.path().display()))
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", MOCK_KEY)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", all_output(&output));
+    assert!(!all_output(&output).contains(&token));
+    handle.join().unwrap();
+    assert_eq!(
+        log.lock().unwrap().len(),
+        1,
+        "one distinct value is vaulted"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(t.path().join("sources/imports/_files/config.json")).unwrap(),
+        original,
+        "the exact source asset is never rewritten"
+    );
+    assert_eq!(
+        std::fs::read_to_string(t.path().join(".sevralocal")).unwrap(),
+        "sources/imports/_files/config.json\n",
+        "the exact source is made local-only before the derivative can ride"
+    );
+    let coordinate_hash = format!(
+        "{:x}",
+        Sha256::digest(b"sources/imports/_files/config.json")
+    );
+    let derivative = format!(
+        "sources/redacted-assets/_files/{hash}-{}.json",
+        &coordinate_hash[..16]
+    );
+    let sanitized = std::fs::read_to_string(t.path().join(&derivative)).unwrap();
+    assert!(!sanitized.contains(&token));
+    assert_eq!(sanitized.matches("$SLACK_TOKEN").count(), 2);
+    let derivative_wrapper =
+        std::fs::read_to_string(t.path().join("sources/redacted-assets/2026/08/portable.md"))
+            .unwrap();
+    assert!(derivative_wrapper.contains(&derivative));
+    assert!(!t.path().join(".sevra-adopt.json").exists());
+
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["assetReplacements"], 2);
+    assert_eq!(result["assetDerivatives"].as_array().unwrap().len(), 1);
+    assert_eq!(result["originalAssetsNewlyKeptHome"], 1);
+    assert_eq!(
+        result["existingHostingReviewPaths"],
+        serde_json::json!([]),
+        "a pre-upload adoption has no prior hosted coordinate to review"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn secrets_adopt_text_asset_resumes_after_derivative_before_wrapper() {
+    let token = format!("ghp_{}", "r".repeat(36));
+    let original = format!("access_token={token}\n");
+    let hash = format!("{:x}", Sha256::digest(original.as_bytes()));
+    let manifest = format!(
+        "{{\"path\":\"sources/imports/_files/config.txt\",\"sha256\":\"{hash}\",\"bytes\":{},\"media_type\":\"text/plain\",\"wrappers\":[\"sources/imports/config.md\"],\"required\":true}}\n",
+        original.len()
+    );
+    let wrapper = note_markdown("Imported evidence.").replace(
+        "---\nImported",
+        "asset: sources/imports/_files/config.txt\n---\nImported",
+    );
+    let t = store_dir(&[
+        (
+            "DB.md",
+            "---\ntype: db-md\nscope: synthetic-adopt\nowner: test@sevrahq.com\n---\n# Synthetic adoption brain\n",
+        ),
+        ("sources/imports/config.md", &wrapper),
+        ("sources/imports/_files/config.txt", &original),
+        ("assets.jsonl", &manifest),
+    ]);
+    add_adopt_baseline(t.path());
+    std::fs::write(
+        t.path().join(".sevra-v2.json"),
+        b"{\"v\":2,\"brain\":\"brain-1\"}\n",
+    )
+    .unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    fake_asset_adopt_dbmd(bin.path());
+
+    let (first_base, _, first_handle) =
+        mock_hub(vec![(201, r#"{"ok":true,"created":true}"#.to_string())]);
+    let first = sevra()
+        .args(["secrets", "adopt", t.path().to_str().unwrap()])
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.path().display()))
+        .env("SEVRA_HUB_URL", &first_base)
+        .env("SEVRA_API_KEY", MOCK_KEY)
+        .env("SEVRA_TEST_ADOPT_EXIT_AFTER_DERIVATIVE", "1")
+        .output()
+        .unwrap();
+    assert_eq!(first.status.code(), Some(88), "{}", all_output(&first));
+    first_handle.join().unwrap();
+    assert!(t.path().join(".sevra-adopt.json").exists());
+    assert_eq!(
+        std::fs::read_to_string(t.path().join("sources/imports/_files/config.txt")).unwrap(),
+        original
+    );
+    assert!(!t
+        .path()
+        .join("sources/redacted-assets/2026/08/portable.md")
+        .exists());
+
+    let encoded = canonical_base64(token.as_bytes());
+    let (resume_base, _, resume_handle) = mock_hub(vec![
+        (
+            409,
+            r#"{"error":"exists","code":"vault_item_exists"}"#.to_string(),
+        ),
+        (
+            200,
+            format!(r#"{{"name":"ACCESS_TOKEN","valueBase64":"{encoded}"}}"#),
+        ),
+    ]);
+    let resumed = sevra()
+        .args(["--json", "secrets", "adopt", t.path().to_str().unwrap()])
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.path().display()))
+        .env("SEVRA_HUB_URL", &resume_base)
+        .env("SEVRA_API_KEY", MOCK_KEY)
+        .output()
+        .unwrap();
+    assert!(resumed.status.success(), "{}", all_output(&resumed));
+    assert!(!all_output(&resumed).contains(&token));
+    resume_handle.join().unwrap();
+    assert!(t
+        .path()
+        .join("sources/redacted-assets/2026/08/portable.md")
+        .exists());
+    assert!(!t.path().join(".sevra-adopt.json").exists());
+    let result: serde_json::Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    assert_eq!(
+        result["existingHostingReviewPaths"],
+        serde_json::json!(["sources/imports/_files/config.txt"]),
+        "an established checkout must surface the exact current-state custody review"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn secrets_adopt_permission_refusal_never_restructures_the_asset() {
+    let token = format!("xoxb-{}", "5".repeat(10));
+    let original = format!("slack={token}\n");
+    let hash = format!("{:x}", Sha256::digest(original.as_bytes()));
+    let manifest = format!(
+        "{{\"path\":\"sources/imports/_files/config.txt\",\"sha256\":\"{hash}\",\"bytes\":{},\"media_type\":\"text/plain\",\"wrappers\":[\"sources/imports/config.md\"],\"required\":true}}\n",
+        original.len()
+    );
+    let wrapper = note_markdown("Imported evidence.").replace(
+        "---\nImported",
+        "asset: sources/imports/_files/config.txt\n---\nImported",
+    );
+    let t = store_dir(&[
+        (
+            "DB.md",
+            "---\ntype: db-md\nscope: synthetic-adopt\nowner: test@sevrahq.com\n---\n# Synthetic adoption brain\n",
+        ),
+        ("sources/imports/config.md", &wrapper),
+        ("sources/imports/_files/config.txt", &original),
+        ("assets.jsonl", &manifest),
+    ]);
+    let bin = tempfile::tempdir().unwrap();
+    fake_asset_adopt_dbmd(bin.path());
+    let (base, _, handle) = mock_hub(vec![(
+        403,
+        r#"{"error":"owner user session required","code":"owner_required"}"#.to_string(),
+    )]);
+    let output = sevra()
+        .args([
+            "secrets",
+            "adopt",
+            t.path().to_str().unwrap(),
+            "--brain",
+            "brain-1",
+        ])
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.path().display()))
+        .env("SEVRA_HUB_URL", &base)
+        .env("SEVRA_API_KEY", MOCK_KEY)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!all_output(&output).contains(&token));
+    handle.join().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(t.path().join("sources/imports/_files/config.txt")).unwrap(),
+        original
+    );
+    assert!(!t.path().join(".sevralocal").exists());
+    assert!(!t.path().join("sources/redacted-assets/_files").exists());
+}
+
+#[test]
+fn secrets_adopt_explicit_brain_must_match_existing_checkout() {
+    let token = format!("sk-proj-{}", "z".repeat(24));
+    let t = store_dir(&[("records/config.md", &operational_markdown(&token))]);
+    add_adopt_baseline(t.path());
+    let output = sevra()
+        .args([
+            "secrets",
+            "adopt",
+            t.path().to_str().unwrap(),
+            "--brain",
+            "another-brain",
+        ])
+        .env("SEVRA_HUB_URL", "http://localhost:9")
+        .env("SEVRA_API_KEY", MOCK_KEY)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(all_output(&output).contains("does not match"));
+    assert!(!all_output(&output).contains(&token));
+    assert!(!t.path().join(".sevra-adopt.json").exists());
+}
+
+#[test]
+fn secrets_adopt_refuses_secret_bearing_asset_filenames_before_vault_access() {
     let token = format!("ghp_{}", "g".repeat(36));
     let hash = format!("{:x}", Sha256::digest(token.as_bytes()));
     let manifest = format!(
@@ -3083,7 +3360,7 @@ fn secrets_adopt_refuses_asset_hits_before_vault_access() {
     assert!(!out.status.success());
     let shown = all_output(&out);
     assert!(
-        shown.contains("outside editable markdown content"),
+        shown.contains("filename and cannot be rewritten without changing identity"),
         "{shown}"
     );
     assert!(!shown.contains(&token), "asset value leaked: {shown}");

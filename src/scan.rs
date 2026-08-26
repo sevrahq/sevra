@@ -57,6 +57,7 @@ const PATH_TOKEN_PAIRS: &[(&str, &str)] = &[
     ("app", "passwords"),
 ];
 
+#[derive(Clone)]
 pub struct SecretHit {
     /// The file's path, redacted wherever the path itself matched — safe to
     /// print even when the secret sits in the filename.

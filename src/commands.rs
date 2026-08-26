@@ -139,6 +139,18 @@ struct AdoptJournal {
     brain_id: String,
     mappings: BTreeMap<String, String>,
     paths: BTreeSet<String>,
+    #[serde(default)]
+    assets: BTreeMap<String, AdoptAssetJournal>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AdoptAssetJournal {
+    original_sha256: String,
+    original_bytes: u64,
+    derivative_path: String,
+    #[serde(default)]
+    wrapper_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -159,6 +171,13 @@ struct AdoptOccurrence {
 struct AdoptValue {
     bytes: Vec<u8>,
     base_name: String,
+}
+
+#[derive(Clone, Debug)]
+struct AdoptAssetDeclaration {
+    sha256: String,
+    bytes: u64,
+    wrappers: Vec<String>,
 }
 
 fn canonical_sha256(value: &str) -> bool {
@@ -1839,7 +1858,7 @@ fn fail_secret_hits(
     );
     msg.push_str(&secret_hits_block(hits));
     msg.push_str(&format!(
-        "\nHandle any value that may have left this machine under your company's incident policy; Sevra does not prescribe issuer action from a pattern match. Keep live values in the brain vault and references in the brain.\n{EXISTING_BYTES_REMEDIATION}\nways out, in order: `sevra secrets adopt {dir}` (move markdown literals into the brain vault) · `sevra secrets quarantine {dir}` (only when the whole file is secret or an asset) · edit deliberately · `--allow-secrets` (push verbatim)"
+        "\nHandle any value that may have left this machine under your company's incident policy; Sevra does not prescribe issuer action from a pattern match. Keep live values in the brain vault and references in the brain.\n{EXISTING_BYTES_REMEDIATION}\nways out, in order: `sevra secrets adopt {dir}` (redact markdown or create a portable sanitized text-asset derivative) · `sevra secrets quarantine {dir}` (only when the whole file must stay local) · edit deliberately · `--allow-secrets` (push verbatim)"
     ));
     let mut data = secret_hits_data(hits);
     if let (Some(scan), Some(object)) = (asset_scan, data.as_object_mut()) {
@@ -6273,7 +6292,7 @@ fn load_adopt_journal(root: &crate::safe_path::SafeDir) -> Result<Option<AdoptJo
         .map_err(|error| format!("cannot read {ADOPT_JOURNAL_FILE}: {error}"))?;
     let journal: AdoptJournal = serde_json::from_slice(&bytes)
         .map_err(|_| format!("{ADOPT_JOURNAL_FILE} is not valid journal JSON"))?;
-    if journal.version != 1
+    if !matches!(journal.version, 1 | 2)
         || journal.brain_id.is_empty()
         || journal.brain_id.len() > 200
         || journal.brain_id.chars().any(char::is_control)
@@ -6292,6 +6311,34 @@ fn load_adopt_journal(root: &crate::safe_path::SafeDir) -> Result<Option<AdoptJo
             .map_err(|_| format!("{ADOPT_JOURNAL_FILE} has an unsafe path"))?;
         if !path.to_ascii_lowercase().ends_with(".md") {
             return Err(format!("{ADOPT_JOURNAL_FILE} names a non-markdown path"));
+        }
+    }
+    if journal.version == 1 && !journal.assets.is_empty() {
+        return Err(format!(
+            "{ADOPT_JOURNAL_FILE} version 1 cannot contain asset work"
+        ));
+    }
+    for (path, asset) in &journal.assets {
+        validate_portable_asset_path(path)
+            .map_err(|_| format!("{ADOPT_JOURNAL_FILE} names an unsafe asset path"))?;
+        validate_portable_asset_path(&asset.derivative_path)
+            .map_err(|_| format!("{ADOPT_JOURNAL_FILE} names an unsafe derivative path"))?;
+        if path == &asset.derivative_path
+            || path.to_ascii_lowercase().ends_with(".md")
+            || asset.derivative_path.to_ascii_lowercase().ends_with(".md")
+            || !canonical_sha256(&asset.original_sha256)
+            || asset.original_bytes > MAX_STORE_BYTES
+        {
+            return Err(format!("{ADOPT_JOURNAL_FILE} has invalid asset work"));
+        }
+        if let Some(wrapper) = &asset.wrapper_path {
+            portable_export_components(wrapper)
+                .map_err(|_| format!("{ADOPT_JOURNAL_FILE} names an unsafe wrapper path"))?;
+            if !wrapper.to_ascii_lowercase().ends_with(".md")
+                || !(wrapper.starts_with("sources/") || wrapper.starts_with("records/"))
+            {
+                return Err(format!("{ADOPT_JOURNAL_FILE} has an invalid wrapper path"));
+            }
         }
     }
     Ok(Some(journal))
@@ -6592,6 +6639,15 @@ fn rewritten_adopt_file(
     mappings: &BTreeMap<String, String>,
     updated_at: &str,
 ) -> Result<String, String> {
+    let (next, provenance) = rewritten_adopt_text(content, occurrences, mappings)?;
+    apply_redacted_provenance(&next, &provenance, updated_at)
+}
+
+fn rewritten_adopt_text(
+    content: &str,
+    occurrences: &[AdoptOccurrence],
+    mappings: &BTreeMap<String, String>,
+) -> Result<(String, BTreeSet<RedactedProvenance>), String> {
     let mut next = content.to_string();
     let mut provenance = BTreeSet::new();
     let mut ordered = occurrences.to_vec();
@@ -6617,7 +6673,260 @@ fn rewritten_adopt_file(
             kind: occurrence.kind.to_string(),
         });
     }
-    apply_redacted_provenance(&next, &provenance, updated_at)
+    Ok((next, provenance))
+}
+
+fn adopt_derivative_path(path: &str, original_sha256: &str) -> Result<String, String> {
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 16
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+        .unwrap_or("txt")
+        .to_ascii_lowercase();
+    let coordinate_hash = format!("{:x}", Sha256::digest(path.as_bytes()));
+    let derivative = format!(
+        "sources/redacted-assets/_files/{original_sha256}-{}.{extension}",
+        &coordinate_hash[..16]
+    );
+    validate_portable_asset_path(&derivative)?;
+    Ok(derivative)
+}
+
+fn parse_adopt_asset_declarations(
+    manifest: Option<&str>,
+) -> Result<BTreeMap<String, AdoptAssetDeclaration>, String> {
+    let Some(manifest) = manifest else {
+        return Ok(BTreeMap::new());
+    };
+    crate::assets::parse_restore_manifest(Some(manifest.as_bytes()))?;
+    let mut declarations = BTreeMap::new();
+    for (index, line) in manifest
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .enumerate()
+    {
+        let row: Value = serde_json::from_str(line)
+            .map_err(|_| format!("assets.jsonl line {} is not valid JSON", index + 1))?;
+        let path = row
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("assets.jsonl line {} has no path", index + 1))?
+            .to_string();
+        let sha256 = row
+            .get("sha256")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("assets.jsonl line {} has no sha256", index + 1))?
+            .to_string();
+        let bytes = row
+            .get("bytes")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("assets.jsonl line {} has no byte count", index + 1))?;
+        let wrappers = row
+            .get("wrappers")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("assets.jsonl line {} has no wrappers", index + 1))?
+            .iter()
+            .map(|wrapper| {
+                let wrapper = wrapper.as_str().ok_or_else(|| {
+                    format!("assets.jsonl line {} has a non-string wrapper", index + 1)
+                })?;
+                portable_export_components(wrapper).map_err(|_| {
+                    format!("assets.jsonl line {} has an unsafe wrapper", index + 1)
+                })?;
+                if !wrapper.to_ascii_lowercase().ends_with(".md")
+                    || !(wrapper.starts_with("sources/") || wrapper.starts_with("records/"))
+                {
+                    return Err(format!(
+                        "assets.jsonl line {} has an invalid wrapper",
+                        index + 1
+                    ));
+                }
+                Ok(wrapper.to_string())
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if wrappers.is_empty() || wrappers.iter().collect::<BTreeSet<_>>().len() != wrappers.len() {
+            return Err(format!(
+                "assets.jsonl line {} has empty or duplicate wrappers",
+                index + 1
+            ));
+        }
+        let declaration = AdoptAssetDeclaration {
+            sha256,
+            bytes,
+            wrappers,
+        };
+        if declarations.insert(path, declaration).is_some() {
+            return Err("assets.jsonl contains a duplicate asset path".into());
+        }
+    }
+    Ok(declarations)
+}
+
+fn run_dbmd_local_json(root: &Path, args: &[String], purpose: &str) -> Result<Value, String> {
+    let output = Command::new("dbmd")
+        .arg("--json")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .map_err(|error| {
+            format!(
+                "{purpose} needs dbmd and it could not run (install it from https://www.sevrahq.com/install): {error}"
+            )
+        })?;
+    if !output.status.success() {
+        let structured = serde_json::from_slice::<Value>(&output.stderr).ok();
+        let message = structured
+            .as_ref()
+            .and_then(|value| value.pointer("/error/message"))
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| std::str::from_utf8(&output.stderr).unwrap_or("dbmd failed"));
+        return Err(format!(
+            "{purpose} failed: {}",
+            terminal_safe(message.trim())
+        ));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("{purpose} returned invalid JSON: {error}"))
+}
+
+fn existing_derivative_wrapper(
+    store: &Store,
+    derivative_path: &str,
+) -> Result<Option<String>, String> {
+    let mut matches = Vec::new();
+    for file in &store.files {
+        let Ok((_, close, _)) = frontmatter_bounds(&file.content) else {
+            continue;
+        };
+        if file.content[..close].contains(derivative_path) {
+            matches.push(file.path.clone());
+        }
+    }
+    matches.sort();
+    matches.dedup();
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.pop()),
+        _ => Err(format!(
+            "multiple wrappers claim sanitized derivative {}; run `dbmd assets scan` and resolve the duplicate declarations",
+            terminal_safe(derivative_path)
+        )),
+    }
+}
+
+fn ensure_adopt_derivative_wrapper(
+    root_path: &Path,
+    root: &crate::safe_path::SafeDir,
+    original: &AdoptAssetDeclaration,
+    asset: &mut AdoptAssetJournal,
+    mappings: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    if let Some(wrapper) = &asset.wrapper_path {
+        if held_file_state(root, wrapper)?.is_some() {
+            return Ok(wrapper.clone());
+        }
+        return Err(format!(
+            "adopt derivative wrapper disappeared: {}",
+            terminal_safe(wrapper)
+        ));
+    }
+
+    let (store, _) = read_store_unscoped(root_path.to_string_lossy().as_ref(), MAX_STORE_BYTES)
+        .map_err(|error| match error {
+            StoreError::Io(error) => format!("could not inspect derivative wrappers: {error}"),
+            StoreError::Scope(error) => error,
+            StoreError::OverCap(_) => "store exceeds the adoption inspection limit".to_string(),
+        })?;
+    if let Some(wrapper) = existing_derivative_wrapper(&store, &asset.derivative_path)? {
+        asset.wrapper_path = Some(wrapper.clone());
+        return Ok(wrapper);
+    }
+
+    let derivative_hash = format!("{:x}", Sha256::digest(asset.derivative_path.as_bytes()));
+    let hash_prefix = &derivative_hash[..16];
+    let requested = format!("sources/redacted-assets/{hash_prefix}.md");
+    let body_path = format!(".sevra-adopt-body-{hash_prefix}.txt");
+    let mut names = mappings.values().cloned().collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    let mut body = String::from(
+        "# Portable sanitized derivative\n\nKnown credential literals in the text asset were replaced with inert vault references. The exact original remains local-only.\n\nOriginal evidence wrappers:\n",
+    );
+    for wrapper in &original.wrappers {
+        let target = wrapper.strip_suffix(".md").unwrap_or(wrapper);
+        body.push_str(&format!("- [[{target}]]\n"));
+    }
+    body.push_str("\nVault references:\n");
+    for name in &names {
+        body.push_str(&format!("- `${}`\n", terminal_safe(name)));
+    }
+    body.push_str(&format!(
+        "\nOriginal SHA-256: `{}`. Sanitized asset: `{}`.\n",
+        asset.original_sha256, asset.derivative_path
+    ));
+    root.atomic_write(&body_path, body.as_bytes(), false, 0o600)
+        .map_err(|error| format!("could not stage derivative wrapper body: {error}"))?;
+    let result = run_dbmd_local_json(
+        root_path,
+        &[
+            "write".to_string(),
+            requested,
+            "--type".to_string(),
+            "note".to_string(),
+            "--summary".to_string(),
+            "Portable sanitized derivative of a local-only text asset".to_string(),
+            "--fm".to_string(),
+            format!("asset={}", asset.derivative_path),
+            "--fm".to_string(),
+            format!("original-sha256={}", asset.original_sha256),
+            "--body-file".to_string(),
+            body_path.clone(),
+            "--dir".to_string(),
+            ".".to_string(),
+        ],
+        "creating a sanitized derivative wrapper",
+    );
+    let _ = root.remove_regular(&body_path);
+    let result = result?;
+    let wrapper = result
+        .get("written")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "dbmd write omitted the derivative wrapper path".to_string())?
+        .to_string();
+    portable_export_components(&wrapper)
+        .map_err(|_| "dbmd write returned an unsafe derivative wrapper path".to_string())?;
+    asset.wrapper_path = Some(wrapper.clone());
+    Ok(wrapper)
+}
+
+fn refresh_adopt_derivative_manifest(
+    root_path: &Path,
+    derivative_path: &str,
+    wrapper_path: &str,
+) -> Result<(), String> {
+    let result = run_dbmd_local_json(
+        root_path,
+        &[
+            "assets".to_string(),
+            "refresh".to_string(),
+            derivative_path.to_string(),
+            "--wrapper".to_string(),
+            wrapper_path.to_string(),
+            "--dir".to_string(),
+            ".".to_string(),
+        ],
+        "cataloging a sanitized derivative",
+    )?;
+    if result.get("path").and_then(Value::as_str) != Some(derivative_path) {
+        return Err("dbmd refreshed a different derivative asset path".into());
+    }
+    Ok(())
 }
 
 fn finish_adopt_scope(
@@ -6652,7 +6961,31 @@ fn finish_adopt_scope(
     Ok((removed, still_kept))
 }
 
-pub fn secrets_adopt(cfg: &Config, dir: Option<String>) {
+fn keep_adopt_original_assets_home(
+    root_path: &Path,
+    paths: impl Iterator<Item = String>,
+) -> Result<usize, String> {
+    let scope = local::load(root_path)?;
+    let mut additions = Vec::new();
+    for path in paths {
+        if !scope
+            .as_ref()
+            .is_some_and(|existing| existing.keeps_home(&path))
+        {
+            additions.push(local::entry_for(&path)?);
+        }
+    }
+    additions.sort();
+    additions.dedup();
+    if additions.is_empty() {
+        return Ok(0);
+    }
+    let raw = scope.as_ref().map(|existing| existing.raw()).unwrap_or("");
+    local::write(root_path, &local::append_entries(raw, &additions))?;
+    Ok(additions.len())
+}
+
+pub fn secrets_adopt(cfg: &Config, dir: Option<String>, explicit_brain: Option<String>) {
     if cfg.key.is_none() {
         fail(NOT_LOGGED_IN, None);
     }
@@ -6686,14 +7019,32 @@ pub fn secrets_adopt(cfg: &Config, dir: Option<String>) {
             None,
         );
     }
-    let brain_id = legacy_baseline
+    let marked_brain = legacy_baseline
         .as_ref()
         .map(|baseline| baseline.brain_id.clone())
-        .or_else(|| v2_checkout.as_ref().map(|checkout| checkout.brain.clone()))
-        .unwrap_or_else(|| {
+        .or_else(|| v2_checkout.as_ref().map(|checkout| checkout.brain.clone()));
+    if explicit_brain.as_ref().is_some_and(|brain| {
+        brain.is_empty() || brain.len() > 200 || brain.chars().any(char::is_control)
+    }) {
+        fail(
+            "--brain is empty, oversized, or contains control characters",
+            None,
+        );
+    }
+    if explicit_brain
+        .as_ref()
+        .zip(marked_brain.as_ref())
+        .is_some_and(|(explicit, marked)| explicit != marked)
+    {
+        fail(
+            "--brain does not match this store's existing checkout identity",
+            None,
+        );
+    }
+    let brain_id = explicit_brain.or(marked_brain).unwrap_or_else(|| {
             fail(
                 &format!(
-                    "{dir} has no {SYNC_BASELINE_FILE} or {V2_CHECKOUT_FILE}; clone or push the brain once before `sevra secrets adopt` so the vault destination is unambiguous"
+                    "{dir} has no {SYNC_BASELINE_FILE} or {V2_CHECKOUT_FILE}; pass --brain <id> after `sevra create` to restructure before the first push"
                 ),
                 None,
             )
@@ -6701,11 +7052,13 @@ pub fn secrets_adopt(cfg: &Config, dir: Option<String>) {
     let mut journal = load_adopt_journal(&root)
         .unwrap_or_else(|error| fail(&error, None))
         .unwrap_or_else(|| AdoptJournal {
-            version: 1,
+            version: 2,
             brain_id: brain_id.clone(),
             mappings: BTreeMap::new(),
             paths: BTreeSet::new(),
+            assets: BTreeMap::new(),
         });
+    journal.version = 2;
     if journal.brain_id != brain_id {
         fail(
             &format!(
@@ -6723,7 +7076,7 @@ pub fn secrets_adopt(cfg: &Config, dir: Option<String>) {
 
     let scope = local::load(&root_path).unwrap_or_else(|error| fail(&error, None));
     let (store, _) = read_store_checked(&dir, false);
-    let mut asset_scan = crate::assets::scan_declared_asset_secrets(
+    let asset_scan = crate::assets::scan_declared_asset_secrets(
         &dir,
         store.assets.as_deref(),
         scope.as_ref(),
@@ -6740,21 +7093,29 @@ pub fn secrets_adopt(cfg: &Config, dir: Option<String>) {
                 || hit.store_path == "assets.jsonl"
         })
         .collect();
-    unsupported.append(&mut asset_scan.hits);
+    let asset_content_paths: BTreeSet<String> = asset_scan
+        .hits
+        .iter()
+        .filter(|hit| !hit.in_path)
+        .map(|hit| hit.store_path.clone())
+        .collect();
+    unsupported.extend(asset_scan.hits.iter().filter(|hit| hit.in_path).cloned());
     if !unsupported.is_empty() {
         let mut message = format!(
-            "adopt refused before vault access: {} match(es) are outside editable markdown content:",
+            "adopt refused before vault access: {} match(es) are in a control file or filename and cannot be rewritten without changing identity:",
             unsupported.len()
         );
         message.push_str(&secret_hits_block(&unsupported));
         message.push_str(
-            "\nasset bytes are content-addressed and filenames are identity; keep the file home with `sevra secrets quarantine`, or rename/edit it deliberately",
+            "\nrename a secret-bearing filename or edit a control file deliberately, then rerun adoption",
         );
         fail(&message, Some(secret_hits_data(&unsupported)));
     }
 
     let mut originals = BTreeMap::new();
     let mut by_path: BTreeMap<String, Vec<AdoptOccurrence>> = BTreeMap::new();
+    let mut asset_originals: BTreeMap<String, (String, std::fs::Permissions)> = BTreeMap::new();
+    let mut by_asset: BTreeMap<String, Vec<AdoptOccurrence>> = BTreeMap::new();
     let mut values: BTreeMap<String, AdoptValue> = BTreeMap::new();
     let updated_at = utc_rfc3339_now();
     for file in &store.files {
@@ -6824,6 +7185,137 @@ pub fn secrets_adopt(cfg: &Config, dir: Option<String>) {
         }
     }
 
+    let asset_declarations = parse_adopt_asset_declarations(store.assets.as_deref())
+        .unwrap_or_else(|error| fail(&format!("cannot adopt assets safely: {error}"), None));
+    if !asset_content_paths.is_empty() {
+        let output = Command::new("dbmd")
+            .args(["assets", "refresh", "--help"])
+            .current_dir(&root_path)
+            .output()
+            .unwrap_or_else(|error| {
+                fail(
+                    &format!(
+                        "text-asset adoption needs current dbmd (install it from https://www.sevrahq.com/install): {error}"
+                    ),
+                    None,
+                )
+            });
+        if !output.status.success() {
+            fail(
+                "text-asset adoption needs a dbmd release with `assets refresh`; update dbmd before retrying",
+                None,
+            );
+        }
+    }
+    for path in &asset_content_paths {
+        let declaration = asset_declarations.get(path).unwrap_or_else(|| {
+            fail(
+                &format!(
+                    "cannot adopt uncataloged asset {}",
+                    terminal_safe(&redact_path(path))
+                ),
+                None,
+            )
+        });
+        let Some((bytes, permissions, _)) =
+            held_file_state(&root, path).unwrap_or_else(|error| fail(&error, None))
+        else {
+            fail(
+                &format!("adopt asset disappeared: {}", terminal_safe(path)),
+                None,
+            )
+        };
+        if bytes.len() as u64 != declaration.bytes
+            || format!("{:x}", Sha256::digest(&bytes)) != declaration.sha256
+        {
+            fail(
+                &format!(
+                    "adopt asset drifted from assets.jsonl: {}",
+                    terminal_safe(path)
+                ),
+                None,
+            );
+        }
+        let text = std::str::from_utf8(&bytes).unwrap_or_else(|_| {
+            fail(
+                &format!(
+                    "adopt cannot make a text derivative from binary/non-UTF-8 asset {}",
+                    terminal_safe(path)
+                ),
+                None,
+            )
+        });
+        let spans = crate::scan::content_secret_spans(text).unwrap_or_else(|error| {
+            fail(
+                &format!("cannot adopt asset {} safely: {error}", terminal_safe(path)),
+                None,
+            )
+        });
+        if spans.is_empty() {
+            continue;
+        }
+        for span in spans {
+            let secret = text.as_bytes()[span.start..span.end].to_vec();
+            if secret.len() > MAX_SECRET_VALUE_BYTES {
+                fail(
+                    &format!(
+                        "cannot adopt {} in {}: the matched value is {} bytes, above the {MAX_SECRET_VALUE_BYTES}-byte vault item limit",
+                        span.kind,
+                        terminal_safe(path),
+                        secret.len()
+                    ),
+                    None,
+                );
+            }
+            let hash = format!("{:x}", Sha256::digest(&secret));
+            let occurrence = AdoptOccurrence {
+                hash: hash.clone(),
+                start: span.start,
+                end: span.end,
+                line: text[..span.start]
+                    .bytes()
+                    .filter(|byte| *byte == b'\n')
+                    .count()
+                    + 1,
+                kind: span.kind,
+            };
+            by_asset.entry(path.clone()).or_default().push(occurrence);
+            let entry = values.entry(hash).or_insert_with(|| AdoptValue {
+                bytes: secret.clone(),
+                base_name: contextual_secret_name(text, span.start, span.kind),
+            });
+            if entry.bytes != secret {
+                fail("SHA-256 collision while grouping asset credentials", None);
+            }
+        }
+        let derivative_path = adopt_derivative_path(path, &declaration.sha256)
+            .unwrap_or_else(|error| fail(&error, None));
+        let next = AdoptAssetJournal {
+            original_sha256: declaration.sha256.clone(),
+            original_bytes: declaration.bytes,
+            derivative_path,
+            wrapper_path: journal
+                .assets
+                .get(path)
+                .and_then(|existing| existing.wrapper_path.clone()),
+        };
+        if journal.assets.get(path).is_some_and(|existing| {
+            existing.original_sha256 != next.original_sha256
+                || existing.original_bytes != next.original_bytes
+                || existing.derivative_path != next.derivative_path
+        }) {
+            fail(
+                &format!(
+                    "{ADOPT_JOURNAL_FILE} records different original asset bytes for {}",
+                    terminal_safe(path)
+                ),
+                None,
+            );
+        }
+        journal.assets.insert(path.clone(), next);
+        asset_originals.insert(path.clone(), (text.to_string(), permissions));
+    }
+
     if values.len() > 256 {
         fail(
             &format!(
@@ -6863,7 +7355,7 @@ pub fn secrets_adopt(cfg: &Config, dir: Option<String>) {
             ));
         }
     }
-    if journal.paths.len() > MAX_STORE_FILES {
+    if journal.paths.len().saturating_add(journal.assets.len()) > MAX_STORE_FILES {
         fail(
             &format!("{ADOPT_JOURNAL_FILE} would exceed the store path limit"),
             None,
@@ -6889,7 +7381,7 @@ pub fn secrets_adopt(cfg: &Config, dir: Option<String>) {
             );
         }
     }
-    if !values.is_empty() || !journal.paths.is_empty() {
+    if !values.is_empty() || !journal.paths.is_empty() || !journal.assets.is_empty() {
         write_adopt_journal(&root, &journal).unwrap_or_else(|error| fail(&error, None));
     }
 
@@ -6979,6 +7471,127 @@ pub fn secrets_adopt(cfg: &Config, dir: Option<String>) {
         }
     }
 
+    let newly_kept_assets = keep_adopt_original_assets_home(
+        &root_path,
+        journal.assets.keys().cloned(),
+    )
+    .unwrap_or_else(|error| {
+        fail(
+            &format!("vault values are durable but original assets could not be kept home: {error}; rerun to resume"),
+            None,
+        )
+    });
+    let mut derivative_assets = Vec::new();
+    let mut asset_replacement_count = 0usize;
+    for (path, occurrences) in &by_asset {
+        let (original, permissions) = asset_originals
+            .get(path)
+            .expect("affected asset has held original text");
+        let (sanitized, provenance) =
+            rewritten_adopt_text(original, occurrences, &journal.mappings).unwrap_or_else(
+                |error| {
+                    fail(
+                        &format!("cannot sanitize asset {}: {error}", terminal_safe(path)),
+                        None,
+                    )
+                },
+            );
+        if !crate::scan::scan_content(path, &sanitized).is_empty() {
+            fail(
+                &format!(
+                    "sanitized derivative of {} still matches a known secret format; original remains untouched and local-only",
+                    terminal_safe(path)
+                ),
+                None,
+            );
+        }
+        let derivative_path = journal.assets[path].derivative_path.clone();
+        match held_file_state(&root, &derivative_path).unwrap_or_else(|error| fail(&error, None)) {
+            Some((existing, _, _)) if existing == sanitized.as_bytes() => {}
+            Some(_) => fail(
+                &format!(
+                    "sanitized derivative path already contains different bytes: {}",
+                    terminal_safe(&derivative_path)
+                ),
+                None,
+            ),
+            None => {
+                root.atomic_create(
+                    &derivative_path,
+                    sanitized.as_bytes(),
+                    true,
+                    export_mode(permissions),
+                )
+                .unwrap_or_else(|error| {
+                    fail(
+                        &format!(
+                            "could not create sanitized derivative {}: {error}; rerun to resume",
+                            terminal_safe(&derivative_path)
+                        ),
+                        None,
+                    )
+                });
+                root.restore_permissions(
+                    &derivative_path,
+                    export_mode(permissions),
+                    permissions.readonly(),
+                )
+                .unwrap_or_else(|error| {
+                    fail(
+                        &format!(
+                            "created sanitized derivative {} but could not restore permissions: {error}",
+                            terminal_safe(&derivative_path)
+                        ),
+                        None,
+                    )
+                });
+            }
+        }
+        if cfg!(debug_assertions)
+            && derivative_assets.is_empty()
+            && std::env::var("SEVRA_TEST_ADOPT_EXIT_AFTER_DERIVATIVE").as_deref() == Ok("1")
+        {
+            std::process::exit(88);
+        }
+        let declaration = asset_declarations
+            .get(path)
+            .expect("affected asset remains declared");
+        let relevant_mappings = provenance
+            .iter()
+            .filter_map(|entry| {
+                journal
+                    .mappings
+                    .iter()
+                    .find(|(_, name)| *name == &entry.name)
+                    .map(|(hash, name)| (hash.clone(), name.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let wrapper = {
+            let asset = journal
+                .assets
+                .get_mut(path)
+                .expect("affected asset has journal work");
+            ensure_adopt_derivative_wrapper(
+                &root_path,
+                &root,
+                declaration,
+                asset,
+                &relevant_mappings,
+            )
+            .unwrap_or_else(|error| fail(&format!("{error}; rerun to resume"), None))
+        };
+        write_adopt_journal(&root, &journal).unwrap_or_else(|error| fail(&error, None));
+        refresh_adopt_derivative_manifest(&root_path, &derivative_path, &wrapper)
+            .unwrap_or_else(|error| fail(&format!("{error}; rerun to resume"), None));
+        asset_replacement_count += occurrences.len();
+        derivative_assets.push(json!({
+            "original": path,
+            "derivative": derivative_path,
+            "wrapper": wrapper,
+            "replacements": occurrences.len(),
+        }));
+    }
+
     let (unquarantined, still_kept) =
         finish_adopt_scope(&root_path, &journal).unwrap_or_else(|error| {
             fail(
@@ -6994,13 +7607,21 @@ pub fn secrets_adopt(cfg: &Config, dir: Option<String>) {
             )
         });
 
-    let mut human = if replacement_count == 0 {
-        "no adoptable markdown credentials remain".to_string()
+    let total_replacements = replacement_count.saturating_add(asset_replacement_count);
+    let mut human = if total_replacements == 0 && asset_scan.skipped() > 0 {
+        format!(
+            "no adoptable markdown credentials remain; no text-asset credentials were detected within bounded coverage ({} asset(s) were not inspected)",
+            asset_scan.skipped()
+        )
+    } else if total_replacements == 0 {
+        "no adoptable markdown credentials remain; no text-asset credentials need a portable derivative"
+            .to_string()
     } else {
         format!(
-            "adopted {} distinct vault item(s); replaced {replacement_count} literal(s) across {} markdown file(s):",
+            "adopted {} distinct vault item(s); replaced {total_replacements} literal(s) across {} markdown file(s) and {} portable asset derivative(s):",
             values.len(),
-            rewritten.len()
+            rewritten.len(),
+            derivative_assets.len()
         )
     };
     for path in &rewritten {
@@ -7012,6 +7633,35 @@ pub fn secrets_adopt(cfg: &Config, dir: Option<String>) {
                 occurrence.line,
                 terminal_safe(name)
             ));
+        }
+    }
+    for asset in &derivative_assets {
+        let derivative = asset
+            .get("derivative")
+            .and_then(Value::as_str)
+            .unwrap_or("sanitized derivative");
+        human.push_str(&format!(
+            "\n  {} (sanitized; exact original stays local-only)",
+            terminal_safe(derivative)
+        ));
+    }
+    if newly_kept_assets > 0 {
+        human.push_str(&format!(
+            "\nkept {newly_kept_assets} exact original asset entr{} in .sevralocal",
+            if newly_kept_assets == 1 { "y" } else { "ies" }
+        ));
+    }
+    let existing_hosting_review: Vec<String> = if v2_checkout.is_some() {
+        journal.assets.keys().cloned().collect()
+    } else {
+        Vec::new()
+    };
+    if !existing_hosting_review.is_empty() {
+        human.push_str(
+            "\nexisting-brain custody review: .sevralocal prevents future upload but does not silently remove a coordinate that already rode. Before the next push, verify each original asset's signed disposition. For every currently hosted original, pass its exact path with `--withdraw-from-hosting` and a company audit `--withdraw-reason`; already-withheld originals need no withdrawal. Retained history and issuer response remain separate decisions.",
+        );
+        for path in &existing_hosting_review {
+            human.push_str(&format!("\n  {}", terminal_safe(path)));
         }
     }
     if unquarantined > 0 {
@@ -7034,8 +7684,14 @@ pub fn secrets_adopt(cfg: &Config, dir: Option<String>) {
             "brain": brain_id,
             "vaultItems": journal.mappings.values().collect::<Vec<_>>(),
             "distinctValues": values.len(),
-            "replacements": replacement_count,
+            "replacements": total_replacements,
+            "markdownReplacements": replacement_count,
+            "assetReplacements": asset_replacement_count,
             "files": rewritten,
+            "assetDerivatives": derivative_assets,
+            "originalAssetsNewlyKeptHome": newly_kept_assets,
+            "assetSecretScan": asset_scan.to_json(),
+            "existingHostingReviewPaths": existing_hosting_review,
             "unquarantinedEntries": unquarantined,
             "stillKeptHome": still_kept,
             "journalRemoved": true,
@@ -7103,7 +7759,7 @@ pub fn secrets_scan(dir: Option<String>) {
     );
     msg.push_str(&secret_hits_block(&hits));
     msg.push_str(&format!(
-        "\nHandle any value that may have left this machine under your company's incident policy; Sevra does not prescribe issuer action from a pattern match. Keep live values in the brain vault and references in the brain.\n{EXISTING_BYTES_REMEDIATION}\nmove markdown literals into the brain vault: `sevra secrets adopt {dir}`. Quarantine only when the whole file is secret or an asset: `sevra secrets quarantine {dir}`. Or edit deliberately"
+        "\nHandle any value that may have left this machine under your company's incident policy; Sevra does not prescribe issuer action from a pattern match. Keep live values in the brain vault and references in the brain.\n{EXISTING_BYTES_REMEDIATION}\nredact markdown or build a portable sanitized text-asset derivative: `sevra secrets adopt {dir}`. Quarantine only when the whole file must stay local: `sevra secrets quarantine {dir}`. Or edit deliberately"
     ));
     let mut data = secret_hits_data(&hits);
     if let Some(object) = data.as_object_mut() {

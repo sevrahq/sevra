@@ -1052,13 +1052,25 @@ pub fn scan_declared_asset_secrets(
     scope: Option<&LocalScope>,
     include_kept_home: bool,
 ) -> AssetSecretScanReport {
-    let (declarations, invalid_manifest_rows) = scan_declarations(manifest);
+    let (mut declarations, invalid_manifest_rows) = scan_declarations(manifest);
     let mut report = AssetSecretScanReport {
         invalid_manifest_rows,
         ..AssetSecretScanReport::default()
     };
     let root = Path::new(dir);
     let mut scan_budget_used = 0_u64;
+
+    // Quarantine/adopt's full view must inspect explicitly kept-home assets
+    // before unrelated riding bytes consume the global budget. Kept-home is
+    // where a prior secret decision is most likely to live; counting it as a
+    // late `totalBudget` skip made the remediation command blind to the exact
+    // file the user had already isolated. Push keeps its original manifest
+    // order because include_kept_home is false there.
+    if include_kept_home {
+        declarations.sort_by_key(|declaration| {
+            !scope.is_some_and(|value| value.keeps_home(&declaration.path))
+        });
+    }
 
     for declaration in declarations {
         if !include_kept_home && scope.is_some_and(|s| s.keeps_home(&declaration.path)) {

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 0.2.32 — 2026-08-25
+
+- Secret adoption now keeps a credential-bearing UTF-8 asset useful across
+  machines without rewriting its evidence bytes. Values are vaulted first;
+  the exact original becomes local-only; and a deterministic sanitized asset
+  plus append-only provenance wrapper travels with inert `$NAME` references.
+  Binary, oversized, unsafe-path, drifted, and residual-secret cases refuse.
+- First-time migrations can run `secrets adopt --brain <id>` after provisioning
+  and before the first push. Existing checkouts report exact hosted-state
+  review paths; removing a currently hosted original remains an explicit,
+  audited `--withdraw-from-hosting` action under the existing permission model.
+
 ## 0.2.31 — 2026-08-25
 
 - Hosted reads: `query`, `get`, `graph`, and their MCP equivalents now wait

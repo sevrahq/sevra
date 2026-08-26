@@ -372,9 +372,16 @@ enum SecretsAction {
         #[arg(long)]
         closure: bool,
     },
-    /// Move detected markdown credentials into the brain vault, then replace
-    /// each literal with an inert `$NAME` reference. Requires a sync baseline.
-    Adopt { dir: Option<String> },
+    /// Move detected credentials into the brain vault. Markdown literals become
+    /// inert `$NAME` references; text assets gain portable sanitized derivatives
+    /// while their exact originals remain local-only.
+    Adopt {
+        dir: Option<String>,
+        /// Explicit vault destination for pre-upload onboarding. Must match any
+        /// existing checkout marker.
+        #[arg(long, value_name = "BRAIN")]
+        brain: Option<String>,
+    },
 }
 
 fn main() {
@@ -552,7 +559,7 @@ fn main() {
                 dry_run,
                 closure,
             } => commands::secrets_quarantine(dir, dry_run, closure),
-            SecretsAction::Adopt { dir } => commands::secrets_adopt(&cfg, dir),
+            SecretsAction::Adopt { dir, brain } => commands::secrets_adopt(&cfg, dir, brain),
         },
         Commands::Inbox { action, brain } => commands::inbox(&cfg, &action, &brain),
         Commands::Export {
