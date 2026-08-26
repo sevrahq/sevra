@@ -2324,17 +2324,25 @@ if [ "$1" = "assets" ] && [ "$2" = "refresh" ] && [ "$3" = "--help" ]; then
 fi
 if [ "$1" = "--json" ] && [ "$2" = "write" ]; then
   asset=''
+  supersedes=''
   for arg in "$@"; do
-    case "$arg" in asset=*) asset=${arg#asset=} ;; esac
+    case "$arg" in
+      asset=*) asset=${arg#asset=} ;;
+      supersedes-asset=*) supersedes=${arg#supersedes-asset=} ;;
+    esac
   done
   wrapper='sources/redacted-assets/2026/08/portable.md'
   mkdir -p 'sources/redacted-assets/2026/08'
-  printf '%s\n' '---' 'type: note' 'id: 01kxrwrfj75t95dccf2vqekzw3' 'created: 2026-08-25T00:00:00Z' 'updated: 2026-08-25T00:00:00Z' 'summary: Portable sanitized derivative' "asset: $asset" '---' 'Portable derivative.' > "$wrapper"
+  printf '%s\n' '---' 'type: note' 'id: 01kxrwrfj75t95dccf2vqekzw3' 'created: 2026-08-25T00:00:00Z' 'updated: 2026-08-25T00:00:00Z' 'summary: Portable sanitized derivative' "asset: $asset" "supersedes-asset: $supersedes" '---' 'Portable derivative.' > "$wrapper"
   printf '{"written":"%s","type":"note"}\n' "$wrapper"
   exit 0
 fi
 if [ "$1" = "--json" ] && [ "$2" = "assets" ] && [ "$3" = "refresh" ]; then
-  printf '{"path":"%s","wrote":true}\n' "$4"
+  supersedes=''
+  while IFS= read -r line; do
+    case "$line" in supersedes-asset:*) supersedes=${line#supersedes-asset: } ;; esac
+  done < "$6"
+  printf '{"path":"%s","superseded_assets":["%s"],"wrote":true}\n' "$4" "$supersedes"
   exit 0
 fi
 exit 64
@@ -3158,6 +3166,7 @@ fn secrets_adopt_vaults_text_asset_values_and_builds_a_portable_derivative() {
         std::fs::read_to_string(t.path().join("sources/redacted-assets/2026/08/portable.md"))
             .unwrap();
     assert!(derivative_wrapper.contains(&derivative));
+    assert!(derivative_wrapper.contains("supersedes-asset: sources/imports/_files/config.json"));
     assert!(!t.path().join(".sevra-adopt.json").exists());
 
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();

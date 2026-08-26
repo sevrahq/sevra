@@ -6823,6 +6823,7 @@ fn existing_derivative_wrapper(
 fn ensure_adopt_derivative_wrapper(
     root_path: &Path,
     root: &crate::safe_path::SafeDir,
+    original_path: &str,
     original: &AdoptAssetDeclaration,
     asset: &mut AdoptAssetJournal,
     mappings: &BTreeMap<String, String>,
@@ -6885,6 +6886,8 @@ fn ensure_adopt_derivative_wrapper(
             format!("asset={}", asset.derivative_path),
             "--fm".to_string(),
             format!("original-sha256={}", asset.original_sha256),
+            "--fm".to_string(),
+            format!("supersedes-asset={original_path}"),
             "--body-file".to_string(),
             body_path.clone(),
             "--dir".to_string(),
@@ -6907,6 +6910,7 @@ fn ensure_adopt_derivative_wrapper(
 
 fn refresh_adopt_derivative_manifest(
     root_path: &Path,
+    original_path: &str,
     derivative_path: &str,
     wrapper_path: &str,
 ) -> Result<(), String> {
@@ -6925,6 +6929,20 @@ fn refresh_adopt_derivative_manifest(
     )?;
     if result.get("path").and_then(Value::as_str) != Some(derivative_path) {
         return Err("dbmd refreshed a different derivative asset path".into());
+    }
+    if !result
+        .get("superseded_assets")
+        .and_then(Value::as_array)
+        .is_some_and(|paths| {
+            paths
+                .iter()
+                .any(|path| path.as_str() == Some(original_path))
+        })
+    {
+        return Err(
+            "dbmd did not mark the exact original asset optional; update dbmd before retrying"
+                .into(),
+        );
     }
     Ok(())
 }
@@ -7574,6 +7592,7 @@ pub fn secrets_adopt(cfg: &Config, dir: Option<String>, explicit_brain: Option<S
             ensure_adopt_derivative_wrapper(
                 &root_path,
                 &root,
+                path,
                 declaration,
                 asset,
                 &relevant_mappings,
@@ -7581,7 +7600,7 @@ pub fn secrets_adopt(cfg: &Config, dir: Option<String>, explicit_brain: Option<S
             .unwrap_or_else(|error| fail(&format!("{error}; rerun to resume"), None))
         };
         write_adopt_journal(&root, &journal).unwrap_or_else(|error| fail(&error, None));
-        refresh_adopt_derivative_manifest(&root_path, &derivative_path, &wrapper)
+        refresh_adopt_derivative_manifest(&root_path, path, &derivative_path, &wrapper)
             .unwrap_or_else(|error| fail(&format!("{error}; rerun to resume"), None));
         asset_replacement_count += occurrences.len();
         derivative_assets.push(json!({

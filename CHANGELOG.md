@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.2.33 — 2026-08-25
+
+- Portable secret-asset adoption now declares the sanitized derivative as the
+  required working copy and retains the exact local-only original as optional
+  evidence through db.md's append-only `supersedes-asset` contract. Publication
+  and hosted execution no longer reject a successfully restructured brain for
+  intentionally withholding the original credential bytes.
+
 ## 0.2.32 — 2026-08-25
 
 - Secret adoption now keeps a credential-bearing UTF-8 asset useful across
