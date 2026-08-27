@@ -14,6 +14,7 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
+use globset::GlobBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -46,7 +47,7 @@ struct PackageConfig {
     profiles: BTreeMap<String, ProfileSpec>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct ProfileSpec {
     include: Vec<IncludeSpec>,
@@ -55,10 +56,12 @@ struct ProfileSpec {
     #[serde(default)]
     allow_secret_named_paths: Vec<String>,
     #[serde(default)]
+    allow_unscanned_binary_paths: Vec<String>,
+    #[serde(default)]
     dependencies: Vec<DependencySpec>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct IncludeSpec {
     path: String,
@@ -66,7 +69,7 @@ struct IncludeSpec {
     allow_unscanned_binary: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct DependencySpec {
     id: String,
@@ -83,6 +86,30 @@ struct DependencySpec {
     locator: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     remote: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    local_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verification: Option<PathVerification>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
+enum PathVerification {
+    RegularFile {
+        #[serde(default)]
+        allow_empty: bool,
+    },
+    Directory {
+        #[serde(default)]
+        allow_empty: bool,
+        #[serde(default)]
+        required: Vec<String>,
+    },
+    SevralocalClosure {
+        policy_sha256: String,
+        #[serde(default)]
+        minimum_entries: usize,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -128,6 +155,10 @@ struct DependencyReceipt {
     locator: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     remote: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification: Option<PathVerification>,
     #[serde(skip_serializing_if = "Option::is_none")]
     remote_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -404,6 +435,23 @@ fn validate_profile(profile: &ProfileSpec) -> Result<(), String> {
     for allowed in &profile.allow_secret_named_paths {
         normalize_rel(allowed, "secret-named exception")?;
     }
+    let mut binary_paths = BTreeSet::new();
+    for allowed in &profile.allow_unscanned_binary_paths {
+        let path = normalize_rel(allowed, "binary exception")?;
+        if !binary_paths.insert(path.clone()) {
+            return Err(format!("duplicate binary exception `{path}`"));
+        }
+        if generated_cache_path(&path) {
+            return Err(format!(
+                "binary exception `{path}` selects generated cache content"
+            ));
+        }
+        if !path_selected(profile, &path) || excluded(&path, &profile.exclude) {
+            return Err(format!(
+                "binary exception `{path}` is not inside the selected package closure"
+            ));
+        }
+    }
     let mut dependency_ids = BTreeSet::new();
     for dependency in &profile.dependencies {
         valid_name(&dependency.id, "dependency id")?;
@@ -418,30 +466,56 @@ fn validate_profile(profile: &ProfileSpec) -> Result<(), String> {
         }
         match dependency.kind.as_str() {
             "git" => {
-                if dependency.path.is_none() || dependency.name.is_some() {
+                if dependency.path.is_none()
+                    || dependency.name.is_some()
+                    || dependency.locator.is_some()
+                    || dependency.local_path.is_some()
+                    || dependency.verification.is_some()
+                {
                     return Err(format!(
-                        "git dependency `{}` requires path and forbids name",
+                        "git dependency `{}` requires path and forbids name, local_path, and verification",
                         dependency.id
                     ));
                 }
             }
             "path" => {
-                if dependency.path.is_none() {
+                if dependency.path.is_none()
+                    || dependency.name.is_some()
+                    || dependency.locator.is_some()
+                    || dependency.remote.is_some()
+                    || dependency.local_path.is_some()
+                {
                     return Err(format!("path dependency `{}` requires path", dependency.id));
                 }
             }
             "secret" => {
-                if dependency.name.is_none() || dependency.path.is_some() {
+                if dependency.name.is_none()
+                    || dependency.path.is_some()
+                    || dependency.locator.is_some()
+                    || dependency.remote.is_some()
+                {
                     return Err(format!(
                         "secret dependency `{}` requires name and forbids path",
                         dependency.id
                     ));
                 }
+                if dependency.local_path.is_none() && dependency.verification.is_some() {
+                    return Err(format!(
+                        "secret dependency `{}` cannot verify an absent local_path",
+                        dependency.id
+                    ));
+                }
             }
             "live" | "external" => {
-                if dependency.locator.is_none() {
+                if dependency.locator.is_none()
+                    || dependency.path.is_some()
+                    || dependency.name.is_some()
+                    || dependency.remote.is_some()
+                    || dependency.local_path.is_some()
+                    || dependency.verification.is_some()
+                {
                     return Err(format!(
-                        "{} dependency `{}` requires locator",
+                        "{} dependency `{}` requires only a locator",
                         dependency.kind, dependency.id
                     ));
                 }
@@ -458,14 +532,84 @@ fn validate_profile(profile: &ProfileSpec) -> Result<(), String> {
                 normalize_rel(path, "dependency path")?;
             }
         }
+        if let Some(path) = &dependency.local_path {
+            normalize_rel(path, "dependency local path")?;
+        }
+        if let Some(verification) = &dependency.verification {
+            validate_path_verification(dependency, verification)?;
+        }
     }
     Ok(())
+}
+
+fn validate_path_verification(
+    dependency: &DependencySpec,
+    verification: &PathVerification,
+) -> Result<(), String> {
+    match verification {
+        PathVerification::RegularFile { .. } => Ok(()),
+        PathVerification::Directory { required, .. } => {
+            let mut seen = BTreeSet::new();
+            for child in required {
+                let child = normalize_rel(child, "dependency required child")?;
+                if !seen.insert(child.clone()) {
+                    return Err(format!(
+                        "dependency `{}` repeats required child `{child}`",
+                        dependency.id
+                    ));
+                }
+            }
+            Ok(())
+        }
+        PathVerification::SevralocalClosure {
+            policy_sha256,
+            minimum_entries,
+        } => {
+            if dependency.kind != "path"
+                || !dependency
+                    .path
+                    .as_deref()
+                    .is_some_and(|path| path.ends_with("/.sevralocal"))
+                || policy_sha256.len() != 64
+                || !policy_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || *minimum_entries == 0
+            {
+                return Err(format!(
+                    "dependency `{}` has an invalid sevralocal_closure verification",
+                    dependency.id
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn path_selected(profile: &ProfileSpec, path: &str) -> bool {
+    profile
+        .include
+        .iter()
+        .any(|include| path == include.path || path.starts_with(&format!("{}/", include.path)))
 }
 
 fn excluded(path: &str, excludes: &[String]) -> bool {
     excludes
         .iter()
         .any(|prefix| path == prefix || path.starts_with(&format!("{prefix}/")))
+}
+
+fn generated_cache_path(path: &str) -> bool {
+    path.split('/').any(|component| {
+        matches!(
+            component,
+            "__pycache__"
+                | "node_modules"
+                | ".pytest_cache"
+                | ".mypy_cache"
+                | ".ruff_cache"
+                | ".DS_Store"
+        ) || component.ends_with(".pyc")
+            || component.ends_with(".pyo")
+    })
 }
 
 fn lexical_symlink_target(path: &str, raw_target: &str) -> Result<String, String> {
@@ -584,6 +728,11 @@ fn collect_file(
     allowed_names: &BTreeSet<String>,
     collected: &mut Collected,
 ) -> Result<(), String> {
+    if generated_cache_path(path) {
+        return Err(format!(
+            "package refuses generated cache companion {path}; exclude it from the profile"
+        ));
+    }
     if collected.entries.len() >= MAX_FILES {
         return Err(format!("package exceeds the {MAX_FILES}-entry limit"));
     }
@@ -705,13 +854,18 @@ fn collect_symlink(
     Ok(())
 }
 
+struct WalkPolicy<'a> {
+    workspace: &'a Workspace,
+    allow_binary: bool,
+    binary_paths: &'a BTreeSet<String>,
+    excludes: &'a [String],
+    allowed_names: &'a BTreeSet<String>,
+}
+
 fn walk(
-    workspace: &Workspace,
+    policy: &WalkPolicy<'_>,
     dir: &SafeDir,
     prefix: &str,
-    allow_binary: bool,
-    excludes: &[String],
-    allowed_names: &BTreeSet<String>,
     collected: &mut Collected,
 ) -> Result<(), String> {
     let mut entries = dir
@@ -724,7 +878,7 @@ fn walk(
             .to_str()
             .ok_or_else(|| format!("package directory {prefix} has a non-UTF-8 entry"))?;
         let path = format!("{prefix}/{name}");
-        if excluded(&path, excludes) {
+        if excluded(&path, policy.excludes) {
             continue;
         }
         match entry.kind {
@@ -732,27 +886,24 @@ fn walk(
                 dir,
                 &entry.name,
                 &path,
-                allow_binary,
-                allowed_names,
+                policy.allow_binary || policy.binary_paths.contains(&path),
+                policy.allowed_names,
                 collected,
             )?,
             EntryKind::Directory => {
                 let child = dir.open_dir(&entry.name).map_err(|error| {
                     format!("cannot securely open companion directory {path}: {error}")
                 })?;
-                walk(
-                    workspace,
-                    &child,
-                    &path,
-                    allow_binary,
-                    excludes,
-                    allowed_names,
-                    collected,
-                )?;
+                walk(policy, &child, &path, collected)?;
             }
-            EntryKind::Symlink => {
-                collect_symlink(workspace, dir, &entry.name, &path, allowed_names, collected)?
-            }
+            EntryKind::Symlink => collect_symlink(
+                policy.workspace,
+                dir,
+                &entry.name,
+                &path,
+                policy.allowed_names,
+                collected,
+            )?,
             EntryKind::Other => {
                 return Err(format!(
                     "package companion {path} is not a regular file, directory, or symlink"
@@ -767,6 +918,7 @@ fn collect_include(
     workspace: &Workspace,
     include: &IncludeSpec,
     excludes: &[String],
+    binary_paths: &BTreeSet<String>,
     allowed_names: &BTreeSet<String>,
     collected: &mut Collected,
 ) -> Result<(), String> {
@@ -806,23 +958,34 @@ fn collect_include(
             &parent,
             leaf,
             &path,
-            include.allow_unscanned_binary,
+            include.allow_unscanned_binary || binary_paths.contains(&path),
             allowed_names,
             collected,
         ),
         EntryKind::Directory => {
+            if include.allow_unscanned_binary {
+                return Err(format!(
+                    "package include {path} grants a directory-wide binary exception; use allow_unscanned_binary_paths for reviewed files"
+                ));
+            }
             let dir = parent.open_dir(leaf).map_err(|error| {
                 format!("cannot securely open included directory {path}: {error}")
             })?;
-            walk(
+            let before = collected.entries.len();
+            let policy = WalkPolicy {
                 workspace,
-                &dir,
-                &path,
-                include.allow_unscanned_binary,
+                allow_binary: include.allow_unscanned_binary,
+                binary_paths,
                 excludes,
                 allowed_names,
-                collected,
-            )
+            };
+            walk(&policy, &dir, &path, collected)?;
+            if collected.entries.len() == before {
+                return Err(format!(
+                    "included directory {path} contributes no package coordinates"
+                ));
+            }
+            Ok(())
         }
         EntryKind::Symlink => {
             collect_symlink(workspace, &parent, leaf, &path, allowed_names, collected)
@@ -868,6 +1031,268 @@ fn safe_git_remote(raw: String) -> Result<String, String> {
     Ok(raw)
 }
 
+fn secure_entry_kind(root: &Path, rel: &str) -> Result<Option<EntryKind>, String> {
+    if rel == "." {
+        return Ok(Some(EntryKind::Directory));
+    }
+    let rel = normalize_rel(rel, "dependency path")?;
+    let parts = rel.split('/').collect::<Vec<_>>();
+    let mut dir = SafeDir::open(root)
+        .map_err(|error| format!("cannot securely open dependency root: {error}"))?;
+    for part in &parts[..parts.len() - 1] {
+        match dir.open_dir(OsStr::new(part)) {
+            Ok(child) => dir = child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(format!(
+                    "cannot securely traverse dependency path {rel}: {error}"
+                ))
+            }
+        }
+    }
+    let leaf = OsStr::new(parts.last().expect("normalized dependency has a leaf"));
+    let entries = dir
+        .entries()
+        .map_err(|error| format!("cannot inspect dependency path {rel}: {error}"))?;
+    Ok(entries
+        .into_iter()
+        .find(|entry| entry.name == leaf)
+        .map(|entry| entry.kind))
+}
+
+fn secure_directory(root: &Path, rel: &str) -> Result<Option<SafeDir>, String> {
+    if rel == "." {
+        return SafeDir::open(root)
+            .map(Some)
+            .map_err(|error| format!("cannot securely open dependency directory: {error}"));
+    }
+    let rel = normalize_rel(rel, "dependency directory")?;
+    let mut dir = SafeDir::open(root)
+        .map_err(|error| format!("cannot securely open dependency root: {error}"))?;
+    for part in rel.split('/') {
+        match dir.open_dir(OsStr::new(part)) {
+            Ok(child) => dir = child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(format!(
+                    "cannot securely open dependency directory {rel}: {error}"
+                ))
+            }
+        }
+    }
+    Ok(Some(dir))
+}
+
+fn collect_regular_store_paths(
+    dir: &SafeDir,
+    prefix: &str,
+    paths: &mut Vec<String>,
+) -> Result<(), String> {
+    for entry in dir
+        .entries()
+        .map_err(|error| format!("cannot inspect private brain closure: {error}"))?
+    {
+        let name = entry
+            .name
+            .to_str()
+            .ok_or_else(|| "private brain closure has a non-UTF-8 path".to_string())?;
+        let path = if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        match entry.kind {
+            EntryKind::File => paths.push(path),
+            EntryKind::Directory => {
+                let child = dir.open_dir(&entry.name).map_err(|error| {
+                    format!("cannot securely traverse private brain closure: {error}")
+                })?;
+                collect_regular_store_paths(&child, &path, paths)?;
+            }
+            EntryKind::Symlink | EntryKind::Other => {}
+        }
+    }
+    Ok(())
+}
+
+fn verify_sevralocal_closure(
+    workspace: &Workspace,
+    dependency_path: &str,
+    policy_sha256: &str,
+    minimum_entries: usize,
+) -> Result<(), String> {
+    let expected_path = format!("{}/{}", workspace.store_rel, crate::local::FILE_NAME);
+    if dependency_path != expected_path {
+        return Err(format!(
+            "sevralocal closure verification requires dependency path {expected_path}"
+        ));
+    }
+    let scope = crate::local::load(&workspace.store)?
+        .ok_or_else(|| "private brain policy is absent".to_string())?;
+    let actual_sha256 = format!("{:x}", Sha256::digest(scope.raw().as_bytes()));
+    if actual_sha256 != policy_sha256.to_ascii_lowercase() {
+        return Err("private brain policy does not match the checkpointed policy digest".into());
+    }
+    let entries = scope
+        .raw()
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let entry = line.strip_suffix('\r').unwrap_or(line);
+            (!entry.trim().is_empty() && !entry.starts_with('#')).then_some((index + 1, entry))
+        })
+        .collect::<Vec<_>>();
+    if entries.len() < minimum_entries {
+        return Err(format!(
+            "private brain policy has {} effective entries; at least {minimum_entries} are required",
+            entries.len()
+        ));
+    }
+    let root = SafeDir::open(&workspace.store)
+        .map_err(|error| format!("cannot securely open private brain store: {error}"))?;
+    let mut present = Vec::new();
+    collect_regular_store_paths(&root, "", &mut present)?;
+    for (line, entry) in entries {
+        let matcher = GlobBuilder::new(entry)
+            .backslash_escape(true)
+            .build()
+            .map_err(|_| format!("private brain policy line {line} is not a valid glob"))?
+            .compile_matcher();
+        if !present.iter().any(|path| matcher.is_match(path)) {
+            return Err(format!(
+                "private brain policy line {line} has no restored regular file"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn required_child_path(base: &str, child: &str) -> String {
+    if base == "." {
+        child.to_string()
+    } else {
+        format!("{base}/{child}")
+    }
+}
+
+fn verify_dependency_path(
+    workspace: &Workspace,
+    rel: &str,
+    verification: Option<&PathVerification>,
+) -> Result<(), String> {
+    let kind =
+        secure_entry_kind(&workspace.root, rel)?.ok_or_else(|| "path is absent".to_string())?;
+    match verification {
+        Some(PathVerification::RegularFile { allow_empty }) => {
+            if kind != EntryKind::File {
+                return Err("path is not a no-follow regular file".into());
+            }
+            if !allow_empty {
+                let file = safe_path::open_regular(&workspace.root, rel)
+                    .map_err(|error| format!("cannot securely inspect file: {error}"))?
+                    .ok_or_else(|| "path is absent".to_string())?;
+                if file
+                    .metadata()
+                    .map_err(|error| format!("cannot inspect file metadata: {error}"))?
+                    .len()
+                    == 0
+                {
+                    return Err("regular file is empty".into());
+                }
+            }
+        }
+        Some(PathVerification::Directory {
+            allow_empty,
+            required,
+        }) => {
+            if kind != EntryKind::Directory {
+                return Err("path is not a no-follow directory".into());
+            }
+            let directory = secure_directory(&workspace.root, rel)?
+                .ok_or_else(|| "path is absent".to_string())?;
+            if !allow_empty
+                && directory
+                    .entries()
+                    .map_err(|error| format!("cannot inspect directory: {error}"))?
+                    .is_empty()
+            {
+                return Err("directory is empty".into());
+            }
+            for child in required {
+                let child = required_child_path(rel, child);
+                match secure_entry_kind(&workspace.root, &child)? {
+                    Some(EntryKind::File | EntryKind::Directory) => {}
+                    Some(_) => return Err(format!("required child {child} is not a regular path")),
+                    None => return Err(format!("required child {child} is absent")),
+                }
+            }
+        }
+        Some(PathVerification::SevralocalClosure {
+            policy_sha256,
+            minimum_entries,
+        }) => {
+            if kind != EntryKind::File {
+                return Err("private brain policy is not a no-follow regular file".into());
+            }
+            verify_sevralocal_closure(workspace, rel, policy_sha256, *minimum_entries)?;
+        }
+        None => {
+            match kind {
+                EntryKind::File => {
+                    let file = safe_path::open_regular(&workspace.root, rel)
+                        .map_err(|error| format!("cannot securely inspect file: {error}"))?
+                        .ok_or_else(|| "path is absent".to_string())?;
+                    if file
+                        .metadata()
+                        .map_err(|error| format!("cannot inspect file metadata: {error}"))?
+                        .len()
+                        == 0
+                    {
+                        return Err("regular file is empty; declare an explicit verification if intentional".into());
+                    }
+                }
+                EntryKind::Directory => {
+                    let directory = secure_directory(&workspace.root, rel)?
+                        .ok_or_else(|| "path is absent".to_string())?;
+                    if directory
+                        .entries()
+                        .map_err(|error| format!("cannot inspect directory: {error}"))?
+                        .is_empty()
+                    {
+                        return Err(
+                            "directory is empty; declare an explicit verification if intentional"
+                                .into(),
+                        );
+                    }
+                }
+                EntryKind::Symlink | EntryKind::Other => {
+                    return Err("path is not a no-follow regular file or directory".into())
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn secret_file_is_owner_only(workspace: &Workspace, rel: &str) -> Result<bool, String> {
+    use std::os::unix::fs::MetadataExt;
+    let file = safe_path::open_regular(&workspace.root, rel)
+        .map_err(|error| format!("cannot inspect local secret custody: {error}"))?
+        .ok_or_else(|| "local secret custody is absent".to_string())?;
+    let mode = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect local secret custody mode: {error}"))?
+        .mode()
+        & 0o777;
+    Ok(mode & 0o077 == 0)
+}
+
+#[cfg(not(unix))]
+fn secret_file_is_owner_only(_workspace: &Workspace, _rel: &str) -> Result<bool, String> {
+    Ok(true)
+}
+
 fn dependency_receipts(
     workspace: &Workspace,
     specs: &[DependencySpec],
@@ -886,6 +1311,8 @@ fn dependency_receipts(
                 name: spec.name.clone(),
                 locator: spec.locator.clone(),
                 remote: spec.remote.clone(),
+                local_path: spec.local_path.clone(),
+                verification: spec.verification.clone(),
                 remote_url: None,
                 detail: None,
             };
@@ -912,25 +1339,71 @@ fn dependency_receipts(
                             None
                         }
                     };
-                    if receipt.remote_url.is_some() {
+                    let head = command_output(
+                        Command::new("git")
+                            .args(["-C"])
+                            .arg(&path)
+                            .args(["rev-parse", "--verify", "HEAD^{commit}"]),
+                        "verify Git dependency history",
+                    );
+                    let shallow = command_output(
+                        Command::new("git")
+                            .args(["-C"])
+                            .arg(&path)
+                            .args(["rev-parse", "--is-shallow-repository"]),
+                        "verify Git dependency history depth",
+                    );
+                    if receipt.remote_url.is_some()
+                        && head.is_ok()
+                        && matches!(shallow.as_deref(), Ok("false"))
+                    {
                         receipt.status = "resolved".into();
+                    } else if receipt.detail.is_none() {
+                        receipt.detail = Some(match (head, shallow) {
+                            (Err(error), _) | (_, Err(error)) => error,
+                            (_, Ok(value)) if value == "true" => {
+                                "Git dependency is a shallow checkout".into()
+                            }
+                            _ => "Git dependency history could not be verified".into(),
+                        });
                     }
                 }
                 "path" => {
-                    let path = workspace.root.join(spec.path.as_deref().unwrap_or(""));
-                    if fs::symlink_metadata(path).is_ok() {
+                    match verify_dependency_path(
+                        workspace,
+                        spec.path.as_deref().unwrap_or(""),
+                        spec.verification.as_ref(),
+                    ) {
+                        Ok(()) => {
                         receipt.status = "resolved".into();
-                    } else {
-                        receipt.detail = Some("path is absent".into());
+                        }
+                        Err(error) => receipt.detail = Some(error),
                     }
                 }
-                "secret" => match vault_names {
-                    Some(names) if names.contains(spec.name.as_deref().unwrap_or("")) => {
-                        receipt.status = "resolved".into()
+                "secret" => {
+                    let vault_resolved = vault_names
+                        .is_some_and(|names| names.contains(spec.name.as_deref().unwrap_or("")));
+                    let local_result = spec.local_path.as_deref().map(|path| {
+                        verify_dependency_path(workspace, path, spec.verification.as_ref())?;
+                        if matches!(
+                            spec.verification,
+                            None | Some(PathVerification::RegularFile { .. })
+                        ) && !secret_file_is_owner_only(workspace, path)?
+                        {
+                            return Err("local secret custody is not owner-only".into());
+                        }
+                        Ok(())
+                    });
+                    if vault_resolved || matches!(local_result, Some(Ok(()))) {
+                        receipt.status = "resolved".into();
+                    } else if let Some(Err(error)) = local_result {
+                        receipt.detail = Some(error);
+                    } else if vault_names.is_some() {
+                        receipt.detail = Some("vault item name is absent".into());
+                    } else {
+                        receipt.detail = Some("vault custody was not checked".into());
                     }
-                    Some(_) => receipt.detail = Some("vault item name is absent".into()),
-                    None => receipt.detail = Some("vault custody was not checked".into()),
-                },
+                }
                 "live" | "external" => {
                     receipt.detail = Some(
                         "declared for operator restoration; Sevra never starts or probes arbitrary external systems"
@@ -1099,12 +1572,18 @@ fn stage_snapshot(
         .iter()
         .map(|path| normalize_rel(path, "secret-named exception"))
         .collect::<Result<_, _>>()?;
+    let binary_paths: BTreeSet<String> = profile
+        .allow_unscanned_binary_paths
+        .iter()
+        .map(|path| normalize_rel(path, "binary exception"))
+        .collect::<Result<_, _>>()?;
     let mut collected = Collected::default();
     for include in &profile.include {
         collect_include(
             workspace,
             include,
             &excludes,
+            &binary_paths,
             &allowed_names,
             &mut collected,
         )?;
@@ -1275,6 +1754,20 @@ pub fn checkpoint_command(
     confirm_bulk: Option<String>,
 ) {
     let workspace = discover_workspace(&workspace_path).unwrap_or_else(|error| fail(&error, None));
+    let held_store = SafeDir::open(&workspace.store).unwrap_or_else(|error| {
+        fail(
+            &format!("cannot open package store for locking: {error}"),
+            None,
+        )
+    });
+    let _package_lock = held_store
+        .lock_relative(PACKAGE_LOCK)
+        .unwrap_or_else(|error| {
+            fail(
+                &format!("cannot lock package lifecycle state: {error}"),
+                None,
+            )
+        });
     if !workspace.store.join(".sevra-v2.json").is_file() {
         fail(
             "package checkpoint requires an established Link.md v2 checkout; run one ordinary `sevra push --brain <brain> db` first",
@@ -1312,6 +1805,167 @@ pub fn checkpoint_command(
         },
     );
     stop_progress(progress_done, progress);
+}
+
+fn dependency_spec_from_receipt(receipt: &DependencyReceipt) -> DependencySpec {
+    DependencySpec {
+        id: receipt.id.clone(),
+        kind: receipt.kind.clone(),
+        required: receipt.required,
+        impact: receipt.impact.clone(),
+        path: receipt.path.clone(),
+        name: receipt.name.clone(),
+        locator: receipt.locator.clone(),
+        remote: receipt.remote.clone(),
+        local_path: receipt.local_path.clone(),
+        verification: receipt.verification.clone(),
+    }
+}
+
+fn binary_allowed_for_path(profile: &ProfileSpec, path: &str) -> bool {
+    profile
+        .allow_unscanned_binary_paths
+        .iter()
+        .any(|allowed| allowed == path)
+        || profile
+            .include
+            .iter()
+            .any(|include| include.path == path && include.allow_unscanned_binary)
+}
+
+fn validate_snapshot_against_profile(
+    workspace: &Workspace,
+    profile: &ProfileSpec,
+    envelope: &SnapshotEnvelope,
+) -> Result<(), String> {
+    let paths = envelope
+        .core
+        .entries
+        .iter()
+        .map(|entry| entry.path())
+        .collect::<BTreeSet<_>>();
+    for include in &profile.include {
+        if !paths
+            .iter()
+            .any(|path| **path == include.path || path.starts_with(&format!("{}/", include.path)))
+        {
+            return Err(format!(
+                "package snapshot omits selected include `{}`",
+                include.path
+            ));
+        }
+    }
+    for allowed in &profile.allow_unscanned_binary_paths {
+        if !paths.contains(allowed.as_str()) {
+            return Err(format!(
+                "package snapshot omits reviewed binary exception `{allowed}`"
+            ));
+        }
+    }
+    for entry in &envelope.core.entries {
+        let path = entry.path();
+        if path == ".git" || path.starts_with(".git/") {
+            return Err(format!(
+                "package snapshot path {path} overlaps reserved Git state"
+            ));
+        }
+        if path == workspace.store_rel || path.starts_with(&format!("{}/", workspace.store_rel)) {
+            return Err(format!(
+                "package snapshot path {path} overlaps the brain store"
+            ));
+        }
+        if generated_cache_path(path) {
+            return Err(format!(
+                "package snapshot contains generated cache path {path}"
+            ));
+        }
+        if !path_selected(profile, path) || excluded(path, &profile.exclude) {
+            return Err(format!(
+                "package snapshot path {path} is outside the current profile closure"
+            ));
+        }
+        if matches!(
+            entry,
+            SnapshotEntry::File {
+                unscanned_binary: true,
+                ..
+            }
+        ) && !binary_allowed_for_path(profile, path)
+        {
+            return Err(format!(
+                "package snapshot grants an undeclared binary exception to {path}"
+            ));
+        }
+    }
+    let snapshot_dependencies = envelope
+        .core
+        .dependencies
+        .iter()
+        .map(dependency_spec_from_receipt)
+        .collect::<Vec<_>>();
+    if snapshot_dependencies != profile.dependencies {
+        return Err(
+            "package snapshot dependency closure does not match the current profile".into(),
+        );
+    }
+    for receipt in &envelope.core.dependencies {
+        if !matches!(receipt.status.as_str(), "resolved" | "unresolved") {
+            return Err(format!(
+                "package dependency `{}` has an invalid status",
+                receipt.id
+            ));
+        }
+        if let Some(remote_url) = &receipt.remote_url {
+            safe_git_remote(remote_url.clone())
+                .map_err(|error| format!("package dependency `{}`: {error}", receipt.id))?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_snapshot_objects(
+    workspace: &Workspace,
+    profile: &ProfileSpec,
+    entries: &[SnapshotEntry],
+) -> Result<(), String> {
+    let allowed_names = profile
+        .allow_secret_named_paths
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    for entry in entries {
+        let SnapshotEntry::File {
+            path,
+            sha256,
+            bytes,
+            asset,
+            unscanned_binary,
+            ..
+        } = entry
+        else {
+            continue;
+        };
+        let Some(object) = safe_path::read_regular(&workspace.store, asset)
+            .map_err(|error| format!("cannot inspect package object for {path}: {error}"))?
+        else {
+            continue;
+        };
+        if object.len() as u64 != *bytes || format!("{:x}", Sha256::digest(&object)) != *sha256 {
+            continue;
+        }
+        let rescanned = scan_companion(
+            path,
+            &object,
+            allowed_names.contains(path.as_str()),
+            binary_allowed_for_path(profile, path),
+        )?;
+        if rescanned != *unscanned_binary {
+            return Err(format!(
+                "package snapshot binary classification changed for {path}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn load_snapshot(workspace: &Workspace, profile: &str) -> Result<SnapshotEnvelope, String> {
@@ -1356,11 +2010,6 @@ fn load_snapshot(workspace: &Workspace, profile: &str) -> Result<SnapshotEnvelop
     let mut paths = BTreeSet::new();
     for entry in &envelope.core.entries {
         let path = normalize_rel(entry.path(), "snapshot path")?;
-        if path == workspace.store_rel || path.starts_with(&format!("{}/", workspace.store_rel)) {
-            return Err(format!(
-                "package snapshot path {path} overlaps the brain store"
-            ));
-        }
         if !paths.insert(path.clone()) {
             return Err("package snapshot contains a duplicate path".into());
         }
@@ -1384,10 +2033,12 @@ fn load_snapshot(workspace: &Workspace, profile: &str) -> Result<SnapshotEnvelop
             }
         }
     }
-    // The signer authenticates bytes, not package semantics. Recheck the
-    // closure on every restore/verify so a validly signed but malformed
-    // snapshot cannot create a link to an undeclared workspace path.
+    // The signer authenticates bytes, not package semantics. Re-derive the
+    // selected path/dependency closure and rescan every available object before
+    // any restore or pull can install it.
+    validate_snapshot_against_profile(workspace, &current_profile, &envelope)?;
     validate_symlink_closure(&envelope.core.entries)?;
+    validate_snapshot_objects(workspace, &current_profile, &envelope.core.entries)?;
     Ok(envelope)
 }
 
@@ -1636,6 +2287,53 @@ fn recover_package_pull(workspace: &Workspace) -> Result<(), String> {
     cleanup_package_journal(workspace, &journal.recovery_dir)
 }
 
+fn prepare_package_backups(
+    workspace: &Workspace,
+    backups: &SafeDir,
+    operations: &mut [PackagePullOperation],
+) -> Result<(), String> {
+    for (index, operation) in operations.iter_mut().enumerate() {
+        if let Some(old @ SnapshotEntry::File { path, mode, .. }) = &operation.old {
+            let bytes = safe_path::read_regular(&workspace.root, path)
+                .map_err(|error| format!("cannot back up package path {path}: {error}"))?
+                .ok_or_else(|| format!("package path {path} disappeared before backup"))?;
+            if let SnapshotEntry::File {
+                sha256,
+                bytes: expected,
+                ..
+            } = old
+            {
+                if bytes.len() as u64 != *expected
+                    || format!("{:x}", Sha256::digest(&bytes)) != *sha256
+                {
+                    return Err(format!(
+                        "package path {path} changed after reconciliation; retry without concurrent edits"
+                    ));
+                }
+            }
+            let file = safe_path::open_regular(&workspace.root, path)
+                .map_err(|error| format!("cannot inspect package path {path}: {error}"))?
+                .ok_or_else(|| format!("package path {path} disappeared before backup"))?;
+            if portable_mode(
+                &file
+                    .metadata()
+                    .map_err(|error| format!("cannot inspect package path {path}: {error}"))?,
+            ) != *mode
+            {
+                return Err(format!(
+                    "package path {path} mode changed after reconciliation; retry without concurrent edits"
+                ));
+            }
+            let name = format!("{index:08x}.blob");
+            backups
+                .atomic_create(&name, &bytes, false, 0o600)
+                .map_err(|error| format!("cannot write package backup: {error}"))?;
+            operation.backup = Some(name);
+        }
+    }
+    Ok(())
+}
+
 fn apply_package_delta(
     workspace: &Workspace,
     previous: &PackageCheckout,
@@ -1713,18 +2411,13 @@ fn apply_package_delta(
     let backups = store
         .create_dir(&recovery_dir, 0o700)
         .map_err(|error| format!("cannot create package recovery directory: {error}"))?;
-    for (index, operation) in operations.iter_mut().enumerate() {
-        if let Some(SnapshotEntry::File { path, .. }) = &operation.old {
-            let bytes = safe_path::read_regular(&workspace.root, path)
-                .map_err(|error| format!("cannot back up package path {path}: {error}"))?
-                .ok_or_else(|| format!("package path {path} disappeared before backup"))?;
-            let name = format!("{index:08x}.blob");
-            backups
-                .atomic_create(&name, &bytes, false, 0o600)
-                .map_err(|error| format!("cannot write package backup: {error}"))?;
-            operation.backup = Some(name);
-        }
+    if let Err(error) = prepare_package_backups(workspace, &backups, &mut operations) {
+        drop(backups);
+        commands::discard_private_stage(&store, &recovery_dir)
+            .map_err(|cleanup| format!("{error}; package backup cleanup also failed: {cleanup}"))?;
+        return Err(error);
     }
+    drop(backups);
     let journal = PackagePullJournal {
         version: 1,
         recovery_dir: recovery_dir.clone(),
@@ -1747,12 +2440,24 @@ fn apply_package_delta(
             match &operation.new {
                 Some(entry @ SnapshotEntry::File { mode, .. }) => {
                     let bytes = package_object(workspace, entry)?;
+                    if !coordinate_matches(workspace, &operation.path, operation.old.as_ref())? {
+                        return Err(format!(
+                            "package path {} changed immediately before install; no local bytes were overwritten",
+                            operation.path
+                        ));
+                    }
                     root.atomic_write(&operation.path, &bytes, true, *mode)
                         .map_err(|error| {
                             format!("cannot update package path {}: {error}", operation.path)
                         })?;
                 }
                 None => {
+                    if !coordinate_matches(workspace, &operation.path, operation.old.as_ref())? {
+                        return Err(format!(
+                            "package path {} changed immediately before deletion; no local bytes were overwritten",
+                            operation.path
+                        ));
+                    }
                     root.remove_regular(&operation.path).map_err(|error| {
                         format!("cannot delete package path {}: {error}", operation.path)
                     })?;
@@ -1792,6 +2497,16 @@ fn verify_snapshot(
     names: Option<&BTreeSet<String>>,
 ) -> Result<VerifyReport, String> {
     let envelope = load_snapshot(workspace, profile)?;
+    dbmd(
+        &workspace.store,
+        &["validate", "--all"],
+        "package brain validation",
+    )?;
+    dbmd(
+        &workspace.store,
+        &["assets", "verify"],
+        "package brain asset verification",
+    )?;
     let mut missing = Vec::new();
     let mut corrupt = Vec::new();
     let mut bytes = 0_u64;
@@ -1902,6 +2617,8 @@ fn verify_snapshot(
                 name: receipt.name.clone(),
                 locator: receipt.locator.clone(),
                 remote: receipt.remote.clone(),
+                local_path: receipt.local_path.clone(),
+                verification: receipt.verification.clone(),
             })
             .collect::<Vec<_>>(),
         names,
@@ -2376,6 +3093,13 @@ pub fn pull_command(cfg: &Config, workspace_path: String, profile: String) {
             Some(sync.clone()),
         )
     });
+    let names = vault_names(cfg, &previous.brain);
+    write_vault_names(&workspace, &previous.brain, &names).unwrap_or_else(|error| {
+        fail(
+            &format!("brain pulled but vault custody could not be refreshed: {error}"),
+            Some(sync.clone()),
+        )
+    });
     let next = checkout_from_snapshot(&previous.brain, &envelope);
     let (changed, dirty) =
         apply_package_delta(&workspace, &previous, &next).unwrap_or_else(|error| {
@@ -2384,8 +3108,7 @@ pub fn pull_command(cfg: &Config, workspace_path: String, profile: String) {
                 Some(sync.clone()),
             )
         });
-    let names = local_vault_names(&workspace);
-    let report = verify_snapshot(&workspace, &profile, names.as_ref()).unwrap_or_else(|error| {
+    let report = verify_snapshot(&workspace, &profile, Some(&names)).unwrap_or_else(|error| {
         fail(
             &format!("package pull verification failed: {error}"),
             Some(sync.clone()),
@@ -2421,26 +3144,15 @@ pub fn pull_command(cfg: &Config, workspace_path: String, profile: String) {
     );
 }
 
-fn local_vault_names(workspace: &Workspace) -> Option<BTreeSet<String>> {
-    let bytes = safe_path::read_regular(&workspace.store, ".sevra-vault.json").ok()??;
-    let value: Value = serde_json::from_slice(&bytes).ok()?;
-    value.get("names")?.as_array().map(|values| {
-        values
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::to_string)
-            .collect()
-    })
-}
-
 pub fn verify_command(workspace_path: String, profile: String) {
     let workspace = discover_workspace(&workspace_path).unwrap_or_else(|error| fail(&error, None));
     // Verify the package profile as well as the generated snapshot: an agent
     // must never operate from a valid old snapshot plus an invalid new policy.
     read_profile(&workspace, &profile)
         .unwrap_or_else(|error| fail(&error, Some(json!({ "code": "package_profile_invalid" }))));
-    let names = local_vault_names(&workspace);
-    let report = verify_snapshot(&workspace, &profile, names.as_ref())
+    // Offline verification never turns a cached vault-name receipt into live
+    // custody evidence. Checkpoint, restore, and pull refresh names from Sevra.
+    let report = verify_snapshot(&workspace, &profile, None)
         .unwrap_or_else(|error| fail(&error, Some(json!({ "code": "package_verify_failed" }))));
     if !report.complete {
         fail(
@@ -2594,6 +3306,8 @@ mod tests {
             name: None,
             locator: None,
             remote: Some("origin".into()),
+            local_path: None,
+            verification: None,
         }];
         let first = dependency_receipts(&workspace, &specs, None);
 
@@ -2824,5 +3538,253 @@ mod tests {
             assert!(!store.join(PULL_JOURNAL).exists());
             assert!(!store.join(recovery_dir).exists());
         }
+    }
+
+    fn minimal_profile() -> ProfileSpec {
+        ProfileSpec {
+            include: vec![IncludeSpec {
+                path: "README.md".into(),
+                allow_unscanned_binary: false,
+            }],
+            exclude: Vec::new(),
+            allow_secret_named_paths: Vec::new(),
+            allow_unscanned_binary_paths: Vec::new(),
+            dependencies: Vec::new(),
+        }
+    }
+
+    fn dummy_file(path: &str) -> SnapshotEntry {
+        SnapshotEntry::File {
+            path: path.into(),
+            sha256: "a".repeat(64),
+            bytes: 1,
+            mode: 0o644,
+            asset: format!("{OBJECT_PREFIX}/{}.blob", "a".repeat(64)),
+            unscanned_binary: false,
+        }
+    }
+
+    fn dummy_envelope(entries: Vec<SnapshotEntry>) -> SnapshotEnvelope {
+        SnapshotEnvelope {
+            version: 1,
+            snapshot_root: "b".repeat(64),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            core: SnapshotCore {
+                version: 1,
+                profile: "working".into(),
+                profile_sha256: "c".repeat(64),
+                store: "db".into(),
+                entries,
+                dependencies: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn signed_snapshot_cannot_escape_paths_or_drop_profile_dependencies() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("db")).unwrap();
+        let workspace = Workspace {
+            root: temp.path().to_path_buf(),
+            store: temp.path().join("db"),
+            store_rel: "db".into(),
+        };
+        let profile = minimal_profile();
+        let hostile = dummy_envelope(vec![
+            dummy_file("README.md"),
+            dummy_file(".git/hooks/post-checkout"),
+        ]);
+        let error = validate_snapshot_against_profile(&workspace, &profile, &hostile).unwrap_err();
+        assert!(error.contains("reserved Git state"));
+
+        let mut dependent = profile;
+        dependent.dependencies.push(DependencySpec {
+            id: "required-runtime".into(),
+            kind: "path".into(),
+            required: true,
+            impact: "operational".into(),
+            path: Some("runtime".into()),
+            name: None,
+            locator: None,
+            remote: None,
+            local_path: None,
+            verification: Some(PathVerification::Directory {
+                allow_empty: false,
+                required: vec!["READY".into()],
+            }),
+        });
+        let dropped = dummy_envelope(vec![dummy_file("README.md")]);
+        let error =
+            validate_snapshot_against_profile(&workspace, &dependent, &dropped).unwrap_err();
+        assert!(error.contains("dependency closure"));
+    }
+
+    #[test]
+    fn dependency_readiness_rejects_placeholders_and_proves_private_closure() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join("db");
+        fs::create_dir_all(store.join("records/private")).unwrap();
+        fs::write(
+            store.join("DB.md"),
+            "---\ntype: db-md\nscope: test\nowner: test\n---\n",
+        )
+        .unwrap();
+        fs::write(store.join(".sevralocal"), "records/private/secret.md\n").unwrap();
+        fs::write(store.join("records/private/secret.md"), "private\n").unwrap();
+        fs::create_dir(temp.path().join("empty")).unwrap();
+        let workspace = Workspace {
+            root: temp.path().to_path_buf(),
+            store: store.clone(),
+            store_rel: "db".into(),
+        };
+        let policy_hash = format!(
+            "{:x}",
+            Sha256::digest(fs::read(store.join(".sevralocal")).unwrap())
+        );
+        let specs = vec![
+            DependencySpec {
+                id: "empty-default".into(),
+                kind: "path".into(),
+                required: false,
+                impact: "operational".into(),
+                path: Some("empty".into()),
+                name: None,
+                locator: None,
+                remote: None,
+                local_path: None,
+                verification: None,
+            },
+            DependencySpec {
+                id: "private".into(),
+                kind: "path".into(),
+                required: false,
+                impact: "semantic".into(),
+                path: Some("db/.sevralocal".into()),
+                name: None,
+                locator: None,
+                remote: None,
+                local_path: None,
+                verification: Some(PathVerification::SevralocalClosure {
+                    policy_sha256: policy_hash,
+                    minimum_entries: 1,
+                }),
+            },
+        ];
+        let first = dependency_receipts(&workspace, &specs, None);
+        assert_eq!(first[0].status, "unresolved");
+        assert_eq!(first[1].status, "resolved");
+
+        fs::remove_file(store.join("records/private/secret.md")).unwrap();
+        let second = dependency_receipts(&workspace, &specs, None);
+        assert_eq!(second[1].status, "unresolved");
+        assert!(second[1]
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("no restored regular file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_never_resolves_a_path_dependency() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("db")).unwrap();
+        symlink("missing", temp.path().join("runtime")).unwrap();
+        let workspace = Workspace {
+            root: temp.path().to_path_buf(),
+            store: temp.path().join("db"),
+            store_rel: "db".into(),
+        };
+        let specs = vec![DependencySpec {
+            id: "runtime".into(),
+            kind: "path".into(),
+            required: false,
+            impact: "operational".into(),
+            path: Some("runtime".into()),
+            name: None,
+            locator: None,
+            remote: None,
+            local_path: None,
+            verification: None,
+        }];
+        let receipt = dependency_receipts(&workspace, &specs, None);
+        assert_eq!(receipt[0].status, "unresolved");
+    }
+
+    #[test]
+    fn package_backup_rechecks_the_old_coordinate_after_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join("db");
+        fs::create_dir_all(&store).unwrap();
+        fs::write(temp.path().join("README.md"), b"edited\n").unwrap();
+        let workspace = Workspace {
+            root: temp.path().to_path_buf(),
+            store: store.clone(),
+            store_rel: "db".into(),
+        };
+        let old = SnapshotEntry::File {
+            path: "README.md".into(),
+            sha256: format!("{:x}", Sha256::digest(b"old\n")),
+            bytes: 4,
+            mode: 0o644,
+            asset: format!("{OBJECT_PREFIX}/{}.blob", "a".repeat(64)),
+            unscanned_binary: false,
+        };
+        let mut operations = vec![PackagePullOperation {
+            path: "README.md".into(),
+            old: Some(old),
+            new: None,
+            backup: None,
+        }];
+        let root = SafeDir::open(&store).unwrap();
+        let backups = root.create_dir("backups", 0o700).unwrap();
+        let error = prepare_package_backups(&workspace, &backups, &mut operations).unwrap_err();
+        assert!(error.contains("changed after reconciliation"));
+        assert_eq!(
+            fs::read(temp.path().join("README.md")).unwrap(),
+            b"edited\n"
+        );
+    }
+
+    #[test]
+    fn binary_exceptions_are_exact_and_generated_caches_are_never_packages() {
+        let mut profile = minimal_profile();
+        profile.include[0].path = ".claude/skills".into();
+        profile.allow_unscanned_binary_paths = vec![".claude/skills/report/reference.pdf".into()];
+        assert!(validate_profile(&profile).is_ok());
+        assert!(binary_allowed_for_path(
+            &profile,
+            ".claude/skills/report/reference.pdf"
+        ));
+        assert!(!binary_allowed_for_path(
+            &profile,
+            ".claude/skills/report/other.pdf"
+        ));
+        assert!(generated_cache_path(
+            ".claude/skills/video/__pycache__/core.cpython-312.pyc"
+        ));
+
+        profile.include[0].allow_unscanned_binary = true;
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("db")).unwrap();
+        fs::create_dir_all(temp.path().join(".claude/skills")).unwrap();
+        fs::write(temp.path().join(".claude/skills/SKILL.md"), "ok\n").unwrap();
+        let workspace = Workspace {
+            root: temp.path().to_path_buf(),
+            store: temp.path().join("db"),
+            store_rel: "db".into(),
+        };
+        let mut collected = Collected::default();
+        let error = collect_include(
+            &workspace,
+            &profile.include[0],
+            &[],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &mut collected,
+        )
+        .unwrap_err();
+        assert!(error.contains("directory-wide binary exception"));
     }
 }

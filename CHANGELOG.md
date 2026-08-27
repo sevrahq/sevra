@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+## 0.2.35 — 2026-08-27
+
+- Brain package restore and pull now re-derive every signed snapshot path and
+  dependency against the current profile, hard-reserve Git and brain-control
+  paths, rescan objects, and refuse omitted includes/dependencies before any
+  companion byte is installed.
+- Dependency readiness is evidence-based: no-follow non-empty path checks are
+  the default; profiles can require child coordinates, explicitly empty
+  directories, or a digest-bound `.sevralocal` closure whose every rule has
+  restored bytes. Secret checks can use live Brain Vault metadata or an
+  owner-only local compatibility path, while offline verify never trusts a
+  cached vault receipt.
+- Binary exceptions are exact-file declarations. Directory-wide opaque-byte
+  allowances and generated caches such as `__pycache__`/`.pyc` are refused.
+- Package checkpoint now shares the package lifecycle lock with pull. Pull
+  rechecks old coordinates during backup and immediately before replacement so
+  a concurrent local edit fails closed instead of being overwritten.
+- Package verification now includes full db.md validation and asset-byte
+  verification before reporting brain or operational readiness.
+
 ## 0.2.34 — 2026-08-26
 
 - Package restore now refuses before downloading a brain when the installed

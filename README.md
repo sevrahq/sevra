@@ -103,15 +103,17 @@ closure. Repeated checkpoints therefore stay stable.
     "working": {
       "include": [
         { "path": "CLAUDE.md" },
-        { "path": ".claude/skills", "allow_unscanned_binary": false },
+        { "path": ".claude/skills" },
         { "path": "scripts" }
       ],
       "exclude": ["scripts/__pycache__"],
       "allow_secret_named_paths": [],
+      "allow_unscanned_binary_paths": [".claude/skills/report/reference.pdf"],
       "dependencies": [
         { "id": "repository-history", "kind": "git", "path": ".", "remote": "origin" },
-        { "id": "private-brain-policy", "kind": "path", "path": "db/.sevralocal", "impact": "semantic" },
-        { "id": "provider-key", "kind": "secret", "name": "OPENAI_API_KEY" },
+        { "id": "runtime", "kind": "path", "path": "runtime", "verification": { "kind": "directory", "required": ["config.json"] } },
+        { "id": "private-brain-policy", "kind": "path", "path": "db/.sevralocal", "impact": "semantic", "verification": { "kind": "sevralocal_closure", "policy_sha256": "<sha256>", "minimum_entries": 1 } },
+        { "id": "provider-key", "kind": "secret", "name": "OPENAI_API_KEY", "local_path": ".secrets/openai.json", "verification": { "kind": "regular_file" } },
         { "id": "browser-session", "kind": "live", "locator": "signed-in Chrome profile" }
       ]
     }
@@ -122,8 +124,13 @@ closure. Repeated checkpoints therefore stay stable.
 Every field is closed-schema. Dependencies are optional unless `required` is
 set to `true`; required gaps stop checkpoint/verify. Dependency `impact`
 defaults to `operational`; use `semantic` only when its absence means the
-restored db.md brain itself is partial. Binary companions require
-an explicit per-include opt-in because their content cannot be secret-scanned.
+restored db.md brain itself is partial. Path dependencies reject symlinks and
+empty placeholders by default; profiles can require exact child coordinates,
+an explicitly empty directory, or a digest-bound `.sevralocal` policy whose
+every rule has restored bytes. Secret dependencies may resolve through the live
+Brain Vault check or a non-empty owner-only local compatibility file. Binary
+companions require exact `allow_unscanned_binary_paths` entries; directory-wide
+exceptions and generated caches are refused.
 
 `package checkpoint` reads companions without following symlinks, scans UTF-8
 content and names for credentials, records portable modes and contained
@@ -139,7 +146,8 @@ contract. The generated object directory must be Git-ignored.
 
 `package restore` requires a fresh workspace and builds the complete result in
 an unpredictable private sibling directory. It clones the brain into `db/`,
-verifies the signed snapshot root and every object, materializes files without
+verifies the signed snapshot root, re-derives every entry and dependency against
+the current profile, rescans every object, materializes files without
 overwriting divergent paths, recreates only contained symlinks, and writes a
 names-only vault receipt before atomically publishing the workspace without
 replacement. Any pre-publication failure removes the private stage, including
@@ -152,9 +160,10 @@ long cold restore emits bounded liveness updates on stderr while
 keeping JSON stdout machine-readable. It never retrieves secret values, runs a
 script, starts a service, logs into an account, or claims that a live dependency
 was restored. `package verify` repeats the byte, mode, symlink, object, profile,
-and dependency checks locally and exits nonzero only for corrupt/missing
+full db.md validation, asset, and dependency checks locally and exits nonzero only for corrupt/missing
 packaged state or unresolved dependencies marked `required`; optional gaps stay
-visible in the structured receipt. `complete` means the verified package is
+visible in the structured receipt. Offline verification never treats the cached
+vault-name receipt as live custody evidence. `complete` means the verified package is
 safe to use under its required closure; `brainComplete` additionally requires
 every semantic dependency, while `operationalReady` is strictest and is false
 until every declared optional live/path/external check is resolved too. The
@@ -167,9 +176,10 @@ new signed package snapshot with a private, mode-600 applied-snapshot receipt.
 Only file companions that still match their previous package coordinate are
 updated or deleted. Divergent local companions are preserved and named; a
 changed symlink topology requires a fresh restore. Updates use a private backup
-journal and roll back after an interruption before the applied receipt
-advances. A per-workspace OS lock serializes that entire lifecycle, including
-recovery and the underlying brain pull. The receipt, lock, and journal live as
+journal, recheck each old coordinate during backup and immediately before
+installation, and roll back after an interruption before the applied receipt
+advances. A per-workspace OS lock serializes checkpoint staging, pull, recovery,
+and the underlying brain operation. The receipt, lock, and journal live as
 dot-prefixed local state inside `db/`, never ride sync, and must be Git-ignored.
 Plain `sevra pull` remains semantic-store-only; agents maintaining a working
 closure use `sevra package pull`.
