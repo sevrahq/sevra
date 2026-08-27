@@ -76,7 +76,7 @@ fn package_help_exposes_the_complete_agent_workflow() {
 
 #[cfg(unix)]
 #[test]
-fn failed_package_restore_removes_its_private_stage() {
+fn package_restore_refuses_missing_relocate_before_creating_stage() {
     let bin = tempfile::tempdir().unwrap();
     fake_v2_dbmd(
         bin.path(),
@@ -98,6 +98,11 @@ fn failed_package_restore_removes_its_private_stage() {
         .output()
         .unwrap();
     assert!(!output.status.success(), "{}", all_output(&output));
+    assert!(
+        all_output(&output).contains("does not support incremental-baseline relocation"),
+        "{}",
+        all_output(&output)
+    );
     assert!(!destination.exists());
     assert!(std::fs::read_dir(parent.path()).unwrap().all(|entry| {
         !entry

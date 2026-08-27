@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.2.34 — 2026-08-26
+
+- Package restore now refuses before downloading a brain when the installed
+  db.md CLI lacks the required path-bound baseline relocation capability.
+- Failed package restore cleanup now safely unlinks package-owned symlinks
+  without following their targets, so a post-publication rollback removes the
+  complete private stage instead of stranding a multi-gigabyte checkout.
+
 - Brain packages: `package checkpoint`, `restore`, and `verify` add an explicit
   working-closure layer above a db.md store. Companion files become immutable
   content-addressed assets in the existing signed v2 history; unchanged hashes

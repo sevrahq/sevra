@@ -4812,7 +4812,15 @@ fn clear_private_stage(root: &crate::safe_path::SafeDir) -> Result<(), String> {
                     return Err("private stage directory disappeared during cleanup".to_string());
                 }
             }
-            crate::safe_path::EntryKind::Symlink | crate::safe_path::EntryKind::Other => {
+            crate::safe_path::EntryKind::Symlink => {
+                if !root
+                    .remove_symlink(name)
+                    .map_err(|error| format!("cannot remove private stage symlink: {error}"))?
+                {
+                    return Err("private stage symlink disappeared during cleanup".to_string());
+                }
+            }
+            crate::safe_path::EntryKind::Other => {
                 return Err("private stage gained an unsafe filesystem entry".to_string());
             }
         }
@@ -8375,6 +8383,29 @@ pub fn validate(dir: Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn private_stage_cleanup_unlinks_symlinks_without_following_targets() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp.path().join("stage");
+        let target = temp.path().join("outside");
+        fs::create_dir_all(stage.join("nested")).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(stage.join("nested/file"), b"package").unwrap();
+        fs::write(target.join("sentinel"), b"keep").unwrap();
+        symlink("../outside", stage.join("external-link")).unwrap();
+        symlink("nested", stage.join("internal-link")).unwrap();
+
+        let held = crate::safe_path::SafeDir::open(&stage).unwrap();
+        clear_private_stage(&held).unwrap();
+
+        assert!(fs::read_dir(&stage).unwrap().next().is_none());
+        assert_eq!(fs::read(target.join("sentinel")).unwrap(), b"keep");
+    }
 
     #[test]
     fn contained_rejects_escapes() {

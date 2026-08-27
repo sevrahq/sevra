@@ -624,6 +624,38 @@ mod platform {
             remove_regular_in_parent(parent, components.last().unwrap())
         }
 
+        pub(super) fn remove_symlink_relative(&self, rel: &str) -> io::Result<bool> {
+            let components = parts(rel)?;
+            let parent = match open_parent_from(self.file.try_clone()?, &components, false) {
+                Ok(parent) => parent,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            let leaf = components.last().unwrap();
+            let Some(mode) = leaf_kind(parent.as_raw_fd(), leaf)? else {
+                return Ok(false);
+            };
+            if mode & libc::S_IFMT != libc::S_IFLNK {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "refusing to remove a non-symlink rollback path",
+                ));
+            }
+            let leaf_c = c_name(leaf)?;
+            // SAFETY: the held parent descriptor and one-component name make
+            // unlinkat remove only the symlink entry. The target is never
+            // opened or followed, including if the leaf is raced.
+            if unsafe { libc::unlinkat(parent.as_raw_fd(), leaf_c.as_ptr(), 0) } != 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::NotFound {
+                    return Ok(false);
+                }
+                return Err(error);
+            }
+            parent.sync_all()?;
+            Ok(true)
+        }
+
         pub(super) fn remove_empty_dir(&self, rel: &str) -> io::Result<bool> {
             let components = parts(rel)?;
             let parent = match open_parent_from(self.file.try_clone()?, &components, false) {
@@ -1289,6 +1321,13 @@ mod platform {
             remove_regular(&self.path, rel)
         }
 
+        pub(super) fn remove_symlink_relative(&self, _rel: &str) -> io::Result<bool> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "secure symlink removal is unsupported on Windows",
+            ))
+        }
+
         pub(super) fn remove_empty_dir(&self, rel: &str) -> io::Result<bool> {
             let components = parts(rel)?;
             let (_held, parent) = match locked_parent(&self.path, &components, false) {
@@ -1763,6 +1802,13 @@ mod platform {
             ))
         }
 
+        pub(super) fn remove_symlink_relative(&self, _rel: &str) -> io::Result<bool> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "secure relative filesystem access is unsupported on this platform",
+            ))
+        }
+
         pub(super) fn remove_empty_dir(&self, _rel: &str) -> io::Result<bool> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -1928,6 +1974,10 @@ impl SafeDir {
 
     pub fn remove_regular(&self, rel: &str) -> io::Result<bool> {
         self.0.remove_regular_relative(rel)
+    }
+
+    pub fn remove_symlink(&self, rel: &str) -> io::Result<bool> {
+        self.0.remove_symlink_relative(rel)
     }
 
     pub fn remove_empty_dir(&self, rel: &str) -> io::Result<bool> {

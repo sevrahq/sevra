@@ -2050,6 +2050,30 @@ fn fail_restore_stage(
     }
 }
 
+fn require_dbmd_relocate_capability() -> Result<(), String> {
+    let output = Command::new("dbmd")
+        .args([
+            "sync",
+            "00000000000000000000000000",
+            "relocate",
+            "--help",
+        ])
+        .output()
+        .map_err(|error| {
+            format!(
+                "cannot run db.md CLI capability preflight (install the current dbmd release): {error}"
+            )
+        })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(
+            "installed db.md CLI does not support incremental-baseline relocation; update dbmd before package restore"
+                .into(),
+        )
+    }
+}
+
 pub fn restore_command(cfg: &Config, brain: String, workspace_path: String, profile: String) {
     valid_name(&profile, "profile name").unwrap_or_else(|error| fail(&error, None));
     let requested_input = PathBuf::from(&workspace_path);
@@ -2073,6 +2097,7 @@ pub fn restore_command(cfg: &Config, brain: String, workspace_path: String, prof
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
+    require_dbmd_relocate_capability().unwrap_or_else(|error| fail(&error, None));
     safe_path::ensure_dir(parent_input, 0o755).unwrap_or_else(|error| {
         fail(
             &format!("cannot securely create restore parent without following links: {error}"),
