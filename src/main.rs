@@ -446,8 +446,9 @@ enum PackageAction {
         #[arg(long, default_value = "working")]
         profile: String,
     },
-    /// Incrementally pull the brain and reconcile clean companion changes
-    /// against the private applied-package receipt.
+    /// Incrementally pull the brain and reconcile clean companion changes.
+    /// A receipt-less Git clone is adopted only after its hosted brain and
+    /// signed companion snapshot verify exactly.
     Pull {
         /// Existing package workspace containing its brain at `db/`
         workspace: String,

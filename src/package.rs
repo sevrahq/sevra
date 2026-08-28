@@ -2254,17 +2254,25 @@ fn validate_checkout(checkout: &PackageCheckout, workspace: &Workspace) -> Resul
     validate_symlink_closure(&checkout.entries)
 }
 
-fn read_package_checkout(workspace: &Workspace) -> Result<PackageCheckout, String> {
-    let bytes = safe_path::read_regular(&workspace.store, CHECKOUT_RECEIPT)
+fn read_package_checkout_optional(
+    workspace: &Workspace,
+) -> Result<Option<PackageCheckout>, String> {
+    let Some(bytes) = safe_path::read_regular(&workspace.store, CHECKOUT_RECEIPT)
         .map_err(|error| format!("cannot read package checkout receipt: {error}"))?
-        .ok_or_else(|| {
-            "workspace has no package checkout receipt; use a fresh `sevra package restore` or verify an exact package before adopting this lifecycle"
-                .to_string()
-        })?;
+    else {
+        return Ok(None);
+    };
     let checkout: PackageCheckout = serde_json::from_slice(&bytes)
         .map_err(|error| format!("package checkout receipt is invalid: {error}"))?;
     validate_checkout(&checkout, workspace)?;
-    Ok(checkout)
+    Ok(Some(checkout))
+}
+
+fn read_package_checkout(workspace: &Workspace) -> Result<PackageCheckout, String> {
+    read_package_checkout_optional(workspace)?.ok_or_else(|| {
+        "workspace has no package checkout receipt; run `sevra package pull <workspace>` to hydrate and adopt an exact Git clone, or use `sevra package restore` for a fresh hosted-only recovery"
+            .to_string()
+    })
 }
 
 fn write_package_checkout(workspace: &Workspace, checkout: &PackageCheckout) -> Result<(), String> {
@@ -2322,6 +2330,26 @@ fn path_absent(workspace: &Workspace, path: &str) -> Result<bool, String> {
         Err(error) => Err(format!("cannot inspect package path {path}: {error}")),
         Ok(_) => Ok(false),
     }
+}
+
+fn verify_adoption_companions(
+    workspace: &Workspace,
+    envelope: &SnapshotEnvelope,
+) -> Result<(), String> {
+    let mut mismatches = Vec::new();
+    for entry in &envelope.core.entries {
+        if !entry_matches(workspace, entry)? {
+            mismatches.push(entry.path().to_string());
+        }
+    }
+    if mismatches.is_empty() {
+        return Ok(());
+    }
+    mismatches.truncate(100);
+    Err(format!(
+        "receipt-less package adoption requires every signed companion to match exactly; divergent or missing paths: {}. Restore into a fresh workspace or make the Git checkout match its committed package snapshot, then retry",
+        mismatches.join(", ")
+    ))
 }
 
 fn coordinate_matches(
@@ -3270,29 +3298,53 @@ pub fn pull_command(cfg: &Config, workspace_path: String, profile: String) {
             Some(json!({ "code": "package_pull_recovery_failed" })),
         )
     });
-    let previous = read_package_checkout(&workspace).unwrap_or_else(|error| {
+    let previous = read_package_checkout_optional(&workspace).unwrap_or_else(|error| {
         fail(
             &error,
-            Some(json!({ "code": "package_checkout_receipt_missing" })),
+            Some(json!({ "code": "package_checkout_receipt_invalid" })),
         )
     });
-    if previous.profile != profile {
-        fail(
-            &format!(
-                "package checkout tracks profile `{}`, not `{profile}`",
-                previous.profile
-            ),
-            None,
-        );
-    }
+    let (brain, adopting) = match previous.as_ref() {
+        Some(previous) => {
+            if previous.profile != profile {
+                fail(
+                    &format!(
+                        "package checkout tracks profile `{}`, not `{profile}`",
+                        previous.profile
+                    ),
+                    None,
+                );
+            }
+            (previous.brain.clone(), false)
+        }
+        None => {
+            let brain = commands::read_v2_checkout_brain(&workspace.store)
+                .unwrap_or_else(|error| fail(&error, None))
+                .unwrap_or_else(|| {
+                    fail(
+                        "receipt-less package adoption requires the tracked `.sevra-v2.json` brain identity; use `sevra package restore` when no checkout identity exists",
+                        Some(json!({ "code": "package_adoption_identity_missing" })),
+                    )
+                });
+            (brain, true)
+        }
+    };
     let (progress_done, progress) = progress_heartbeat(
-        "sevra: pulling the verified brain delta and reconciling its signed working closure",
-        "sevra: still pulling and verifying the incremental working closure; no scripts or services are being started",
+        if adopting {
+            "sevra: hydrating and verifying this receipt-less checkout before adopting its signed working closure"
+        } else {
+            "sevra: pulling the verified brain delta and reconciling its signed working closure"
+        },
+        if adopting {
+            "sevra: still hydrating the verified brain and large assets; no companion is adopted and no scripts or services are being started"
+        } else {
+            "sevra: still pulling and verifying the incremental working closure; no scripts or services are being started"
+        },
     );
     let mut sync = match commands::try_run_dbmd_sync(
         cfg,
         &[
-            previous.brain.clone(),
+            brain,
             "--pull-only".into(),
             "--dir".into(),
             workspace.store.to_string_lossy().into_owned(),
@@ -3308,14 +3360,46 @@ pub fn pull_command(cfg: &Config, workspace_path: String, profile: String) {
             Some(sync.clone()),
         )
     });
-    let names = vault_names(cfg, &previous.brain);
-    write_vault_names(&workspace, &previous.brain, &names).unwrap_or_else(|error| {
+    let canonical_brain = sync
+        .get("brain")
+        .or_else(|| sync.get("brain_id"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            fail(
+                "dbmd sync omitted the canonical brain identity",
+                Some(sync.clone()),
+            )
+        })
+        .to_string();
+    let next = checkout_from_snapshot(&canonical_brain, &envelope);
+    let previous = match previous {
+        Some(previous) => previous,
+        None => {
+            verify_adoption_companions(&workspace, &envelope).unwrap_or_else(|error| {
+                fail(
+                    &error,
+                    Some(json!({
+                        "code": "package_adoption_companion_mismatch",
+                        "sync": sync,
+                    })),
+                )
+            });
+            write_package_checkout(&workspace, &next).unwrap_or_else(|error| {
+                fail(
+                    &format!("verified package adoption could not record its receipt: {error}"),
+                    Some(json!({ "code": "package_adoption_receipt_failed", "sync": sync })),
+                )
+            });
+            next.clone()
+        }
+    };
+    let names = vault_names(cfg, &canonical_brain);
+    write_vault_names(&workspace, &canonical_brain, &names).unwrap_or_else(|error| {
         fail(
             &format!("brain pulled but vault custody could not be refreshed: {error}"),
             Some(sync.clone()),
         )
     });
-    let next = checkout_from_snapshot(&previous.brain, &envelope);
     let (changed, dirty) =
         apply_package_delta(&workspace, &previous, &next).unwrap_or_else(|error| {
             fail(
@@ -3336,6 +3420,7 @@ pub fn pull_command(cfg: &Config, workspace_path: String, profile: String) {
         );
         object.insert("packageChanges".into(), json!(changed));
         object.insert("packageLocalDirty".into(), json!(dirty));
+        object.insert("packageAdopted".into(), json!(adopting));
         object.insert("workspace".into(), json!(workspace_path));
     }
     if !report.complete {
@@ -3347,7 +3432,8 @@ pub fn pull_command(cfg: &Config, workspace_path: String, profile: String) {
     stop_progress(progress_done, progress);
     out_layout(
         &format!(
-            "pulled brain and package {} → {}\ncompanions: {} changed, {} locally divergent; brain completeness {}; operational readiness {}",
+            "{} brain and package {} → {}\ncompanions: {} changed, {} locally divergent; brain completeness {}; operational readiness {}",
+            if adopting { "hydrated and adopted" } else { "pulled" },
             terminal_safe(&profile),
             terminal_safe(&workspace_path),
             changed.len(),
@@ -3991,6 +4077,33 @@ mod tests {
             fs::read(temp.path().join("README.md")).unwrap(),
             b"edited\n"
         );
+    }
+
+    #[test]
+    fn receiptless_adoption_requires_every_signed_companion_to_match() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("db")).unwrap();
+        fs::write(temp.path().join("README.md"), b"signed\n").unwrap();
+        let workspace = Workspace {
+            root: temp.path().to_path_buf(),
+            store: temp.path().join("db"),
+            store_rel: "db".into(),
+        };
+        let entry = SnapshotEntry::File {
+            path: "README.md".into(),
+            sha256: format!("{:x}", Sha256::digest(b"signed\n")),
+            bytes: 7,
+            mode: 0o644,
+            asset: format!("{OBJECT_PREFIX}/{}.blob", "a".repeat(64)),
+            unscanned_binary: false,
+        };
+        let envelope = dummy_envelope(vec![entry]);
+
+        verify_adoption_companions(&workspace, &envelope).unwrap();
+        fs::write(temp.path().join("README.md"), b"local edit\n").unwrap();
+        let error = verify_adoption_companions(&workspace, &envelope).unwrap_err();
+        assert!(error.contains("README.md"));
+        assert!(error.contains("match exactly"));
     }
 
     #[test]

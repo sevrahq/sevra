@@ -5422,6 +5422,10 @@ fn read_v2_checkout(root: &Path) -> Result<Option<V2Checkout>, String> {
     Ok(Some(value))
 }
 
+pub(crate) fn read_v2_checkout_brain(root: &Path) -> Result<Option<String>, String> {
+    read_v2_checkout(root).map(|checkout| checkout.map(|value| value.brain))
+}
+
 fn clone_brain_v2(cfg: &Config, brain: &str, dir: Option<String>) {
     let metadata = ensure_ok(
         request(

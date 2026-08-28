@@ -66,7 +66,7 @@ sevra package checkpoint <workspace> --brain <brain> [--profile working]
 sevra package restore <brain> <fresh-workspace> [--profile working]
                                                     clone the brain + restore companions safely
 sevra package pull <workspace> [--profile working]
-                                                    incrementally reconcile brain + companions
+                                                    hydrate/adopt an exact Git clone, then reconcile incrementally
 sevra package verify <workspace> [--profile working]
                                                     verify closure locally; start nothing
 sevra conflicts [db-dir] [--prune] [--all]       inspect/prune private v2 conflict bundles
@@ -181,9 +181,19 @@ is suppressed. An active policy must also have a semantic
 `sevralocal_closure` dependency so `brainComplete` cannot become true merely
 because private content was intentionally withheld.
 
-`package pull` is the ongoing operation for a restored working package. It
-first performs the ordinary verified incremental db.md pull, then compares the
-new signed package snapshot with a private, mode-600 applied-snapshot receipt.
+`package pull` is also the native hydration command for an exact Git clone.
+When the private applied-package receipt is absent but the tracked
+`.sevra-v2.json` identity is present, it first delegates the ordinary verified
+incremental pull to db.md (dbmd 0.8.38+ for hosted assets above 512 MiB), then
+requires every companion to match the signed package snapshot exactly before
+adopting the lifecycle and writing the mode-600 receipt. A divergent or missing
+companion fails closed and is never overwritten. The same command can therefore
+turn a fresh private-repository clone into the complete working brain without a
+temporary export, manual asset copy, or reset of the incremental baseline.
+
+For an established package checkout, `package pull` first performs the ordinary
+verified incremental db.md pull, then compares the new signed package snapshot
+with its private applied-snapshot receipt.
 Only file companions that still match their previous package coordinate are
 updated or deleted. Divergent local companions are preserved and named; a
 changed symlink topology requires a fresh restore. Updates use a private backup
