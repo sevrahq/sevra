@@ -144,7 +144,8 @@ commit. If `DB.md` changes with content, dbmd first lands and verifies the
 contract-only head, then recomputes and commits the remaining tree under that
 contract. The generated object directory must be Git-ignored.
 
-`package restore` requires a fresh workspace and builds the complete result in
+`package restore` requires dbmd 0.8.37 or newer, requires a fresh workspace,
+and builds the complete result in
 an unpredictable private sibling directory. It clones the brain into `db/`,
 verifies the signed snapshot root, re-derives every entry and dependency against
 the current profile, rescans every object, materializes files without
@@ -169,6 +170,16 @@ every semantic dependency, while `operationalReady` is strictest and is false
 until every declared optional live/path/external check is resolved too. The
 receipt lists `semanticUnresolvedDependencies` explicitly, so a hosted-only
 copy cannot hide intentionally withheld brain content behind package success.
+When `.sevralocal` deliberately withholds brain paths, checkpoint expands it
+against the securely opened regular-file closure and signs only sorted,
+domain-separated path commitments into the package snapshot. The source policy,
+private bytes, and unreferenced path spellings do not ride. Restore supplies
+that commitment manifest to db.md's projection-aware semantic and asset gates
+over bounded stdin. Omitted targets remain explicitly unresolved; no undeclared
+broken link, missing byte, corrupt present asset, stale index, or schema error
+is suppressed. An active policy must also have a semantic
+`sevralocal_closure` dependency so `brainComplete` cannot become true merely
+because private content was intentionally withheld.
 
 `package pull` is the ongoing operation for a restored working package. It
 first performs the ordinary verified incremental db.md pull, then compares the

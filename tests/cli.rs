@@ -113,6 +113,45 @@ fn package_restore_refuses_missing_relocate_before_creating_stage() {
     }));
 }
 
+#[cfg(unix)]
+#[test]
+fn package_restore_refuses_missing_projection_support_before_creating_stage() {
+    let bin = tempfile::tempdir().unwrap();
+    fake_v2_dbmd(
+        bin.path(),
+        "#!/bin/sh\nif [ \"$1\" = sync ]; then exit 0; fi\nprintf '%s\\n' '--projection-excludes <FILE>'\nexit 0\n",
+    );
+    let parent = tempfile::tempdir().unwrap();
+    let destination = parent.path().join("restored");
+    let output = sevra()
+        .args([
+            "package",
+            "restore",
+            "brain-slug",
+            destination.to_str().unwrap(),
+            "--json",
+        ])
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.path().display()))
+        .env("SEVRA_HUB_URL", "https://hub.example")
+        .env("SEVRA_API_KEY", "stored-secret")
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{}", all_output(&output));
+    assert!(
+        all_output(&output).contains("projection-aware semantic validation"),
+        "{}",
+        all_output(&output)
+    );
+    assert!(!destination.exists());
+    assert!(std::fs::read_dir(parent.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".sevra-restore-")
+    }));
+}
+
 #[test]
 fn resolve_requires_one_explicit_reviewed_choice() {
     sevra()

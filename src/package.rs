@@ -10,9 +10,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use globset::GlobBuilder;
 use serde::{Deserialize, Serialize};
@@ -174,6 +174,16 @@ struct SnapshotCore {
     store: String,
     entries: Vec<SnapshotEntry>,
     dependencies: Vec<DependencyReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    projection: Option<ProjectionManifest>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ProjectionManifest {
+    version: u8,
+    algorithm: String,
+    path_hashes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1115,6 +1125,91 @@ fn collect_regular_store_paths(
     Ok(())
 }
 
+fn projection_path_sha256(path: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"dbmd-projection-path-v1\0");
+    digest.update(path.as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+fn build_projection_manifest(
+    workspace: &Workspace,
+) -> Result<Option<(ProjectionManifest, String)>, String> {
+    let Some(scope) = crate::local::load(&workspace.store)? else {
+        return Ok(None);
+    };
+    if !scope.active() {
+        return Ok(None);
+    }
+    if scope.keeps_home(SNAPSHOT_RECORD) || scope.keeps_home(&format!("{OBJECT_PREFIX}/probe.blob"))
+    {
+        return Err(
+            ".sevralocal cannot cover Sevra package snapshot records or immutable objects".into(),
+        );
+    }
+    let root = SafeDir::open(&workspace.store)
+        .map_err(|error| format!("cannot securely open private brain store: {error}"))?;
+    let mut present = Vec::new();
+    collect_regular_store_paths(&root, "", &mut present)?;
+    let path_hashes = present
+        .into_iter()
+        .filter(|path| path != crate::local::FILE_NAME && scope.keeps_home(path))
+        .map(|path| projection_path_sha256(&path))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if path_hashes.is_empty() {
+        return Err("active .sevralocal policy has no private regular-file closure".into());
+    }
+    if path_hashes.len() > MAX_FILES {
+        return Err(format!(
+            "private brain projection exceeds the {MAX_FILES}-path package bound"
+        ));
+    }
+    let policy_sha256 = format!("{:x}", Sha256::digest(scope.raw().as_bytes()));
+    Ok(Some((
+        ProjectionManifest {
+            version: 1,
+            algorithm: "sha256".into(),
+            path_hashes,
+        },
+        policy_sha256,
+    )))
+}
+
+fn validate_projection_manifest(manifest: &ProjectionManifest) -> Result<(), String> {
+    if manifest.version != 1
+        || manifest.algorithm != "sha256"
+        || manifest.path_hashes.len() > MAX_FILES
+    {
+        return Err("package projection manifest has an unsupported format".into());
+    }
+    let mut prior: Option<&str> = None;
+    for hash in &manifest.path_hashes {
+        if hash.len() != 64
+            || !hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || prior.is_some_and(|value| value >= hash.as_str())
+        {
+            return Err(
+                "package projection manifest commitments are not canonical lowercase SHA-256"
+                    .into(),
+            );
+        }
+        prior = Some(hash);
+    }
+    if ["DB.md", "assets.jsonl"].into_iter().any(|path| {
+        manifest
+            .path_hashes
+            .binary_search(&projection_path_sha256(path))
+            .is_ok()
+    }) {
+        return Err("package projection manifest covers required hosted brain metadata".into());
+    }
+    Ok(())
+}
+
 fn verify_sevralocal_closure(
     workspace: &Workspace,
     dependency_path: &str,
@@ -1152,6 +1247,7 @@ fn verify_sevralocal_closure(
         .map_err(|error| format!("cannot securely open private brain store: {error}"))?;
     let mut present = Vec::new();
     collect_regular_store_paths(&root, "", &mut present)?;
+    present.retain(|path| path != crate::local::FILE_NAME);
     for (line, entry) in entries {
         let matcher = GlobBuilder::new(entry)
             .backslash_escape(true)
@@ -1444,12 +1540,38 @@ fn vault_names(cfg: &Config, brain: &str) -> BTreeSet<String> {
 }
 
 fn dbmd(store: &Path, args: &[&str], what: &str) -> Result<Value, String> {
-    let output = Command::new("dbmd")
-        .arg("--json")
-        .args(args)
-        .current_dir(store)
-        .output()
-        .map_err(|error| format!("cannot run dbmd for {what}: {error}"))?;
+    dbmd_with_input(store, args, what, None)
+}
+
+fn dbmd_with_input(
+    store: &Path,
+    args: &[&str],
+    what: &str,
+    input: Option<&[u8]>,
+) -> Result<Value, String> {
+    let mut command = Command::new("dbmd");
+    command.arg("--json").args(args).current_dir(store);
+    let output = if let Some(input) = input {
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("cannot run dbmd for {what}: {error}"))?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| format!("cannot open dbmd stdin for {what}"))?
+            .write_all(input)
+            .map_err(|error| format!("cannot supply dbmd projection for {what}: {error}"))?;
+        child
+            .wait_with_output()
+            .map_err(|error| format!("cannot wait for dbmd {what}: {error}"))?
+    } else {
+        command
+            .output()
+            .map_err(|error| format!("cannot run dbmd for {what}: {error}"))?
+    };
     if !output.status.success() {
         return Err(format!(
             "dbmd {what} failed: {}",
@@ -1590,7 +1712,41 @@ fn stage_snapshot(
     }
     let entries = collected.entries.into_values().collect::<Vec<_>>();
     validate_symlink_closure(&entries)?;
+    let projection_build = build_projection_manifest(workspace)?;
+    let expected_policy_path = format!("{}/{}", workspace.store_rel, crate::local::FILE_NAME);
+    let private_dependency = projection_build
+        .as_ref()
+        .and_then(|(_, actual_policy_sha256)| {
+            profile.dependencies.iter().find(|dependency| {
+                dependency.kind == "path"
+                    && dependency.impact == "semantic"
+                    && dependency.path.as_deref() == Some(expected_policy_path.as_str())
+                    && matches!(
+                        dependency.verification.as_ref(),
+                        Some(PathVerification::SevralocalClosure { policy_sha256, .. })
+                            if policy_sha256.eq_ignore_ascii_case(actual_policy_sha256)
+                    )
+            })
+        });
+    if projection_build.is_some() && private_dependency.is_none() {
+        return Err(
+            "an active .sevralocal requires a matching semantic sevralocal_closure dependency in the package profile"
+                .into(),
+        );
+    }
     let dependencies = dependency_receipts(workspace, &profile.dependencies, Some(names));
+    if let Some(private_dependency) = private_dependency {
+        if !dependencies
+            .iter()
+            .any(|receipt| receipt.id == private_dependency.id && receipt.status == "resolved")
+        {
+            return Err(
+                "private brain policy changed while the package projection was being checkpointed"
+                    .into(),
+            );
+        }
+    }
+    let projection = projection_build.map(|(manifest, _)| manifest);
     let required_unresolved: Vec<&str> = dependencies
         .iter()
         .filter(|dependency| dependency.required && dependency.status != "resolved")
@@ -1609,6 +1765,7 @@ fn stage_snapshot(
         store: workspace.store_rel.clone(),
         entries,
         dependencies,
+        projection,
     };
     let snapshot_root = canonical_hash(&core)?;
     let prior_root = existing_snapshot_root(workspace)?;
@@ -2006,6 +2163,9 @@ fn load_snapshot(workspace: &Workspace, profile: &str) -> Result<SnapshotEnvelop
     let root = canonical_hash(&envelope.core)?;
     if root != envelope.snapshot_root {
         return Err("package snapshot root does not match its canonical contents".into());
+    }
+    if let Some(projection) = envelope.core.projection.as_ref() {
+        validate_projection_manifest(projection)?;
     }
     let mut paths = BTreeSet::new();
     for entry in &envelope.core.entries {
@@ -2497,16 +2657,55 @@ fn verify_snapshot(
     names: Option<&BTreeSet<String>>,
 ) -> Result<VerifyReport, String> {
     let envelope = load_snapshot(workspace, profile)?;
-    dbmd(
-        &workspace.store,
-        &["validate", "--all"],
-        "package brain validation",
-    )?;
-    dbmd(
-        &workspace.store,
-        &["assets", "verify"],
-        "package brain asset verification",
-    )?;
+    let projection_policy = safe_path::open_regular(&workspace.store, ".sevralocal")
+        .map_err(|error| format!("cannot inspect package projection policy: {error}"))?;
+    let projection_manifest = envelope
+        .core
+        .projection
+        .as_ref()
+        .map(serde_json::to_vec)
+        .transpose()
+        .map_err(|error| format!("cannot encode package projection manifest: {error}"))?;
+    if projection_policy.is_some() {
+        dbmd(
+            &workspace.store,
+            &["validate", "--all", "--projection-excludes", ".sevralocal"],
+            "package brain projection validation",
+        )?;
+    } else if let Some(manifest) = projection_manifest.as_deref() {
+        dbmd_with_input(
+            &workspace.store,
+            &["validate", "--all", "--projection-manifest", "-"],
+            "package brain committed-projection validation",
+            Some(manifest),
+        )?;
+    } else {
+        dbmd(
+            &workspace.store,
+            &["validate", "--all"],
+            "package brain validation",
+        )?;
+    }
+    if projection_policy.is_some() {
+        dbmd(
+            &workspace.store,
+            &["assets", "verify", "--projection-excludes", ".sevralocal"],
+            "package brain projection asset verification",
+        )?;
+    } else if let Some(manifest) = projection_manifest.as_deref() {
+        dbmd_with_input(
+            &workspace.store,
+            &["assets", "verify", "--projection-manifest", "-"],
+            "package brain committed-projection asset verification",
+            Some(manifest),
+        )?;
+    } else {
+        dbmd(
+            &workspace.store,
+            &["assets", "verify"],
+            "package brain asset verification",
+        )?;
+    }
     let mut missing = Vec::new();
     let mut corrupt = Vec::new();
     let mut bytes = 0_u64;
@@ -2767,28 +2966,44 @@ fn fail_restore_stage(
     }
 }
 
-fn require_dbmd_relocate_capability() -> Result<(), String> {
-    let output = Command::new("dbmd")
-        .args([
-            "sync",
-            "00000000000000000000000000",
-            "relocate",
-            "--help",
-        ])
-        .output()
-        .map_err(|error| {
-            format!(
-                "cannot run db.md CLI capability preflight (install the current dbmd release): {error}"
-            )
-        })?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(
-            "installed db.md CLI does not support incremental-baseline relocation; update dbmd before package restore"
-                .into(),
+fn dbmd_help(args: &[&str], capability: &str) -> Result<Vec<u8>, String> {
+    let output = Command::new("dbmd").args(args).output().map_err(|error| {
+        format!(
+            "cannot run db.md CLI capability preflight (install the current dbmd release): {error}"
         )
+    })?;
+    if !output.status.success() {
+        return Err(format!(
+            "installed db.md CLI does not support {capability}; update dbmd before package restore"
+        ));
     }
+    Ok(output.stdout)
+}
+
+fn require_dbmd_package_capabilities() -> Result<(), String> {
+    dbmd_help(
+        &["sync", "00000000000000000000000000", "relocate", "--help"],
+        "incremental-baseline relocation",
+    )?;
+    for (args, capability) in [
+        (
+            &["validate", "--help"][..],
+            "projection-aware semantic validation",
+        ),
+        (
+            &["assets", "verify", "--help"][..],
+            "projection-aware asset verification",
+        ),
+    ] {
+        let help = dbmd_help(args, capability)?;
+        let help = String::from_utf8_lossy(&help);
+        if !help.contains("--projection-excludes") || !help.contains("--projection-manifest") {
+            return Err(format!(
+                "installed db.md CLI does not support {capability}; update dbmd before package restore"
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn restore_command(cfg: &Config, brain: String, workspace_path: String, profile: String) {
@@ -2814,7 +3029,7 @@ pub fn restore_command(cfg: &Config, brain: String, workspace_path: String, prof
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    require_dbmd_relocate_capability().unwrap_or_else(|error| fail(&error, None));
+    require_dbmd_package_capabilities().unwrap_or_else(|error| fail(&error, None));
     safe_path::ensure_dir(parent_input, 0o755).unwrap_or_else(|error| {
         fail(
             &format!("cannot securely create restore parent without following links: {error}"),
@@ -3232,6 +3447,7 @@ mod tests {
             store: "db".into(),
             entries: Vec::new(),
             dependencies: Vec::new(),
+            projection: None,
         };
         let first = canonical_hash(&core).unwrap();
         let envelope = SnapshotEnvelope {
@@ -3241,6 +3457,35 @@ mod tests {
             core,
         };
         assert_eq!(canonical_hash(&envelope.core).unwrap(), first);
+    }
+
+    #[test]
+    fn private_projection_is_a_sorted_path_commitment_not_a_policy_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join("db");
+        fs::create_dir_all(store.join("records/private")).unwrap();
+        fs::write(store.join(".sevralocal"), "records/private/**\n").unwrap();
+        fs::write(store.join("records/private/secret.md"), "private\n").unwrap();
+        let workspace = Workspace {
+            root: temp.path().to_path_buf(),
+            store,
+            store_rel: "db".into(),
+        };
+        let (manifest, policy_sha256) = build_projection_manifest(&workspace).unwrap().unwrap();
+        assert_eq!(manifest.version, 1);
+        assert_eq!(manifest.algorithm, "sha256");
+        assert_eq!(
+            manifest.path_hashes,
+            vec![projection_path_sha256("records/private/secret.md")]
+        );
+        let encoded = serde_json::to_string(&manifest).unwrap();
+        assert!(!encoded.contains("secret.md"));
+        assert!(!encoded.contains("records/private"));
+        assert_eq!(
+            policy_sha256,
+            format!("{:x}", Sha256::digest(b"records/private/**\n"))
+        );
+        validate_projection_manifest(&manifest).unwrap();
     }
 
     #[test]
@@ -3576,6 +3821,7 @@ mod tests {
                 store: "db".into(),
                 entries,
                 dependencies: Vec::new(),
+                projection: None,
             },
         }
     }

@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+## 0.2.36 — 2026-08-27
+
+- Package verification now delegates intentional partial-store semantics to
+  db.md's explicit projection contract. Checkpoint expands `.sevralocal`
+  against the no-follow regular-file closure and signs only sorted,
+  domain-separated SHA-256 path commitments into the package snapshot. A
+  hosted restore verifies those commitments through bounded stdin, without
+  publishing the private source policy or unreferenced path spellings. Both
+  the full semantic sweep and deep asset verification use that same receipt:
+  declared omissions remain visible, while unlisted
+  broken links, missing assets, corruption, stale indexes, and every unrelated
+  error still block restore, pull, checkpoint, and verify.
+- Cold restore capability-checks dbmd's projection-aware validation and asset
+  verification (including committed manifests), plus baseline relocation,
+  before downloading the brain. This
+  requires dbmd 0.8.37+ and prevents a large restore from failing only after
+  publication because an older local toolkit cannot validate its projection.
+
 ## 0.2.35 — 2026-08-27
 
 - Brain package restore and pull now re-derive every signed snapshot path and
