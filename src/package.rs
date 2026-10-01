@@ -347,7 +347,7 @@ fn valid_name(raw: &str, what: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn is_canonical_brain_id(raw: &str) -> bool {
+pub(crate) fn is_canonical_brain_id(raw: &str) -> bool {
     raw.len() == 26
         && raw.bytes().all(|byte| {
             byte.is_ascii_digit()

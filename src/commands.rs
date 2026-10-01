@@ -2426,12 +2426,13 @@ fn push_v2(cfg: &Config, dir: &str, brain: &str, options: &PushOptions<'_>) {
     let mut result = run_dbmd_sync(cfg, &sync_args, Path::new(dir));
     let canonical = std::fs::canonicalize(dir)
         .unwrap_or_else(|error| fail(&format!("cannot record v2 checkout: {error}"), None));
-    let canonical_brain = result
-        .get("brain_id")
-        .or_else(|| result.get("brain"))
-        .and_then(Value::as_str)
-        .unwrap_or(brain);
-    write_v2_checkout(&canonical, canonical_brain).unwrap_or_else(|error| {
+    let recorded = read_v2_checkout(&canonical).ok().flatten();
+    let canonical_brain = pushed_checkout_identity(
+        &result,
+        recorded.as_ref().map(|checkout| checkout.brain.as_str()),
+        brain,
+    );
+    write_v2_checkout(&canonical, &canonical_brain).unwrap_or_else(|error| {
         fail(
             &format!("push committed but {V2_CHECKOUT_FILE} could not be written: {error}"),
             Some(result.clone()),
@@ -5422,6 +5423,26 @@ fn read_v2_checkout(root: &Path) -> Result<Option<V2Checkout>, String> {
     Ok(Some(value))
 }
 
+/// The identity a checkout records after a push: the canonical brain ID dbmd
+/// reports, never the alias the caller passed, because an alias can be rebound
+/// to another brain. dbmd before 0.14.1 omitted the ID when a push changed
+/// nothing; keep an already recorded canonical ID then rather than downgrade
+/// it to the alias.
+fn pushed_checkout_identity(result: &Value, recorded: Option<&str>, requested: &str) -> String {
+    if let Some(reported) = result
+        .get("brain_id")
+        .or_else(|| result.get("brain"))
+        .and_then(Value::as_str)
+        .filter(|reported| !reported.is_empty())
+    {
+        return reported.to_string();
+    }
+    match recorded {
+        Some(recorded) if crate::package::is_canonical_brain_id(recorded) => recorded.to_string(),
+        _ => requested.to_string(),
+    }
+}
+
 pub(crate) fn read_v2_checkout_brain(root: &Path) -> Result<Option<String>, String> {
     read_v2_checkout(root).map(|checkout| checkout.map(|value| value.brain))
 }
@@ -8387,6 +8408,26 @@ pub fn validate(dir: Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_push_records_the_canonical_brain_id_never_the_alias() {
+        let id = "01m0qwbgagah002c4qg7x1xfcd";
+        let alias = "command-center";
+        // Committed receipts, and unchanged ones from dbmd 0.14.1, name the ID.
+        let committed = json!({ "outcome": "committed", "brain_id": id });
+        assert_eq!(pushed_checkout_identity(&committed, Some(alias), alias), id);
+        assert_eq!(pushed_checkout_identity(&committed, None, alias), id);
+        // Older dbmd omitted the ID when nothing changed: keep the recorded ID
+        // instead of flipping the tracked binding back to the alias.
+        let unchanged = json!({ "outcome": "no_change", "sync_status": "synced" });
+        assert_eq!(pushed_checkout_identity(&unchanged, Some(id), alias), id);
+        // Only with no recorded ID is the requested reference all there is.
+        assert_eq!(
+            pushed_checkout_identity(&unchanged, Some(alias), alias),
+            alias
+        );
+        assert_eq!(pushed_checkout_identity(&unchanged, None, alias), alias);
+    }
 
     #[cfg(unix)]
     #[test]
