@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.2.39 — 2026-10-01
+
+- Push records the canonical brain ID in `.sevra-v2.json`, never the alias it
+  was given. A committed push recorded the ID dbmd reported, but an unchanged
+  push fell back to the slug, so the tracked binding flipped between the two on
+  every checkpoint and each flip needed its own commit. dbmd 0.14.1 names the ID
+  in every push receipt; with older dbmd an unchanged push keeps the recorded ID.
+  An alias can be rebound to another brain; the ID cannot.
 - Release integrity: the controller's preflight now requires both musl
   targets and `rust-src` in the Linux-host Rust 1.96.0 toolchain, before it
   creates the tag. The first v0.2.38 attempt lacked `rust-src`, so its arm64
