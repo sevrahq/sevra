@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Package checkpoint now runs `dbmd validate --all` before it appends the
+  "Checkpointed" curator-log entry. A store that fails validation no longer
+  gains a log entry for a checkpoint that was then refused.
+- Upgrade rustls to 0.23.45 (RUSTSEC-2026-0285).
+
 ## 0.2.36 — 2026-08-27
 
 - Package verification now delegates intentional partial-store semantics to

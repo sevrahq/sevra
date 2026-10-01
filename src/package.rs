@@ -1846,6 +1846,16 @@ fn stage_snapshot(
         &["index", "rebuild"],
         "package index rebuild",
     )?;
+    // Validate before recording the checkpoint in the curator log: a store
+    // that cannot pass `dbmd validate --all` must not gain a "Checkpointed"
+    // entry for a checkpoint that is then refused. The entry is appended only
+    // after validation passes and still before the push, so it travels with
+    // the content it describes.
+    dbmd(
+        &workspace.store,
+        &["validate", "--all"],
+        "package validation",
+    )?;
     if changed {
         dbmd(
             &workspace.store,
@@ -1859,11 +1869,6 @@ fn stage_snapshot(
             "package curator log",
         )?;
     }
-    dbmd(
-        &workspace.store,
-        &["validate", "--all"],
-        "package validation",
-    )?;
     let files = envelope
         .core
         .entries
@@ -3662,6 +3667,29 @@ mod tests {
         assert_eq!(
             canonical_hash(&first).unwrap(),
             canonical_hash(&second).unwrap()
+        );
+    }
+
+    #[test]
+    fn checkpoint_validates_before_logging_the_checkpoint() {
+        // A checkpoint the store cannot pass must not leave a "Checkpointed"
+        // curator-log entry behind: inside `stage_snapshot`, `dbmd validate
+        // --all` runs before the log append.
+        let source = include_str!("package.rs");
+        let start = source
+            .find("\nfn stage_snapshot(")
+            .expect("stage_snapshot exists");
+        let body = &source[start + 1..];
+        let body = &body[..body.find("\nfn ").unwrap_or(body.len())];
+        let validation = body
+            .find("\"package validation\"")
+            .expect("stage_snapshot validates the store");
+        let log = body
+            .find("\"package curator log\"")
+            .expect("stage_snapshot logs the checkpoint");
+        assert!(
+            validation < log,
+            "validate --all must run before the checkpoint is logged"
         );
     }
 
