@@ -660,6 +660,15 @@ case "$1" in
       aarch64-unknown-linux-musl \
       x86_64-pc-windows-msvc
     ;;
+  component)
+    case "$*" in
+      "component list --installed --toolchain 1.96.0-x86_64-unknown-linux-gnu")
+        printf '%s\n' cargo-x86_64-unknown-linux-gnu
+        [ "${SEVRA_TEST_NO_RUST_SRC:-0}" = 1 ] || printf '%s\n' rust-src
+        ;;
+      *) exit 98 ;;
+    esac
+    ;;
   *) exit 98 ;;
 esac
 EOF
@@ -797,6 +806,34 @@ chmod +x "$successor_bin"/*
 
 : >"$SEVRA_TEST_LOG"
 real_tar="$(command -v tar)"
+# Without rust-src in the Linux-host toolchain the Linux rebuilds differ from
+# CI. Preflight must refuse before it binds the tag or builds anything.
+if (
+  cd "$successor_root"
+  SEVRA_TEST_MODE=successor_final \
+  SEVRA_TEST_NO_RUST_SRC=1 \
+  SEVRA_SUCCESSOR_ROOT="$successor_root" \
+  SEVRA_SUCCESSOR_SOURCE="$successor_source" \
+  SEVRA_TEST_STATE="$fixture/state" \
+  SEVRA_REAL_TAR="$real_tar" \
+    PATH="$successor_bin:$PATH" \
+    sh scripts/release.sh --resume v0.2.11
+) >"$fixture/successor-no-rust-src.out" 2>&1
+then
+  printf '%s\n' "successor released without rust-src in the Linux-host toolchain" >&2
+  exit 1
+fi
+if ! grep -Fq 'lacks rust-src' "$fixture/successor-no-rust-src.out" ||
+  grep -Fq 'release: binding' "$fixture/successor-no-rust-src.out" ||
+  grep -Eq '^(cargo|cross|xwin) ' "$SEVRA_TEST_LOG"
+then
+  printf '%s\n' "missing rust-src did not stop preflight before binding" >&2
+  cat "$fixture/successor-no-rust-src.out" >&2
+  cat "$SEVRA_TEST_LOG" >&2
+  exit 1
+fi
+
+: >"$SEVRA_TEST_LOG"
 if ! (
   cd "$successor_root"
   SEVRA_TEST_MODE=successor_final \

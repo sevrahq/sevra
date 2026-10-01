@@ -57,6 +57,21 @@ both routes to agree for every compatibility generation.
    The wrapper verifies both the exact Intel compiler revision and successful
    x86_64 execution before it creates the version tag.
 
+   The Linux builders mount the Linux-host toolchain, which needs both musl
+   targets and `rust-src`. CI's cross toolchain has `rust-src`, so rustc
+   embeds standard-library paths under `/rust/lib/rustlib/src/rust`; without
+   it the paths stay `/rustc/<commit>/library`, and the rebuilt Linux binaries
+   differ from CI in `.rodata`. The wrapper checks all three before it creates
+   the tag:
+
+   ```sh
+   rustup toolchain install 1.96.0-x86_64-unknown-linux-gnu \
+     --profile minimal --force-non-host
+   rustup target add --toolchain 1.96.0-x86_64-unknown-linux-gnu \
+     x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+   rustup component add --toolchain 1.96.0-x86_64-unknown-linux-gnu rust-src
+   ```
+
    For releases after v0.2.10, only after those five byte comparisons pass does
    the wrapper read offline signer B from its dedicated local macOS Keychain
    cache, pass it to one local Node process over stdin, check its pinned SPKI, sign, create

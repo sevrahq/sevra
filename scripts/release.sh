@@ -433,6 +433,24 @@ else
   fi
   [ -x "$linux_rustc" ] ||
     die "the Linux-host Rust 1.96.0 toolchain is incomplete"
+  # Cross mounts this toolchain into the Linux builders, so the musl standard
+  # libraries must be installed here. CI's cross toolchain also has rust-src,
+  # which makes rustc embed standard-library paths under
+  # /rust/lib/rustlib/src/rust; without it they stay /rustc/<commit>/library
+  # and the Linux rebuilds differ from CI in .rodata.
+  linux_targets="$(
+    rustup target list --installed --toolchain 1.96.0-x86_64-unknown-linux-gnu
+  )"
+  for linux_target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+    printf '%s\n' "$linux_targets" | grep -Fxq "$linux_target" ||
+      die "the Linux-host Rust 1.96.0 toolchain lacks the $linux_target target"
+  done
+  linux_components="$(
+    rustup component list --installed \
+      --toolchain 1.96.0-x86_64-unknown-linux-gnu
+  )"
+  printf '%s\n' "$linux_components" | grep -Fxq rust-src ||
+    die "the Linux-host Rust 1.96.0 toolchain lacks rust-src"
   arch -x86_64 "$x86_rustc" --version |
     grep -Fxq 'rustc 1.96.0 (ac68faa20 2026-05-25)' ||
     die "Rosetta and the exact Intel-native Rust 1.96.0 compiler are required"

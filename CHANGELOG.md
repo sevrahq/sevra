@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Release integrity: the controller's preflight now requires both musl
+  targets and `rust-src` in the Linux-host Rust 1.96.0 toolchain, before it
+  creates the tag. The first v0.2.38 attempt lacked `rust-src`, so its arm64
+  Linux rebuild embedded `/rustc/<commit>` standard-library paths where CI
+  embeds `/rust/lib/rustlib/src/rust`, and the byte comparison failed after
+  the tag was pushed. `--resume` completed the release once it was installed.
+
 ## 0.2.38 — 2026-09-30
 
 - Package checkpoint now runs `dbmd validate --all` before it appends the
