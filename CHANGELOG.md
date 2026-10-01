@@ -2,10 +2,20 @@
 
 ## Unreleased
 
+## 0.2.38 — 2026-09-30
+
 - Package checkpoint now runs `dbmd validate --all` before it appends the
   "Checkpointed" curator-log entry. A store that fails validation no longer
   gains a log entry for a checkpoint that was then refused.
 - Upgrade rustls to 0.23.45 (RUSTSEC-2026-0285).
+
+## 0.2.37 — 2026-08-27
+
+- `package pull` hydrates an exact private Git clone into the complete working
+  brain: it delegates the verified incremental pull to db.md, requires every
+  companion to match the signed package snapshot exactly, and only then adopts
+  the lifecycle and writes the private receipt. A divergent or missing companion
+  fails closed and is never overwritten. (Entry added with 0.2.38.)
 
 ## 0.2.36 — 2026-08-27
 
